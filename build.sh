@@ -1,8 +1,7 @@
+#!/usr/bin/env bash
 # Builds main.js from src/ (ES modules, bundled by esbuild) and runs the test suite.
 # Requires Node.js. First run: npm install
-$ErrorActionPreference = 'Stop'
-Set-Location $PSScriptRoot
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
 npm run build
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 npm test
-exit $LASTEXITCODE

@@ -1,30 +1,25 @@
 // ─── Task / Habit creation (modals, inline composer, FAB) ─────────────────────
 
-function newComposerDraft(date) {
+import * as obsidian from 'obsidian';
+import { WD_UA, addDays, charForStatusId, describeRule, humanDate, mondayIdx, parseISO, prioColor, priorityKeys, t, toISO, todayISO } from './core.js';
+import { buildChips, buildHabitFields, buildRecurrenceFields, buildRule, newHabitDraft, ruleFromRecDraft, validateHabit } from './forms.js';
+import { applyDefaults, collectGroups, collectTags, getOrCreateDateFile, insertLineUnderHeading, serializeTaskBody, setDescription } from './store.js';
+
+export function newComposerDraft(date) {
     return { text: '', date: date || todayISO(), start: null, end: null, priority: null, tags: [], group: null,
              status: 'todo', descText: '',
              rec: { freq: 'none', interval: 1, weekdays: [], monthMode: 'day', monthday: '', nth: 1, weekday: 0, which: 'first', month: new Date().getMonth() },
              _tagChips: null, _groupChips: null };
 }
 
-function nextMonday() { const d = new Date(); return addDays(d, 7 - ((d.getDay() + 6) % 7)); }
+export function nextMonday() { const d = new Date(); return addDays(d, 7 - mondayIdx(d)); }
 
-function composeTaskRaw(d) {
-    const parts = [];
-    if (d.start) parts.push(d.end ? `${d.start}-${d.end}` : d.start);
-    if (d.text) parts.push(d.text);
-    for (const t of (d.tags || [])) parts.push(`#${t}`);
-    if (d.priority) parts.push(`!${d.priority}`);
-    if (d.group) parts.push(`@${d.group}`);
-    return parts.join(' ');
-}
-
-function syncDraftChips(d) {
+export function syncDraftChips(d) {
     if (d._tagChips) d.tags = d._tagChips.get();
     if (d._groupChips) d.group = d._groupChips.get()[0] || null;
 }
 
-async function createFromDraft(app, plugin, d) {
+export async function createFromDraft(app, plugin, d) {
     syncDraftChips(d);
     // sweep any #tag / @group tokens typed straight into the description into chips
     if (d.descText) {
@@ -34,18 +29,14 @@ async function createFromDraft(app, plugin, d) {
             return pre;
         }).replace(/[ \t]{2,}/g, ' ').trim();
     }
-    const raw = composeTaskRaw(d);
+    const raw = serializeTaskBody(d);   // drafts carry the same field names as parsed tasks
     if (!raw.trim()) return;
     if (d.rec && d.rec.freq && d.rec.freq !== 'none') {
-        const start = d.date || todayISO();
-        const rule = Object.assign({ id: genId(), raw, start, end: null }, ruleFromRecDraft(d.rec));
-        if ((rule.freq === 'monthly' || rule.freq === 'yearly') && rule.monthMode === 'day' && !rule.monthday)
-            rule.monthday = parseISO(start).getDate();
-        plugin.settings.recurrences.push(rule);
+        plugin.settings.recurrences.push(buildRule(raw, d.date || todayISO(), null, d.rec));
         await plugin.saveSettings();
     } else {
         const file = await getOrCreateDateFile(app, d.date || todayISO());
-        const mark = statusMark(d.status || 'todo');
+        const mark = charForStatusId(d.status || 'todo');
         const lineNum = await insertLineUnderHeading(app, file, `- [${mark}] ${applyDefaults(raw, plugin.settings)}`, plugin.settings);
         if (d.descText && d.descText.trim() && lineNum != null) {
             await setDescription(app, file, { line: lineNum, text: d.text, descId: null }, d.descText, plugin.settings);
@@ -54,7 +45,7 @@ async function createFromDraft(app, plugin, d) {
 }
 
 // date + time + recurrence options
-function buildScheduleFields(container, d, rerender) {
+export function buildScheduleFields(container, d, rerender) {
     new obsidian.Setting(container).setName(t('Дата'))
         .addText(c => { c.inputEl.type = 'date'; c.setValue(d.date || todayISO()).onChange(v => d.date = v); });
     new obsidian.Setting(container).setName(t('Час'))
@@ -79,7 +70,7 @@ function buildScheduleFields(container, d, rerender) {
 }
 
 // priority + tags + group
-function buildAttrFields(container, d, tags, groups) {
+export function buildAttrFields(container, d, tags, groups) {
     new obsidian.Setting(container).setName(t('Пріоритет'))
         .addDropdown(dd => { dd.addOption('', '—'); priorityKeys.forEach(k => dd.addOption(k, k)); dd.setValue(d.priority || '').onChange(v => d.priority = v || null); });
     new obsidian.Setting(container).setName(t('Група')).setDesc(t('Enter — додати'))
@@ -89,7 +80,7 @@ function buildAttrFields(container, d, tags, groups) {
 }
 
 // Floating popover anchored to an element; closes on outside click / Esc
-function openPopover(anchorEl, build) {
+export function openPopover(anchorEl, build) {
     const pop = document.body.createEl('div', { cls: 'tc-popover' });
     const close = () => {
         document.removeEventListener('mousedown', onDoc, true);
@@ -114,8 +105,9 @@ function openPopover(anchorEl, build) {
 }
 
 // Inline composer: text field with two icons inside it; options open in popovers
-function renderTaskComposer(app, plugin, container, date, onCreate) {
+export function renderTaskComposer(app, plugin, container, date, onCreate, defaults) {
     const d = newComposerDraft(date);
+    if (defaults) { if (defaults.group) d.group = defaults.group; if (defaults.tags) d.tags = defaults.tags.slice(); }
     const field = container.createEl('div', { cls: 'tc-composer-field' });
     const input = field.createEl('input', { cls: 'tc-input tc-composer-input' });
     input.type = 'text';
@@ -135,27 +127,19 @@ function renderTaskComposer(app, plugin, container, date, onCreate) {
 
     const icons = field.createEl('div', { cls: 'tc-composer-icons' });
     const cal = icons.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(cal, 'calendar-clock');
-    cal.setAttribute('aria-label', 'Дата / час / повтор');
+    cal.setAttribute('aria-label', t('Дата / час / повтор'));
     cal.onclick = async () => { await ensure(); openPopover(cal, (pop, close) => { const r = () => { pop.empty(); buildScheduleFields(pop, d, r); footer(pop, close); }; r(); }); };
     const more = icons.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(more, 'sliders-horizontal');
-    more.setAttribute('aria-label', 'Теги / пріоритет / група');
+    more.setAttribute('aria-label', t('Теги / пріоритет / група'));
     more.onclick = async () => { await ensure(); syncDraftChips(d); openPopover(more, (pop, close) => { buildAttrFields(pop, d, tags, groups); footer(pop, close); }); };
 
     return field;
 }
 
-// Floating "+" button (mobile) that opens the full create modal
-function renderFab(app, plugin, container, date) {
-    const fab = container.createEl('button', { cls: 'tc-fab' });
-    obsidian.setIcon(fab, 'plus');
-    fab.setAttribute('aria-label', 'Нова задача');
-    fab.onclick = () => new TaskCreateModal(app, plugin, date).open();
-}
-
 // Inline #tag / @group autocomplete on a textarea. Calls onPick(sig, value) when a token
 // is committed (the token text is first stripped from the textarea). Shared by the create
 // modal's smart description and the task editor.
-function attachInlineTagAutocomplete(ta, tags, groups, onPick) {
+export function attachInlineTagAutocomplete(ta, tags, groups, onPick) {
     let sug = null, items = [], active = -1, token = null;
     const close = () => { if (sug) sug.remove(); sug = null; items = []; active = -1; token = null; };
     const commit = val => {
@@ -200,7 +184,7 @@ function attachInlineTagAutocomplete(ta, tags, groups, onPick) {
 }
 
 // Description textarea with inline #tag / @group autocomplete; picks become chips below.
-function buildSmartDescription(container, d, tags, groups) {
+export function buildSmartDescription(container, d, tags, groups) {
     const wrap = container.createEl('div', { cls: 'tc-smartdesc' });
     const ta = wrap.createEl('textarea', { cls: 'tc-editor-desc tc-smartdesc-input' });
     ta.rows = 4;
@@ -231,7 +215,7 @@ function buildSmartDescription(container, d, tags, groups) {
 }
 
 // Date / time picker with quick buttons (Today / Tomorrow / Next Monday)
-class DatePickerModal extends obsidian.Modal {
+export class DatePickerModal extends obsidian.Modal {
     constructor(app, d, onDone) { super(app); this.d = d; this.onDone = onDone; }
     onOpen() {
         const { contentEl } = this;
@@ -256,7 +240,7 @@ class DatePickerModal extends obsidian.Modal {
 }
 
 // Custom recurrence builder (wraps the shared schedule form, no raw/dates)
-class RecurrenceCustomModal extends obsidian.Modal {
+export class RecurrenceCustomModal extends obsidian.Modal {
     constructor(app, rec, onDone) { super(app); this.rec = rec; this.onDone = onDone; if (this.rec.freq === 'none') this.rec.freq = 'daily'; }
     onOpen() {
         const { contentEl } = this;
@@ -273,7 +257,7 @@ class RecurrenceCustomModal extends obsidian.Modal {
 }
 
 // Full create modal (Ctrl+P "Створити задачу" + mobile FAB) — title, smart description, quick-param row
-class TaskCreateModal extends obsidian.Modal {
+export class TaskCreateModal extends obsidian.Modal {
     constructor(app, plugin, date) { super(app); this.plugin = plugin; this.d = newComposerDraft(date || todayISO()); }
     async onOpen() {
         this.tags = collectTags(this.app);
@@ -337,7 +321,7 @@ class TaskCreateModal extends obsidian.Modal {
             const setRec = rec => { Object.assign(this.d.rec, rec); updateLabels(); };
             menu.addItem(it => it.setTitle(t('Без повтору')).onClick(() => setRec({ freq: 'none' })));
             menu.addItem(it => it.setTitle(t('Щоденно')).onClick(() => setRec({ freq: 'daily', interval: 1 })));
-            menu.addItem(it => it.setTitle(t('Щотижнево (поточний день)')).onClick(() => setRec({ freq: 'weekly', interval: 1, weekdays: [(base.getDay() + 6) % 7] })));
+            menu.addItem(it => it.setTitle(t('Щотижнево (поточний день)')).onClick(() => setRec({ freq: 'weekly', interval: 1, weekdays: [mondayIdx(base)] })));
             menu.addItem(it => it.setTitle(t('Щотижнево у робочі дні (Пн–Пт)')).onClick(() => setRec({ freq: 'weekly', interval: 1, weekdays: [0, 1, 2, 3, 4] })));
             menu.addItem(it => it.setTitle(t('Щомісячно (поточне число)')).onClick(() => setRec({ freq: 'monthly', interval: 1, monthMode: 'day', monthday: base.getDate() })));
             menu.addItem(it => it.setTitle(t('Щорічно (поточний день)')).onClick(() => setRec({ freq: 'yearly', interval: 1, month: base.getMonth(), monthMode: 'day', monthday: base.getDate() })));
@@ -363,7 +347,7 @@ class TaskCreateModal extends obsidian.Modal {
 }
 
 // Habit create modal (Ctrl+P "Створити звичку")
-class HabitCreateModal extends obsidian.Modal {
+export class HabitCreateModal extends obsidian.Modal {
     constructor(app, plugin) { super(app); this.plugin = plugin; this.d = newHabitDraft(); }
     onOpen() {
         const { contentEl } = this;
