@@ -20,8 +20,19 @@
               "icon": "lucide-file",
               "title": "2026-06-28"
             }
+          },
+          {
+            "id": "2555429d0eca7fe4",
+            "type": "leaf",
+            "state": {
+              "type": "md-task-calendar-list",
+              "state": {},
+              "icon": "list-checks",
+              "title": "Tasks"
+            }
           }
-        ]
+        ],
+        "currentTab": 1
       }
     ],
     "direction": "vertical"
@@ -136,33 +147,42 @@
             }
           },
           {
-            "id": "a95ec05ccba234e2",
-            "type": "leaf",
-            "state": {
-              "type": "md-task-calendar-habits",
-              "state": {},
-              "icon": "check-circle",
-              "title": "Habits"
-            }
-          },
-          {
-            "id": "dcc909ef1fbeb5b4",
-            "type": "leaf",
-            "state": {
-              "type": "md-task-calendar-list",
-              "state": {},
-              "icon": "list-checks",
-              "title": "Tasks"
-            }
-          },
-          {
             "id": "cfb7b7d72f77970f",
             "type": "leaf",
             "state": {
               "type": "md-task-calendar-smart",
               "state": {},
-              "icon": "list-todo",
-              "title": "Smart list"
+              "icon": "lucide-ghost",
+              "title": "md-task-calendar-smart"
+            }
+          },
+          {
+            "id": "85be9ec71783d53f",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "Всі властивості"
+            }
+          },
+          {
+            "id": "f1dce7cc5de38704",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "2026-06-28.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Вміст 2026-06-28"
             }
           }
         ],
@@ -174,69 +194,24 @@
   },
   "left-ribbon": {
     "hiddenItems": {
-      "switcher:Open quick switcher": false,
-      "graph:Open graph view": false,
-      "canvas:Create new canvas": false,
-      "daily-notes:Open today's daily note": false,
-      "templates:Insert template": false,
-      "command-palette:Open command palette": false,
-      "bases:Create new base": false,
-      "md-task-calendar:MD Task Calendar — Календар": false,
-      "md-task-calendar:MD Task Calendar — Список": false,
-      "md-task-calendar:MD Task Calendar — Звички": false,
-      "md-task-calendar:MD Task Calendar — Міні-календар": false,
-      "md-task-calendar:MD Task Calendar — Розумний список": false,
-      "md-task-calendar:MD Task Calendar — Smart list": false,
-      "md-task-calendar:MD Task Calendar — Calendar": false,
-      "md-task-calendar:MD Task Calendar — Tasks": false,
-      "md-task-calendar:MD Task Calendar — Habits": false,
-      "md-task-calendar:MD Task Calendar — Mini calendar": false,
-      "markday:Markday — Smart list": false,
-      "markday:Markday — Calendar": false,
+      "switcher:Відкрити провідник файлів": false,
+      "graph:Граф": false,
+      "canvas:Створити нове полотно": false,
+      "daily-notes:Сьогоднішня нотатка": false,
+      "templates:Вставити шаблон": false,
+      "command-palette:Відкрити меню команд": false,
+      "bases:Створити нову базу": false,
       "markday:Markday — Tasks": false,
+      "markday:Markday — Calendar": false,
       "markday:Markday — Habits": false,
       "markday:Markday — Mini calendar": false
     }
   },
-  "floating": {
-    "id": "36b4d471124134f1",
-    "type": "floating",
-    "children": [
-      {
-        "id": "f97038a5972e780a",
-        "type": "window",
-        "children": [
-          {
-            "id": "b969c431b9e384ab",
-            "type": "tabs",
-            "children": [
-              {
-                "id": "51b288a888b34542",
-                "type": "leaf",
-                "state": {
-                  "type": "md-task-calendar-cal",
-                  "state": {},
-                  "icon": "calendar",
-                  "title": "Calendar"
-                }
-              }
-            ]
-          }
-        ],
-        "direction": "vertical",
-        "x": 420,
-        "y": 118,
-        "width": 911,
-        "height": 926,
-        "maximize": false,
-        "zoom": 0
-      }
-    ]
-  },
-  "active": "51b288a888b34542",
+  "active": "2555429d0eca7fe4",
   "lastOpenFiles": [
-    "2026-06-08.md",
+    "Без назви.base",
     "2026-06-28.md",
+    "2026-06-08.md",
     "2026-06-29.md",
     "2026-06-18.md",
     "2026-06-12.md",
@@ -258,7 +233,6 @@
     "2026-06-10.md.tmp.20604.f51c390aeeea",
     "2026-07-05.md.tmp.20604.d37a6726ca9c",
     "2026-06-29.md.tmp.20604.a69240d992e6",
-    "2026-06-28.md.tmp.20604.3874cf7e7acd",
     "2026-06-17.md",
     "2026-07-05.md",
     "2026-07-01.md",
