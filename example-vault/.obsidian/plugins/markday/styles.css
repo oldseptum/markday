@@ -1,499 +1,655 @@
 /* ════════════════════════════════════════════════════════════════════════════
-   Markday — styles
-   Priority / tag / group colors are applied inline from settings (applyConfig).
-   Built on Obsidian's native variables for a clean, lean, theme-aware look.
+   MARKDAY — стилі плагіна (гібрид: нативні змінні Obsidian + сучасна пластика)
+   ────────────────────────────────────────────────────────────────────────────
+   Принципи:
+   • Жодних власних кольорів — лише змінні теми (--background-*, --text-*,
+     --interactive-*, --radius-*, --size-*, --font-*). Тема/акцент користувача
+     підхоплюються автоматично, світла й темна працюють без окремих правил.
+   • Кольори користувача (пріоритети/теги/групи/звички) приходять із JS лише як
+     custom properties (--chip, --card-color, --hc); усі формули тонування — тут,
+     через color-mix із фоном/текстом теми, тож будь-який колір лишається читабельним.
+   • Адаптив: `.tc-pane` має container-type — «компактний» режим вмикається за
+     ШИРИНОЮ ПАНЕЛІ (не вікна). Поріг 560px збігається з compactMode() у коді.
+   • Стани інтерактиву: спокійний default → помітний hover → акцентний active;
+     переходи короткі (0.12s), без анімацій, що заважають.
+
+   Зміст:
+     0. Токени         — локальні tc-* похідні від змінних теми
+     1. Загальне       — pane, кнопки-іконки, інпути, чипи, попап, кнопки модалок
+     2. Картка задачі  — рядок задачі (спільний для списку / дня / деталей)
+     3. Список задач   — бічна панель фільтрів + контент + групи + стрічка звичок
+     4. Календар хедер — спільний для місяця / тижня / overview
+     5. Місяць         — повна сітка (широкі екрани)
+     6. Overview       — компактні крапки + панель дня (вузькі екрани)
+     7. Тиждень        — таймлайн (week / workweek / 3day)
+     8. Міні-календар  — бічна панель
+     9. Звички         — дашборд (список зліва + деталі справа)
+    10. Створення      — композер і вікно нової задачі
+    11. Редагування    — вікно задачі (4 шари)
+    12. Налаштування   — картки-групи + менеджер-модалки
    ════════════════════════════════════════════════════════════════════════════ */
 
+
+/* ═══ 0. ТОКЕНИ ══════════════════════════════════════════════════════════════ */
+/* Єдина точка зміни вигляду плагіна. Визначено на body, щоб діяти всюди:
+   у панелях (.tc-pane), модалках, налаштуваннях і в попапах, підвішених до body. */
+
+body {
+    /* Геометрія */
+    --tc-radius-row: var(--radius-m);                 /* рядки задач, клітинки, композер */
+    --tc-radius-card: var(--radius-l);                /* картки, попапи, картки-групи */
+    --tc-radius-pill: 999px;                          /* бейджі, чипи, лічильники, дата-кнопка */
+
+    /* Тонування кольором користувача (--card-color / --chip приходять із JS) */
+    --tc-tint-bg: 20%;                                /* фон кольорової картки */
+    --tc-tint-bg-hover: 30%;                          /* … під курсором */
+    --tc-chip-bg: 14%;                                /* фон кольорового бейджа */
+    --tc-chip-text: 55%;                              /* частка кольору в тексті бейджа */
+
+    /* Акцентні підкладки (три сили — для фонів станів) */
+    --tc-accent-weak: color-mix(in srgb, var(--interactive-accent) 5%, transparent);    /* "сьогодні" */
+    --tc-accent-soft: color-mix(in srgb, var(--interactive-accent) 12%, transparent);   /* активний пункт */
+    --tc-accent-strong: color-mix(in srgb, var(--interactive-accent) 20%, transparent); /* drop/превʼю/фокус */
+
+    /* Лінії */
+    --tc-hairline: var(--background-modifier-border);
+    --tc-hairline-soft: color-mix(in srgb, var(--background-modifier-border) 55%, transparent);
+
+    /* Чекбокси/статус-бокси (базовий · бар місяця · таймлайн · редактор) */
+    --tc-check: 18px;
+    --tc-check-bar: 14px;
+    --tc-check-tl: 15px;
+    --tc-check-lg: 20px;
+
+    /* Мікротипографіка та іконки */
+    --tc-font-micro: 9px;                             /* осі, підписи сіток */
+    --tc-font-mini: 11px;                             /* бари місяця */
+    --tc-icon-stroke: 2.5;                            /* товщина Lucide на малих розмірах */
+
+    /* Рух */
+    --tc-transition: 0.12s ease;
+}
+
+
+/* ═══ 1. ЗАГАЛЬНЕ ════════════════════════════════════════════════════════════ */
+
 .tc-pane {
-    padding: var(--size-4-3);
+    padding: var(--size-4-3) var(--size-4-4);
     overflow-y: auto;
-    container-type: inline-size;
+    container-type: inline-size;   /* вмикає @container-адаптив усередині панелі */
+}
+@container (max-width: 560px) {
+    .tc-pane { padding: 12px 14px; }
 }
 
-/* nicer accent checkboxes everywhere in the plugin */
-/* standard checkboxes — alignment within our rows */
-.tc-pane input[type="checkbox"], .tc-editor input[type="checkbox"] { cursor: pointer; }
-.tc-row > input[type="checkbox"],
-.tc-subrow > input[type="checkbox"] { flex-shrink: 0; margin-top: 3px; }
-.tc-inline-check { display: flex; align-items: center; gap: var(--size-4-1); font-size: var(--font-ui-smaller); color: var(--text-muted); cursor: pointer; }
-
-/* ── Buttons ─────────────────────────────────────────────────────────────── */
-.tc-btn {
-    padding: var(--size-2-1) var(--size-4-3);
-    border-radius: var(--radius-s);
-    border: none;
-    background: var(--interactive-accent);
-    color: var(--text-on-accent);
-    cursor: pointer;
-    font-size: var(--font-ui-smaller);
-    box-shadow: none;
+/* Кнопки-іконки Obsidian (clickable-icon) — активний/заданий стан */
+.clickable-icon.is-active { color: var(--interactive-accent); background: var(--tc-accent-soft); }
+.clickable-icon.is-set { background: color-mix(in srgb, currentColor 14%, transparent); }
+@container (max-width: 560px) {
+    .clickable-icon { width: 38px; height: 38px; }
+    .clickable-icon .svg-icon { width: 22px; height: 22px; }
 }
-.tc-btn:hover { background: var(--interactive-accent-hover); }
-.tc-btn-secondary {
-    background: var(--interactive-normal);
-    color: var(--text-muted);
-    box-shadow: var(--input-shadow);
-}
-.tc-btn-secondary:hover { background: var(--interactive-hover); color: var(--text-normal); }
 
-/* ── Inputs / selects ────────────────────────────────────────────────────── */
-.tc-input,
-.tc-select,
-.tc-habit-input {
+/* Текстові інпути — розміри й радіуси нативних полів */
+.tc-input {
     background: var(--background-modifier-form-field);
-    border: 1px solid var(--background-modifier-border);
-    border-radius: var(--radius-s);
+    border: 1px solid var(--tc-hairline);
+    border-radius: var(--input-radius, var(--radius-s));
     color: var(--text-normal);
-    font-size: var(--font-ui-smaller);
-    padding: var(--size-2-1) var(--size-4-2);
+    font-size: var(--font-ui-small);
+    padding: var(--size-2-2) var(--size-4-2);
+    transition: border-color var(--tc-transition), box-shadow var(--tc-transition);
 }
-.tc-input:focus,
-.tc-select:focus,
-.tc-habit-input:focus {
+.tc-input:focus {
     outline: none;
     border-color: var(--interactive-accent);
-    box-shadow: 0 0 0 2px var(--background-modifier-border-focus);
+    box-shadow: 0 0 0 2px var(--tc-accent-strong);
+}
+.tc-input::placeholder { color: var(--text-faint); }
+@container (max-width: 560px) {
+    .tc-input, .dropdown { font-size: var(--font-ui-medium); padding: 8px 10px; min-height: 38px; }
 }
 
+/* Рядок "+ додати" (підзадача в редакторі, додавання в all-day таймлайну) */
 .tc-add-row { display: flex; gap: var(--size-4-1); margin-top: var(--size-4-2); }
 .tc-add-row .tc-input { flex: 1; min-width: 0; }
 
-/* ── List toolbar ────────────────────────────────────────────────────────── */
-.tc-toolbar {
-    display: flex;
-    align-items: center;
-    gap: var(--size-4-2);
-    margin-bottom: var(--size-4-3);
-    padding-bottom: var(--size-4-2);
-    border-bottom: 1px solid var(--background-modifier-border);
+/* Чипи тегів/груп (форми повторень, редактор, smart-опис) */
+.tc-chips {
+    display: flex; flex-wrap: wrap; gap: 5px; align-items: center; width: 100%;
+    border: 1px solid var(--tc-hairline);
+    border-radius: var(--input-radius, var(--radius-s));
+    padding: 4px 6px;
+    background: var(--background-modifier-form-field);
 }
-.tc-toolbar-input { flex: 1; min-width: 0; }
-.tc-icon-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    border: none;
-    border-radius: var(--radius-s);
-    background: transparent;
+.tc-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    background: var(--background-modifier-hover);
     color: var(--text-muted);
-    cursor: pointer;
-    box-shadow: none;
-}
-.tc-icon-btn:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
-.tc-icon-btn .svg-icon { width: 18px; height: 18px; }
-
-/* ── List controls (legacy) ──────────────────────────────────────────────── */
-.tc-controls {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: var(--size-4-3);
-    margin-bottom: var(--size-4-3);
-    padding-bottom: var(--size-4-2);
-    border-bottom: 1px solid var(--background-modifier-border);
-}
-.tc-select-lbl,
-.tc-check-lbl {
-    display: flex;
-    align-items: center;
-    gap: var(--size-4-1);
+    border-radius: var(--tc-radius-pill);
+    padding: 1px 6px 1px 9px;
     font-size: var(--font-ui-smaller);
-    color: var(--text-muted);
+    line-height: 1.7;
 }
-.tc-check-lbl { cursor: pointer; }
+.tc-chip-input { flex: 1; min-width: 70px; border: none; background: transparent; color: var(--text-normal); font-size: var(--font-ui-smaller); outline: none; }
+/* × ховається до наведення (на дотику — завжди видно) */
+.tc-chip .tc-chip-x { display: none; margin-left: 3px; cursor: pointer; opacity: 0.7; }
+.tc-chip:hover .tc-chip-x { display: inline; }
+.tc-chip-x:hover { color: var(--text-error); }
+.is-mobile .tc-chip .tc-chip-x { display: inline; }
+/* «+» для додавання тегу через опис */
+.tc-chip-add { cursor: pointer; background: transparent; border: 1px dashed var(--tc-hairline); color: var(--text-muted); padding: 1px 9px; border-radius: var(--tc-radius-pill); transition: color var(--tc-transition), border-color var(--tc-transition); }
+.tc-chip-add:hover { color: var(--interactive-accent); border-color: var(--interactive-accent); }
 
-/* ── Task rows ───────────────────────────────────────────────────────────── */
-.tc-list { display: flex; flex-direction: column; gap: 1px; }
+/* Кольорові бейджі/чипи: JS дає лише --chip; фон — мʼяка підкладка кольору,
+   текст — колір, підтягнутий до тексту теми (читабельно на світлій і темній) */
+.tc-tinted {
+    background: color-mix(in srgb, var(--chip) var(--tc-chip-bg), transparent);
+    color: color-mix(in srgb, var(--chip) var(--tc-chip-text), var(--text-normal));
+}
+
+/* Плаваючий попап (опції композера) */
+.tc-popover {
+    position: fixed; z-index: 50; width: 300px; max-width: 92vw;
+    background: var(--background-primary);
+    border: 1px solid var(--tc-hairline);
+    border-radius: var(--tc-radius-card);
+    box-shadow: var(--shadow-l);
+    padding: var(--size-4-2) var(--size-4-3);
+}
+.tc-popover .setting-item { padding: var(--size-4-1) 0; border: none; }
+
+/* Низ модалок */
+.tc-modal-btns { display: flex; justify-content: flex-end; gap: var(--size-4-2); margin-top: var(--size-4-4); }
+
+/* Порожній стан */
+.tc-empty { color: var(--text-muted); font-size: var(--font-ui-small); padding: var(--size-4-2) 0; }
+.tc-col-empty { text-align: center; color: var(--text-faint); font-size: var(--font-ui-smaller); padding: var(--size-4-3) 0; }
+
+
+/* ═══ 2. КАРТКА ЗАДАЧІ (рядок) ═══════════════════════════════════════════════ */
+/* Спільний рядок: список, панель дня, деталі дня. Колір (пріоритет/тег/група)
+   приходить як --card-color; без нього край прозорий. */
+
+.tc-list { display: flex; flex-direction: column; gap: 2px; }
 
 .tc-row {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--size-4-2);
-    padding: var(--size-2-1) var(--size-4-2);
-    border-radius: var(--radius-s);
-    border-left: 2px solid transparent;
-    transition: background 0.1s ease;
+    display: flex; align-items: center; gap: var(--size-4-2);
+    padding: var(--size-2-2) var(--size-4-2);
+    border-radius: var(--tc-radius-row);
+    border-left: 3px solid var(--card-color, transparent);
+    transition: background var(--tc-transition);
 }
 .tc-row:hover { background: var(--background-modifier-hover); }
 .tc-row.tc-event { background: var(--background-secondary); }
-.tc-row.tc-virtual { opacity: 0.7; border-left-style: dashed; }
-.tc-row.tc-virtual .tc-label { font-style: italic; }
-
-.tc-row-main { flex: 1; min-width: 0; }
-.tc-row-top { display: flex; align-items: baseline; gap: var(--size-4-2); }
-
-.tc-caret {
-    flex-shrink: 0;
-    width: 12px;
-    margin-top: 2px;
-    font-size: 9px;
-    color: var(--text-faint);
-    cursor: pointer;
-    user-select: none;
-    transition: color 0.1s ease;
-}
-.tc-caret:hover { color: var(--text-normal); }
-
-.tc-label { font-size: var(--font-ui-small); line-height: 1.4; word-break: break-word; }
 .tc-clickable { cursor: pointer; }
-.tc-clickable:hover { color: var(--text-accent); }
-.tc-done { text-decoration: line-through; color: var(--text-muted); opacity: 0.65; }
 
-.tc-time {
-    flex-shrink: 0;
-    font-size: var(--font-ui-smaller);
-    font-weight: var(--font-medium);
-    font-variant-numeric: tabular-nums;
-    color: var(--text-accent);
+/* Свайп вправо по рядку (мобільний): виконати / зняти виконання.
+   pan-y лишає вертикальний скрол системі, горизонтальний рух обробляємо самі. */
+.tc-row { touch-action: pan-y; transition: background var(--tc-transition), transform 0.15s ease; }
+.tc-row.tc-swiping { transition: background var(--tc-transition); }   /* тягнеться за пальцем без анімації */
+.tc-row.tc-swipe-commit { background: var(--tc-accent-soft); }
+
+/* Стани: виконано ≡ скасовано виглядають однаково (різниця лише в чекбоксі) */
+.tc-row-done, .tc-cancelled { opacity: 0.55; }
+.tc-row-done .tc-label, .tc-cancelled .tc-label { text-decoration: line-through; color: var(--text-muted); }
+.tc-done { text-decoration: line-through; color: var(--text-muted); }   /* підзадача в редакторі */
+
+/* Регулярна задача = пунктирний лівий край (зберігається після виконання) */
+.tc-recurring { border-left-style: dashed; }
+.tc-row.tc-recurring:not(.tc-event) { border-left-color: var(--card-color, var(--text-faint)); }
+
+/* Нативний чекбокс — акцентний колір теми */
+.tc-row > input[type="checkbox"] { accent-color: var(--interactive-accent); }
+
+/* Чекбокс задачі та ✕-бокс для скасованих — суцільна заливка, без обводки; сіра для
+   cancelled-поведінки, акцентна для кастомних "активних" статусів (у роботі тощо). */
+.tc-row > input[type="checkbox"], .tc-row > .tc-xbox { flex-shrink: 0; margin-inline-start: 6px; }
+.tc-xbox {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: var(--tc-check); height: var(--tc-check); box-sizing: border-box;
+    border: none; border-radius: 5px;
+    background: var(--text-faint);
+    color: var(--background-primary); font-size: 11px; line-height: 1; cursor: pointer; flex-shrink: 0;
+    transition: background var(--tc-transition);
+}
+.tc-xbox:hover { background: var(--text-muted); }
+.tc-xbox.tc-bar-cbx { width: var(--tc-check-bar); height: var(--tc-check-bar); font-size: 8px; border-radius: 4px; }
+.tc-xbox.tc-tl-cb { width: var(--tc-check-tl); height: var(--tc-check-tl); font-size: var(--tc-font-micro); border-radius: 4px; }
+.tc-xbox.tc-te-check { width: var(--tc-check-lg); height: var(--tc-check-lg); font-size: 12px; }
+
+/* Кастомні "активні" статуси (у роботі, заплановано, …) — акцентна заливка:
+   «відкрита задача, але не звичайне todo» */
+.tc-row > .tc-statusbox { flex-shrink: 0; margin-inline-start: 6px; }
+.tc-statusbox {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: var(--tc-check); height: var(--tc-check); box-sizing: border-box;
+    border: none; border-radius: 5px;
+    background: var(--interactive-accent);
+    color: var(--text-on-accent); font-size: 11px; line-height: 1; cursor: pointer; flex-shrink: 0;
+    transition: background var(--tc-transition);
+}
+.tc-statusbox:hover { background: var(--interactive-accent-hover); }
+.tc-statusbox.tc-bar-cbx { width: var(--tc-check-bar); height: var(--tc-check-bar); font-size: 8px; border-radius: 4px; }
+.tc-statusbox.tc-tl-cb { width: var(--tc-check-tl); height: var(--tc-check-tl); font-size: var(--tc-font-micro); border-radius: 4px; }
+.tc-statusbox.tc-te-check { width: var(--tc-check-lg); height: var(--tc-check-lg); font-size: 12px; }
+
+/* Товща лінія іконок на малих розмірах читається краще, ніж дефолтні 2px Lucide */
+.tc-xbox svg, .tc-statusbox svg, .tc-icon-preview svg, .tc-status-row-icon svg { stroke-width: var(--tc-icon-stroke); }
+
+@container (max-width: 560px) {
+    .tc-row > input[type="checkbox"] { width: 20px; height: 20px; }
 }
 
-.tc-rec { flex-shrink: 0; font-size: 0.8em; opacity: 0.65; }
-
-.tc-date-chip {
-    margin-left: auto;
-    font-size: var(--font-ui-smaller);
-    color: var(--text-faint);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
+/* Тіло рядка */
+.tc-row-main { flex: 1; min-width: 0; }
+.tc-row-top { display: flex; align-items: center; gap: var(--size-4-2); }
+.tc-label { font-size: var(--font-ui-small); line-height: 1.45; word-break: break-word; }
+@container (max-width: 560px) {
+    .tc-label { font-size: var(--font-ui-medium); line-height: 1.45; }
 }
 
-/* badges */
-.tc-badges { display: flex; flex-wrap: wrap; gap: var(--size-2-1); margin-top: 2px; }
+/* Правий блок рядка: кільце прогресу підзадач (зліва) + дата/час */
+.tc-row-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.tc-subprog { flex-shrink: 0; }
+.tc-time { font-size: var(--font-ui-smaller); font-weight: var(--font-medium); font-variant-numeric: tabular-nums; color: var(--text-accent); white-space: nowrap; }
+.tc-date-chip { font-size: var(--font-ui-smaller); color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tc-overdue-date { color: var(--text-error); font-weight: var(--font-medium); }
+
+/* Бейджі (теги / група / пріоритет); кольорові — через .tc-tinted вище */
+.tc-badges { display: flex; flex-wrap: wrap; gap: var(--size-2-1); margin-top: 3px; }
 .tc-badge {
-    font-size: var(--font-ui-smaller);
-    line-height: 1.6;
-    padding: 0 var(--size-4-2);
-    border-radius: var(--radius-l);
-    background: var(--background-modifier-hover);
-    color: var(--text-muted);
+    font-size: var(--font-ui-smaller); line-height: 1.7;
+    padding: 0 var(--size-4-2); border-radius: var(--tc-radius-pill);
+    background: var(--background-modifier-hover); color: var(--text-muted);
 }
-.tc-tag { color: var(--text-accent); }
+.tc-tag:not(.tc-tinted) { color: var(--text-accent); background: color-mix(in srgb, var(--text-accent) 10%, transparent); }
 
-/* progress */
-.tc-progress { display: inline-flex; align-items: center; gap: var(--size-4-1); margin-left: auto; }
-.tc-progress-num {
-    font-size: var(--font-ui-smaller);
-    color: var(--text-muted);
-    font-variant-numeric: tabular-nums;
+/* Превʼю опису ("показувати деталі") */
+.tc-desc-preview {
+    margin-top: 3px; font-size: var(--font-ui-smaller); color: var(--text-muted);
+    white-space: pre-wrap; max-height: 2.8em; overflow: hidden;
+    -webkit-mask-image: linear-gradient(180deg, black 55%, transparent);
+    mask-image: linear-gradient(180deg, black 55%, transparent);
 }
-.tc-progress-bar {
-    display: inline-block;
-    width: 42px;
-    height: 4px;
-    border-radius: var(--radius-l);
-    background: var(--background-modifier-border);
-    overflow: hidden;
-}
-.tc-progress-fill { display: block; height: 100%; background: var(--interactive-accent); border-radius: inherit; }
 
-/* expandable detail (subtasks + comments) */
-.tc-detail {
-    margin: 2px 0 var(--size-4-2) 28px;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    border-left: 2px solid var(--background-modifier-border);
-    padding-left: var(--size-4-2);
-}
-.tc-subrow { display: flex; align-items: center; gap: var(--size-4-2); padding: 1px 0; }
+/* Підзадачі в редакторі */
+.tc-subrow { display: flex; align-items: center; gap: var(--size-4-2); padding: 2px 0; }
 .tc-subrow .tc-label { font-size: var(--font-ui-smaller); }
-.tc-commentrow { display: flex; align-items: baseline; gap: var(--size-4-1); color: var(--text-muted); padding: 1px 0; }
-.tc-comment-text { font-size: var(--font-ui-smaller); font-style: italic; }
-
 .tc-del {
-    margin-left: auto;
-    cursor: pointer;
-    color: var(--text-faint);
-    font-size: var(--font-ui-smaller);
-    padding: 0 var(--size-4-1);
-    opacity: 0;
-    transition: opacity 0.1s ease, color 0.1s ease;
+    margin-left: auto; cursor: pointer; color: var(--text-faint);
+    font-size: var(--font-ui-smaller); padding: 0 var(--size-4-1);
+    opacity: 0; transition: opacity var(--tc-transition), color var(--tc-transition);
 }
-.tc-subrow:hover .tc-del,
-.tc-commentrow:hover .tc-del { opacity: 1; }
+.tc-subrow:hover .tc-del { opacity: 1; }
 .tc-del:hover { color: var(--text-error); }
+.is-mobile .tc-del { opacity: 1; }
 
-.tc-empty { color: var(--text-muted); font-style: italic; font-size: var(--font-ui-small); padding: var(--size-4-2) 0; }
-
-/* ── List groups ─────────────────────────────────────────────────────────── */
-.tc-group { margin-bottom: var(--size-4-4); }
+/* Групи (заголовок зі стрілкою-згортанням + лічильник) */
+.tc-group { margin-bottom: var(--size-4-6); }
 .tc-group-head {
-    display: flex;
-    align-items: center;
-    gap: var(--size-4-2);
-    margin-bottom: var(--size-4-1);
-    padding-bottom: var(--size-2-1);
-    border-bottom: 1px solid var(--background-modifier-border);
+    display: flex; align-items: center; gap: var(--size-4-2);
+    margin-bottom: var(--size-4-2); padding: var(--size-2-2) 0;
+    cursor: pointer; user-select: none;
+    border-radius: var(--radius-s);
 }
-.tc-group-title { font-weight: var(--font-semibold); font-size: var(--font-ui-small); }
+.tc-group-caret { display: inline-flex; color: var(--text-faint); margin-right: 2px; transition: color var(--tc-transition); }
+.tc-group-head:hover .tc-group-caret { color: var(--text-normal); }
+.tc-group-caret .svg-icon { width: 16px; height: 16px; }
+.tc-group-title { font-size: var(--font-ui-medium); font-weight: var(--font-semibold); color: var(--text-normal); }
 .tc-group-count {
-    font-size: var(--font-ui-smaller);
-    color: var(--text-muted);
-    background: var(--background-modifier-hover);
-    border-radius: var(--radius-l);
-    padding: 0 var(--size-4-2);
-}
-
-/* ── Calendar header ─────────────────────────────────────────────────────── */
-.tc-cal-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--size-4-2);
-    margin-bottom: var(--size-4-2);
-}
-.tc-mode-group {
-    display: flex;
-    gap: 2px;
-    background: var(--background-modifier-hover);
-    padding: 2px;
-    border-radius: var(--radius-m);
-}
-.tc-nav-group { display: flex; gap: 2px; align-items: center; }
-
-.tc-mode-btn {
-    padding: var(--size-2-1) var(--size-4-2);
-    border-radius: var(--radius-s);
-    background: transparent;
-    border: none;
-    color: var(--text-muted);
-    cursor: pointer;
-    font-size: var(--font-ui-smaller);
-    box-shadow: none;
-}
-.tc-mode-btn:hover { color: var(--text-normal); background: transparent; }
-.tc-mode-active, .tc-mode-active:hover {
-    background: var(--background-primary);
-    color: var(--text-normal);
-    box-shadow: var(--shadow-s);
-}
-
-.tc-nav-btn {
-    padding: var(--size-2-1) var(--size-4-2);
-    border-radius: var(--radius-s);
-    background: transparent;
-    border: none;
-    color: var(--text-muted);
-    cursor: pointer;
-    font-size: var(--font-ui-smaller);
-    box-shadow: none;
-}
-.tc-nav-btn:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
-
-.tc-cal-title {
-    text-align: center;
-    font-weight: var(--font-semibold);
-    margin-bottom: var(--size-4-2);
-    font-size: var(--font-ui-medium);
+    font-size: var(--font-ui-smaller); color: var(--text-muted);
+    background: var(--background-modifier-hover); border-radius: var(--tc-radius-pill); padding: 1px 8px;
     font-variant-numeric: tabular-nums;
 }
+.tc-overdue-group .tc-group-title { color: var(--text-error); }
 
-/* ── Month grid ──────────────────────────────────────────────────────────── */
-.tc-month-grid {
-    display: grid;
-    grid-template-columns: repeat(7, 1fr);
-    gap: var(--size-2-1);
+
+/* ═══ 3. СПИСОК ЗАДАЧ ════════════════════════════════════════════════════════ */
+
+/* Дві панелі: бічна (фільтри) + контент */
+.tc-list-2pane { display: flex; align-items: stretch; position: relative; }
+.tc-list-main { flex: 1; min-width: 0; }
+
+/* Бічна панель фільтрів — як нативна навігація (File explorer) */
+.tc-list-side {
+    flex: 0 0 240px; width: 240px;
+    padding-right: 14px; margin-right: 16px;
+    border-right: 1px solid var(--tc-hairline-soft);
+    overflow-y: auto;
 }
-.tc-wd {
-    text-align: center;
-    font-size: var(--font-ui-smaller);
-    color: var(--text-faint);
-    padding: 2px 0;
+/* Підкладка під overlay-панеллю: клік/тап поза панеллю закриває її */
+.tc-side-backdrop {
+    position: absolute; inset: 0; z-index: 19;
+    background: color-mix(in srgb, var(--background-primary) 55%, transparent);
 }
-.tc-day-cell {
-    min-height: 56px;
-    border: 1px solid var(--background-modifier-border);
+
+/* На вузькому — накладка поверх списку (відкривається кнопкою-гамбургером) */
+.tc-list-side-overlay {
+    position: absolute; left: 0; top: 0; bottom: 0; z-index: 20;
+    flex: none; width: 260px; padding: 12px; margin: 0;
+    background: var(--background-primary);
+    border-right: 1px solid var(--tc-hairline);
+    box-shadow: var(--shadow-l);
+    border-radius: 0 var(--tc-radius-card) var(--tc-radius-card) 0;
+}
+.tc-side-sec { margin-bottom: 18px; }
+.tc-side-sec-title { font-size: var(--font-ui-smaller); text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); margin: 0 8px 6px; }
+.tc-side-row {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+    border-radius: var(--radius-s); cursor: pointer; color: var(--text-muted);
+    transition: background var(--tc-transition), color var(--tc-transition);
+}
+.tc-side-row:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.tc-side-row.is-active {
+    background: var(--tc-accent-soft);
+    color: var(--text-normal); font-weight: var(--font-medium);
+}
+.tc-side-row.is-active .tc-side-ic { color: var(--interactive-accent); }
+.tc-side-ic { display: inline-flex; color: var(--text-muted); }
+.tc-side-ic .svg-icon { width: 16px; height: 16px; }
+.tc-side-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0; }
+.tc-side-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: var(--font-ui-small); }
+.tc-side-count { color: var(--text-faint); font-size: var(--font-ui-smaller); font-variant-numeric: tabular-nums; }
+
+/* Хедер списку (гамбургер + назва фільтра + іконки) і композер під ним */
+.tc-list-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.tc-list-title { font-size: var(--font-ui-large); font-weight: var(--font-bold); letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tc-toolbar-spacer { flex: 1; }
+.tc-listview .tc-composer-field { padding-bottom: 16px; }
+
+/* Рядки у вью «Список»: заокруглені, розділені лише повітрям; заголовки груп липкі */
+.tc-listview .tc-list { gap: 2px; }
+.tc-listview .tc-row {
+    padding: 9px 10px; gap: 11px;
+    background: transparent;
+}
+.tc-listview .tc-row:hover { background: var(--background-modifier-hover); }
+.tc-listview .tc-row.tc-event { background: var(--background-secondary); }
+.tc-listview .tc-label { font-size: var(--font-ui-medium); }
+.tc-listview .tc-group-head {
+    position: sticky; top: -1px; z-index: 1;
+    background: color-mix(in srgb, var(--background-primary) 88%, transparent);
+    -webkit-backdrop-filter: blur(4px);
+    backdrop-filter: blur(4px);
+}
+@container (max-width: 560px) {
+    .tc-listview .tc-row { padding: 12px 8px; }
+}
+
+/* Стрічка звичок у списку: квадратні картки із заливкою кольором звички (--hc) */
+.tc-habit-strip { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 14px; padding-bottom: 2px; }
+.tc-habit-strip .tc-habit-chip {
+    flex: 0 0 auto;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+    width: 74px; height: 74px; padding: 8px 6px;
+    border: none; border-radius: var(--tc-radius-card); cursor: pointer;
+    background: color-mix(in srgb, var(--hc, var(--interactive-accent)) 16%, var(--background-secondary));
+    transition: background var(--tc-transition), transform var(--tc-transition);
+}
+.tc-habit-strip .tc-habit-chip:hover {
+    background: color-mix(in srgb, var(--hc, var(--interactive-accent)) 26%, var(--background-secondary));
+}
+.tc-habit-strip .tc-habit-chip:active { transform: scale(0.97); }
+.tc-habit-strip .tc-habit-chip.is-done { opacity: 0.4; }
+.tc-habit-chip-emoji { font-size: 1.6em; line-height: 1; }
+.tc-habit-chip-name { font-size: var(--font-ui-smaller); max-width: 66px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@container (max-width: 520px) {
+    .tc-listview .tc-habit-strip .tc-habit-chip { width: 56px; height: 56px; }
+    .tc-listview .tc-habit-strip .tc-habit-chip-name { display: none; }   /* лише іконка коли тісно */
+}
+
+
+/* ═══ 4. КАЛЕНДАР — ХЕДЕР ════════════════════════════════════════════════════ */
+
+.tc-cal-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: var(--size-4-2); margin-bottom: var(--size-4-3); }
+.tc-cal-title { font-weight: var(--font-semibold); font-size: var(--font-ui-medium); font-variant-numeric: tabular-nums; }
+.tc-cal-controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--size-4-2); }
+.tc-nav-group {
+    display: flex; gap: 0; align-items: center;
+    background: var(--background-secondary);
+    border-radius: var(--radius-m); padding: 1px;
+}
+/* Уніфікований перемикач періоду: ◀ [назва → сьогодні] ▶ (звички/календар) */
+.tc-nav-group > button { box-shadow: none; }
+.tc-nav-label {
+    background: transparent; border: none; box-shadow: none;
+    padding: 4px 12px; font-weight: var(--font-semibold); cursor: pointer;
+    color: var(--text-normal); font-variant-numeric: tabular-nums;
     border-radius: var(--radius-s);
+    transition: background var(--tc-transition);
+}
+.tc-nav-label:hover { background: var(--background-modifier-hover); }
+@container (max-width: 560px) {
+    .tc-cal-header { gap: 6px; flex-wrap: nowrap; }
+    .tc-cal-title { flex: 1; text-align: center; }
+    .tc-cal-controls { gap: 2px; }
+}
+
+
+/* ═══ 5. МІСЯЦЬ (повна сітка) ════════════════════════════════════════════════ */
+
+.tc-month-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: var(--size-2-1); }
+.tc-wd { text-align: center; font-size: var(--font-ui-smaller); font-weight: var(--font-medium); color: var(--text-faint); padding: 2px 0 4px; text-transform: uppercase; letter-spacing: 0.03em; }
+
+.tc-day-cell {
+    height: 96px; overflow: hidden;
+    border: 1px solid var(--tc-hairline-soft);
+    border-radius: var(--tc-radius-row);
     padding: var(--size-2-1) var(--size-4-1);
     cursor: pointer;
-    display: flex;
-    flex-direction: column;
-    gap: var(--size-2-1);
-    transition: background 0.1s ease, border-color 0.1s ease;
+    display: flex; flex-direction: column; gap: var(--size-2-1);
+    transition: background var(--tc-transition), border-color var(--tc-transition);
 }
-.tc-day-cell:hover { background: var(--background-modifier-hover); border-color: var(--background-modifier-border-hover); }
+.tc-day-cell:hover { background: var(--background-modifier-hover); border-color: var(--tc-hairline); }
 .tc-outside { opacity: 0.4; }
-.tc-today { border-color: var(--interactive-accent); }
+.tc-today {
+    border-color: color-mix(in srgb, var(--interactive-accent) 45%, transparent);
+    background: var(--tc-accent-weak);
+}
 .tc-today .tc-day-head > span:first-child {
-    color: var(--text-on-accent);
-    background: var(--interactive-accent);
-    border-radius: var(--radius-s);
-    padding: 0 4px;
+    color: var(--text-on-accent); background: var(--interactive-accent);
+    border-radius: var(--tc-radius-pill); padding: 0 6px; font-weight: var(--font-semibold);
 }
 .tc-selected { box-shadow: inset 0 0 0 2px var(--interactive-accent); }
+.tc-day-head { display: flex; justify-content: space-between; align-items: center; font-size: var(--font-ui-smaller); font-variant-numeric: tabular-nums; }
 
-.tc-day-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: var(--font-ui-smaller);
-}
-.tc-day-count { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+/* Десктоп: місяць заповнює всю висоту панелі (без нижнього блока) */
+.tc-cal-fill { display: flex; flex-direction: column; height: 100%; }
+.tc-cal-fill .tc-cal-header { flex: 0 0 auto; }
+.tc-cal-fill .tc-month-grid { flex: 1 1 auto; min-height: 0; grid-template-rows: auto repeat(6, minmax(0, 1fr)); }
+.tc-cal-fill .tc-day-cell { height: auto; min-height: 0; }
 
-.tc-dots { display: flex; flex-wrap: wrap; gap: 3px; }
-.tc-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); }
+/* Бар задачі в клітинці дня. Колір (--card-color) — тонований фон + лівий край. */
+.tc-day-items { position: relative; flex: 1 1 auto; min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: 2px; }
+.tc-bar {
+    position: relative; display: flex; align-items: center; gap: var(--size-4-1);
+    padding: 1px var(--size-4-2) 1px var(--size-4-1);
+    border-radius: var(--radius-s);
+    border-left: 3px solid var(--tc-hairline);
+    background: var(--background-secondary);
+    font-size: var(--tc-font-mini); line-height: 1.5; cursor: pointer; overflow: hidden;
+    transition: background var(--tc-transition);
+}
+.tc-bar:hover { background: var(--background-modifier-hover); }
+.tc-bar.tc-colored {
+    border-left-color: var(--card-color);
+    background: color-mix(in srgb, var(--card-color) var(--tc-tint-bg), var(--background-primary));
+}
+.tc-bar.tc-colored:hover { background: color-mix(in srgb, var(--card-color) var(--tc-tint-bg-hover), var(--background-primary)); }
+.tc-bar.tc-virtual, .tc-bar-recurring { border-left-style: dashed; }   /* регулярні — пунктир */
+.tc-bar-done .tc-bar-text, .tc-bar-cancelled .tc-bar-text { text-decoration: line-through; }
+.tc-bar-done, .tc-bar-cancelled { opacity: 0.55; }
+/* сірий напівпрозорий чекбокс у барі */
+.tc-bar input[type="checkbox"] { flex-shrink: 0; margin: 0; transform: scale(0.85); accent-color: var(--text-muted); opacity: 0.7; }
+.tc-bar-text {
+    flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: clip;
+    -webkit-mask-image: linear-gradient(90deg, black 82%, transparent);
+    mask-image: linear-gradient(90deg, black 82%, transparent);
+}
+.tc-bar-time { flex-shrink: 0; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.tc-bar-more { background: transparent; border-left-color: transparent; color: var(--text-muted); font-size: var(--font-ui-smaller); cursor: pointer; padding-left: 6px; }
+.tc-bar-more:hover { color: var(--text-normal); background: transparent; }
+@container (max-width: 760px) {
+    .tc-month-grid .tc-bar-cbx { display: none; }   /* на малому вікні чекбокс у барі ховаємо */
+}
+@container (max-width: 560px) {
+    .tc-bar { padding: 1px 5px; gap: 4px; }
+    .tc-bar-time { display: none; }
+}
 
-/* day detail panel under the month grid */
-.tc-day-detail {
-    margin-top: var(--size-4-4);
-    border-top: 1px solid var(--background-modifier-border);
-    padding-top: var(--size-4-3);
+/* Пріоритетна крапка (коли colorBy ≠ priority) */
+.tc-prio-dot { position: absolute; top: 3px; right: 3px; width: 6px; height: 6px; border-radius: 50%; box-shadow: 0 0 0 1.5px var(--background-primary); }
+
+/* Інлайн-розгортання дня в місяці (вузький екран: тап по дню) */
+.tc-month-expand {
+    grid-column: 1 / -1;
+    background: var(--background-secondary);
+    border-radius: var(--tc-radius-card);
+    padding: var(--size-4-2) var(--size-4-3);
+    margin: 2px 0 6px;
 }
-.tc-day-detail-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: var(--size-4-2);
+
+
+/* ═══ 6. OVERVIEW (крапки + панель дня) ══════════════════════════════════════ */
+/* Вузькі екрани (<1250px, перемикається в коді). Центрований блок ≤720px. */
+
+.tc-overview { max-width: 720px; margin: 0 auto; }
+.tc-dots-grid .tc-dots-cell {
+    height: auto; aspect-ratio: 1; width: 100%; max-width: 95px;   /* перебиваємо фіксовану висоту tc-day-cell */
+    justify-self: center; align-items: center; justify-content: flex-start; gap: 4px;
+    border-color: transparent;
 }
+.tc-dots-grid .tc-dots-cell:hover { border-color: var(--tc-hairline-soft); }
+.tc-dots-num { font-size: var(--font-ui-smaller); font-variant-numeric: tabular-nums; }
+.tc-dots { display: flex; flex-wrap: wrap; gap: 3px; justify-content: center; }
+.tc-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); box-sizing: border-box; }
+.tc-dot-hollow { background: transparent; border: 1.5px solid var(--text-muted); }   /* виконано */
+.tc-dot-x { background: transparent; border: none; position: relative; }              /* скасовано → ✕ */
+.tc-dot-x::before { content: '\2715'; position: absolute; inset: -2px 0 0; display: flex; align-items: center; justify-content: center; font-size: var(--tc-font-micro); color: var(--text-faint); }
+
+/* Панель дня під крапками: композер + список задач (ті самі, що у вью «Список») */
+.tc-day-detail { margin-top: var(--size-4-4); border-top: 1px solid var(--tc-hairline-soft); padding-top: var(--size-4-3); }
+.tc-day-detail-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--size-4-2); }
 .tc-day-detail-date { font-weight: var(--font-semibold); font-variant-numeric: tabular-nums; }
-.tc-col-empty { text-align: center; color: var(--text-faint); font-size: var(--font-ui-smaller); padding: var(--size-4-3) 0; }
-.tc-col-wd { display: block; font-size: var(--font-ui-smaller); color: var(--text-faint); }
-.tc-col-date { font-size: var(--font-ui-small); font-weight: var(--font-semibold); font-variant-numeric: tabular-nums; }
 
-/* ── Timeline (week / 3-day) ─────────────────────────────────────────────── */
-.tc-tl { --tc-axis: 48px; }
-.tc-tl-header,
-.tc-tl-allday,
-.tc-tl-grid {
+
+/* ═══ 7. ТИЖДЕНЬ — ТАЙМЛАЙН ══════════════════════════════════════════════════ */
+
+.tc-tl { --tc-axis: 48px; overflow-x: auto; }
+/* три синхронні сітки (хедер / весь день / годинна) однакової ширини; мін. день 140px */
+.tc-tl-header, .tc-tl-allday, .tc-tl-grid {
     display: grid;
     grid-template-columns: var(--tc-axis) repeat(var(--tc-col-count, 7), 1fr);
+    min-width: calc(var(--tc-axis) + var(--tc-col-count, 7) * 140px);
 }
-.tc-tl-header {
-    position: sticky;
-    top: 0;
-    z-index: 3;
-    background: var(--background-primary);
-    border-bottom: 1px solid var(--background-modifier-border);
-}
-.tc-tl-dayhead {
-    text-align: center;
-    padding: var(--size-2-1) 0;
-    border-left: 1px solid var(--background-modifier-border);
-}
+.tc-tl-header { position: sticky; top: 0; z-index: 3; background: var(--background-primary); border-bottom: 1px solid var(--tc-hairline); }
+.tc-tl-dayhead { text-align: center; padding: var(--size-2-2) 0; border-left: 1px solid var(--tc-hairline-soft); }
 .tc-tl-dayhead.tc-col-today .tc-col-date { color: var(--interactive-accent); }
+.tc-col-wd { display: block; font-size: var(--font-ui-smaller); color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.03em; }
+.tc-col-date { font-size: var(--font-ui-small); font-weight: var(--font-semibold); font-variant-numeric: tabular-nums; }
 
-.tc-tl-allday {
-    border-bottom: 1px solid var(--background-modifier-border);
-    min-height: 26px;
-}
-.tc-tl-axislabel {
-    font-size: 9px;
-    color: var(--text-faint);
-    text-align: right;
-    padding: var(--size-2-1) var(--size-4-1) 0 0;
-}
-.tc-tl-alldaycell {
-    border-left: 1px solid var(--background-modifier-border);
-    padding: 2px;
-    min-width: 0;
-}
+.tc-tl-allday { border-bottom: 1px solid var(--tc-hairline); min-height: 26px; }
+.tc-tl-axislabel { font-size: var(--tc-font-micro); color: var(--text-faint); text-align: right; padding: var(--size-2-1) var(--size-4-1) 0 0; }
+.tc-tl-alldaycell { border-left: 1px solid var(--tc-hairline-soft); padding: 2px; min-width: 0; }
 
+/* Згорнуті неробочі години */
 .tc-tl-strip {
-    text-align: center;
-    font-size: var(--font-ui-smaller);
-    color: var(--text-faint);
-    background: var(--background-secondary);
-    border-bottom: 1px solid var(--background-modifier-border);
-    padding: var(--size-2-1);
-    cursor: pointer;
-    transition: background 0.1s ease, color 0.1s ease;
+    text-align: center; font-size: var(--font-ui-smaller); color: var(--text-faint);
+    background: var(--background-secondary); border-bottom: 1px solid var(--tc-hairline-soft);
+    padding: var(--size-2-1); cursor: pointer;
+    transition: background var(--tc-transition), color var(--tc-transition);
 }
 .tc-tl-strip:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
 
+/* Годинна сітка: основні лінії — soft-hairline, підгодинні ще слабші */
 .tc-tl-grid { position: relative; }
 .tc-tl-axis { position: relative; }
-.tc-tl-hour { position: relative; border-top: 1px solid var(--background-modifier-border); box-sizing: border-box; }
-.tc-tl-hour span {
-    position: absolute;
-    top: -7px;
-    right: var(--size-4-1);
-    font-size: 9px;
-    color: var(--text-faint);
-    background: var(--background-primary);
-    padding: 0 2px;
-    font-variant-numeric: tabular-nums;
-}
-.tc-tl-col { position: relative; border-left: 1px solid var(--background-modifier-border); }
-.tc-tl-col.tc-col-today { background: color-mix(in srgb, var(--interactive-accent) 4%, transparent); }
-.tc-tl-col.tc-tl-col-drop { background: color-mix(in srgb, var(--interactive-accent) 16%, transparent); }
-.tc-tl-hourline { border-top: 1px solid var(--background-modifier-border-hover); box-sizing: border-box; }
-.tc-tl-hourline:nth-child(odd) { border-top-color: var(--background-modifier-border); }
+.tc-tl-hour { position: relative; border-top: 1px solid var(--tc-hairline-soft); box-sizing: border-box; }
+.tc-tl-hour span { position: absolute; top: -7px; right: var(--size-4-1); font-size: var(--tc-font-micro); color: var(--text-faint); background: var(--background-primary); padding: 0 2px; font-variant-numeric: tabular-nums; }
+.tc-tl-col { position: relative; border-left: 1px solid var(--tc-hairline-soft); }
+.tc-tl-col.tc-col-today { background: var(--tc-accent-weak); }
+.tc-tl-col.tc-tl-col-drop { background: var(--tc-accent-strong); }
+.tc-tl-hourline { border-top: 1px solid var(--tc-hairline-soft); box-sizing: border-box; }
 
+/* Лінія поточного часу */
+.tc-tl-now { position: absolute; left: var(--tc-axis); right: 0; height: 0; border-top: 2px solid var(--color-red); z-index: 4; pointer-events: none; }
+.tc-tl-now::before { content: ''; position: absolute; left: -3px; top: -4px; width: 7px; height: 7px; border-radius: 50%; background: var(--color-red); }
+
+/* Подія (картка з часом): без кольору — акцентний тон; з кольором — --card-color */
 .tc-tl-event {
-    position: absolute;
-    left: 2px;
-    right: 2px;
-    box-sizing: border-box;
-    overflow: hidden;
+    position: absolute; left: 2px; right: 2px; box-sizing: border-box; overflow: hidden;
+    display: flex; align-items: stretch; gap: 4px;
     border-radius: var(--radius-s);
-    border-left: 3px solid var(--interactive-accent);
-    background: color-mix(in srgb, var(--interactive-accent) 18%, var(--background-primary));
+    border-left: 3px solid var(--card-color, var(--interactive-accent));
+    background: color-mix(in srgb, var(--card-color, var(--interactive-accent)) var(--tc-tint-bg), var(--background-primary));
     padding: 2px var(--size-4-2);
-    font-size: var(--font-ui-smaller);
-    line-height: 1.3;
-    cursor: grab;
-    z-index: 1;
+    font-size: var(--font-ui-smaller); line-height: 1.3; cursor: grab; z-index: 1;
+    transition: box-shadow var(--tc-transition);
 }
-.tc-tl-event:hover { box-shadow: var(--shadow-s); }
-.tc-tl-event:active { cursor: grabbing; }
-.tc-tl-event.tc-virtual { opacity: 0.6; border-left-style: dashed; cursor: pointer; }
-.tc-tl-event-time { font-weight: var(--font-medium); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.tc-tl-event-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tc-tl-event:hover { box-shadow: var(--shadow-s); z-index: 2; }
+.tc-tl-event:active { cursor: grabbing; box-shadow: var(--shadow-l); }
+.tc-tl-event.tc-virtual, .tc-tl-event.tc-tl-recurring { border-left-style: dashed; }   /* регулярні — пунктир */
+.tc-tl-event.tc-virtual { cursor: pointer; }
+.tc-tl-done, .tc-tl-event.tc-cancelled { opacity: 0.55; }
+.tc-tl-cb { transform: scale(0.78); margin: 0 !important; flex-shrink: 0; accent-color: var(--text-muted); opacity: 0.7; }
+
+/* тіло події: звичайне — назва над часом; компактне (≤30хв) — в один рядок із fade */
+.tc-tl-event-body { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+.tc-tl-event-title {
+    font-weight: var(--font-medium); white-space: nowrap; overflow: hidden; text-overflow: clip;
+    -webkit-mask-image: linear-gradient(90deg, black 82%, transparent);
+    mask-image: linear-gradient(90deg, black 82%, transparent);
+}
+.tc-tl-event-time { font-size: 0.85em; color: var(--text-muted); font-variant-numeric: tabular-nums; margin-top: 1px; }
+.tc-tl-event-body-row {
+    flex-direction: row; align-items: baseline; gap: 6px; white-space: nowrap; overflow: hidden;
+    -webkit-mask-image: linear-gradient(90deg, black 80%, transparent);
+    mask-image: linear-gradient(90deg, black 80%, transparent);
+}
+.tc-tl-event-body-row .tc-tl-event-title,
+.tc-tl-event-body-row .tc-tl-event-time { flex: 0 0 auto; margin-top: 0; overflow: visible; text-overflow: clip; -webkit-mask-image: none; mask-image: none; }
+.tc-tl-event-compact { padding-top: 1px; padding-bottom: 1px; }
+
+/* ручки зміни розміру + превʼю створення */
 .tc-tl-handle { position: absolute; left: 0; right: 0; height: 7px; cursor: ns-resize; z-index: 2; }
 .tc-tl-handle-top { top: 0; }
 .tc-tl-handle-bottom { bottom: 0; }
+.tc-tl-preview { background: var(--tc-accent-strong); border: 1px dashed var(--interactive-accent); pointer-events: none; }
 
-/* ── Mini calendar (sidebar) ─────────────────────────────────────────────── */
-.tcm-pane { padding: var(--size-4-2); }
-.tcm-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: var(--size-4-2);
-}
-.tcm-title {
-    font-size: var(--font-ui-small);
-    font-weight: var(--font-semibold);
-    cursor: pointer;
-    text-align: center;
-    flex: 1;
-}
-.tcm-title:hover { color: var(--text-accent); }
-.tcm-nav {
-    background: transparent;
-    border: none;
-    box-shadow: none;
-    color: var(--text-muted);
-    cursor: pointer;
-    font-size: 1.1em;
-    padding: 0 var(--size-4-2);
-    line-height: 1;
-}
-.tcm-nav:hover { color: var(--text-normal); }
-
-.tcm-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
-.tcm-wd { font-size: 9px; text-align: center; color: var(--text-faint); padding-bottom: 2px; }
-.tcm-cell {
-    aspect-ratio: 1 / 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 2px;
+/* All-day чип — той самий вигляд, що й подія (кольоровий, пунктир для регулярних) */
+.tc-tl-allday-card {
+    display: flex; align-items: center; gap: 5px; padding: 2px 7px; margin-bottom: 3px;
     border-radius: var(--radius-s);
-    font-size: var(--font-ui-smaller);
-    cursor: pointer;
+    border-left: 3px solid var(--card-color, var(--interactive-accent));
+    background: color-mix(in srgb, var(--card-color, var(--interactive-accent)) var(--tc-tint-bg), var(--background-primary));
+    font-size: 12px; cursor: pointer; overflow: hidden;
+    transition: background var(--tc-transition);
+}
+.tc-tl-allday-card:hover { background: color-mix(in srgb, var(--card-color, var(--interactive-accent)) var(--tc-tint-bg-hover), var(--background-primary)); }
+.tc-tl-allday-card.tc-virtual, .tc-tl-allday-card.tc-tl-recurring { border-left-style: dashed; }
+.tc-tl-allday-card .tc-tl-event-title { flex: 1; min-width: 0; }
+
+
+/* ═══ 8. МІНІ-КАЛЕНДАР (бічна панель) ════════════════════════════════════════ */
+
+.tcm-pane { padding: var(--size-4-2); }
+.tcm-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--size-4-2); }
+.tcm-title { font-size: var(--font-ui-small); font-weight: var(--font-semibold); cursor: pointer; text-align: center; flex: 1; border-radius: var(--radius-s); padding: 2px 0; transition: background var(--tc-transition); }
+.tcm-title:hover { background: var(--background-modifier-hover); }
+.tcm-nav { background: transparent; border: none; box-shadow: none; color: var(--text-muted); cursor: pointer; font-size: 1.1em; padding: 0 var(--size-4-2); line-height: 1; border-radius: var(--radius-s); }
+.tcm-nav:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.tcm-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+.tcm-wd { font-size: var(--tc-font-micro); text-align: center; color: var(--text-faint); padding-bottom: 2px; text-transform: uppercase; }
+.tcm-cell {
+    aspect-ratio: 1 / 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+    border-radius: var(--radius-s); font-size: var(--font-ui-smaller); cursor: pointer;
     border: 1px solid transparent;
-    transition: background 0.1s ease;
+    transition: background var(--tc-transition), border-color var(--tc-transition);
 }
 .tcm-cell:hover { background: var(--background-modifier-hover); }
 .tcm-outside { opacity: 0.3; }
-.tcm-has-file { background: color-mix(in srgb, var(--interactive-accent) 13%, transparent); }
+.tcm-has-file { background: var(--tc-accent-soft); }
 .tcm-today { border-color: var(--interactive-accent); font-weight: var(--font-semibold); }
 .tcm-num { line-height: 1; font-variant-numeric: tabular-nums; }
 .tcm-dots { display: flex; gap: 2px; height: 5px; align-items: center; }
@@ -501,564 +657,193 @@
 .tcm-dot-filled { background: var(--interactive-accent); }
 .tcm-dot-hollow { border: 1px solid var(--text-muted); }
 
-/* ── Habits ──────────────────────────────────────────────────────────────── */
-.tc-habits { display: flex; flex-direction: column; gap: 2px; margin-top: var(--size-4-3); }
-.tc-habit-row { display: grid; grid-template-columns: 110px repeat(7, 1fr); gap: var(--size-4-1); align-items: stretch; }
-.tc-habit-name { display: flex; flex-direction: column; justify-content: center; padding: 2px var(--size-4-1); }
-.tc-habit-title { font-size: var(--font-ui-small); font-weight: var(--font-medium); }
-.tc-habit-unit { font-size: 10px; color: var(--text-faint); }
-.tc-habit-cell {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 32px;
-    border: 1px solid var(--background-modifier-border);
-    border-radius: var(--radius-s);
-    padding: var(--size-2-1);
+
+/* ═══ 9. ЗВИЧКИ — ДАШБОРД ════════════════════════════════════════════════════ */
+
+/* Дві панелі (список + деталі), центровані, ≤1200px. Згортання в одну — у коді (<860px). */
+.tc-habits-2pane { display: grid; grid-template-columns: minmax(300px, 420px) 1fr; gap: 28px; align-items: start; max-width: 1200px; margin: 0 auto; }
+.tc-habits-list, .tc-habits-detail { min-width: 0; }
+
+/* Ліва панель — власний контейнер: назви ховаються за ШИРИНОЮ цього блоку */
+.tc-hl { container-type: inline-size; }
+.tc-hl-grid { display: grid; grid-template-columns: minmax(150px, 1.2fr) repeat(7, minmax(0, 1fr)); align-items: center; gap: 4px; }
+@container (max-width: 300px) {
+    .tc-hl-name, .tc-hl-streak { display: none; }                       /* лишаються тільки іконки */
+    .tc-hl-grid { grid-template-columns: 38px repeat(7, minmax(0, 1fr)); }
 }
-.tc-habit-head .tc-habit-cell { border: none; min-height: auto; padding: 0 0 2px; flex-direction: column; }
-.tc-habit-today { border-color: var(--interactive-accent); }
-.tc-habit-head .tc-habit-today .tc-col-date { color: var(--interactive-accent); }
-.tc-habit-input { width: 100%; max-width: 52px; text-align: center; }
+.tc-hl-weekhead { padding: 4px 0 8px; border-bottom: 1px solid var(--tc-hairline-soft); margin-bottom: 6px; }
+.tc-hl-dayhead { display: flex; flex-direction: column; align-items: center; gap: 3px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.tc-hl-dayhead.tc-hl-today .tc-col-wd { color: var(--interactive-accent); font-weight: var(--font-semibold); }
+.tc-hl-row { padding: 8px 6px; border-radius: var(--tc-radius-row); transition: background var(--tc-transition); }
+.tc-hl-row:hover { background: var(--background-modifier-hover); }
+.tc-hl-row.is-selected { background: var(--tc-accent-soft); box-shadow: inset 0 0 0 1px var(--tc-accent-strong); }
+.tc-hl-info { display: flex; align-items: center; gap: 10px; cursor: pointer; min-width: 0; }
+.tc-hl-badge { width: 34px; height: 34px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; background: var(--background-modifier-border); flex-shrink: 0; }
+.tc-hl-meta { min-width: 0; }
+.tc-hl-name { font-weight: var(--font-semibold); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tc-hl-streak { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.tc-hl-cell { display: flex; align-items: center; justify-content: center; }
+.tc-hl-cell.tc-clickable { cursor: pointer; }
 
-/* ── Modals ──────────────────────────────────────────────────────────────── */
-.tc-modal-btns { display: flex; justify-content: flex-end; gap: var(--size-4-2); margin-top: var(--size-4-4); }
+/* SVG-кільце прогресу (тиждень, місячний календар деталей) */
+.tc-ring-wrap { position: relative; display: inline-flex; align-items: center; justify-content: center; }
+.tc-ring { width: 100%; height: 100%; display: block; }
+.tc-ring-center { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; color: var(--text-muted); pointer-events: none; font-variant-numeric: tabular-nums; }
+.tc-ring-full .tc-ring-center { color: var(--text-normal); font-weight: var(--font-semibold); }
 
-.tc-qc-tabs {
-    display: flex;
-    gap: 2px;
-    margin-bottom: var(--size-4-4);
-    background: var(--background-modifier-hover);
-    padding: 2px;
-    border-radius: var(--radius-m);
-}
-.tc-qc-tab {
-    flex: 1;
-    padding: var(--size-4-1) var(--size-4-2);
-    border-radius: var(--radius-s);
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    cursor: pointer;
-    font-size: var(--font-ui-smaller);
-    box-shadow: none;
-}
-.tc-qc-tab:hover { color: var(--text-normal); }
-.tc-qc-tab-active, .tc-qc-tab-active:hover {
-    background: var(--background-primary);
-    color: var(--text-normal);
-    box-shadow: var(--shadow-s);
-}
+/* Деталі: хедер */
+.tc-hd-head { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+.tc-hd-title { display: flex; align-items: center; gap: 8px; font-size: var(--font-ui-large); font-weight: var(--font-bold); flex: 1; min-width: 0; }
+.tc-hd-emoji { font-size: 1.3em; }
+.tc-hd-subhead { font-weight: var(--font-semibold); margin: 20px 0 8px; }
 
-.tc-editor h4 { margin: var(--size-4-3) 0 var(--size-4-1); font-size: var(--font-ui-small); color: var(--text-muted); }
-.tc-editor-desc { width: 100%; }
-.tc-editor-desc-row { align-items: flex-start; }
-.tc-editor-footer { display: flex; align-items: center; justify-content: space-between; margin-top: var(--size-4-4); }
-.tc-btn-icon { display: inline-flex; align-items: center; justify-content: center; padding: var(--size-4-1); }
-.tc-btn-icon .svg-icon { width: 16px; height: 16px; }
-.tc-btn-danger { background: var(--interactive-normal); color: var(--text-muted); box-shadow: var(--input-shadow); }
-.tc-btn-danger:hover { background: var(--background-modifier-error); color: var(--text-on-accent); }
+/* Деталі: картки-метрики — без рамок, як картки налаштувань */
+.tc-metric-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.tc-metric-card { background: var(--background-secondary); border-radius: var(--tc-radius-card); padding: 12px 14px; }
+.tc-metric-top { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.tc-metric-icon { display: inline-flex; }
+.tc-metric-icon .svg-icon { width: 15px; height: 15px; }
+.tc-metric-value { font-size: 1.5em; font-weight: var(--font-bold); margin-top: 4px; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.tc-metric-sub { font-size: var(--font-ui-smaller); color: var(--text-faint); }
 
-/* ── Calendar header controls ────────────────────────────────────────────── */
-.tc-cal-header .tc-cal-title { margin: 0; text-align: left; }
-.tc-cal-controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--size-4-2); }
+/* Деталі: місячний календар із кільцями */
+.tc-ring-cal { margin-top: 20px; }
+.tc-ringcal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; justify-items: center; }
+.tc-ringcal-grid .tc-wd { font-size: var(--font-ui-smaller); color: var(--text-faint); }
+.tc-ringcal-cell { display: flex; align-items: center; justify-content: center; padding: 2px; border-radius: 8px; transition: background var(--tc-transition); }
+.tc-ringcal-cell.tc-clickable { cursor: pointer; }
+.tc-ringcal-cell.tc-clickable:hover { background: var(--background-modifier-hover); }
+.tc-ringcal-cell.tc-today { box-shadow: inset 0 0 0 2px var(--interactive-accent); }
+.tc-ringcal-cell.tc-outside { opacity: 0.4; }
 
-/* ── Month task bars ─────────────────────────────────────────────────────── */
-.tc-day-items { display: flex; flex-direction: column; gap: 2px; }
-.tc-bar {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: var(--size-4-1);
-    padding: 1px var(--size-4-2) 1px var(--size-4-1);
-    border-radius: var(--radius-s);
-    border-left: 3px solid var(--background-modifier-border);
-    background: var(--background-secondary);
-    font-size: var(--font-ui-smaller);
-    line-height: 1.5;
-    cursor: pointer;
-    overflow: hidden;
-}
-.tc-bar:hover { filter: brightness(1.05); }
-.tc-bar.tc-virtual { opacity: 0.65; border-left-style: dashed; }
-.tc-bar input[type="checkbox"] { flex-shrink: 0; margin: 0; transform: scale(0.85); }
-.tc-bar-text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tc-bar-time { flex-shrink: 0; color: var(--text-muted); font-variant-numeric: tabular-nums; }
-.tc-bar-done .tc-bar-text { text-decoration: line-through; opacity: 0.6; }
+/* Деталі: графік Daily Goals */
+.tc-barchart-wrap { margin-top: 20px; }
+.tc-barchart { position: relative; display: flex; align-items: flex-end; gap: 2px; height: 120px; padding-top: 4px; border-bottom: 1px solid var(--tc-hairline-soft); }
+.tc-bar-col { flex: 1; display: flex; align-items: flex-end; height: 100%; }
+.tc-bar-fill { width: 100%; min-height: 1px; background: var(--background-modifier-border); border-radius: 2px 2px 0 0; }
+.tc-bar-fill.tc-bar-done { background: var(--interactive-accent); }
+.tc-bar-goalline { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--interactive-accent); pointer-events: none; z-index: 4; }
+.tc-bar-goallabel { position: absolute; right: 2px; top: -8px; font-size: var(--tc-font-micro); color: var(--interactive-accent); background: var(--background-primary); padding: 0 3px; }
+.tc-bar-tip { position: absolute; top: 0; transform: translate(-50%, -110%); background: var(--background-secondary); border: 1px solid var(--tc-hairline); border-radius: var(--radius-s); padding: 1px 7px; font-size: var(--font-ui-smaller); font-variant-numeric: tabular-nums; white-space: nowrap; pointer-events: none; z-index: 6; box-shadow: var(--shadow-s); }
+.tc-barchart-axis { display: flex; gap: 2px; margin-top: 3px; }
+.tc-bar-axislabel { flex: 1; min-width: 0; text-align: center; font-size: var(--tc-font-micro); color: var(--text-faint); font-variant-numeric: tabular-nums; }
 
-/* priority dot (when colorBy != priority) */
-.tc-prio-dot {
-    position: absolute;
-    top: 3px;
-    right: 3px;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    box-shadow: 0 0 0 1px var(--background-primary);
-}
-
-/* ── Description preview (list "show details") ───────────────────────────── */
-.tc-desc-preview {
-    margin-top: 3px;
-    font-size: var(--font-ui-smaller);
-    color: var(--text-muted);
-    white-space: pre-wrap;
-    max-height: 2.8em;
-    overflow: hidden;
-    -webkit-mask-image: linear-gradient(180deg, #000 55%, transparent);
-    mask-image: linear-gradient(180deg, #000 55%, transparent);
-}
-
-/* ════════════════════════════════════════════════════════════════════════════
-   v0.18 — calendar refinements (overrides above where needed)
-   ════════════════════════════════════════════════════════════════════════════ */
-
-/* calendar checkboxes: grey, semi-transparent, smaller */
-.tc-tl input[type="checkbox"],
-.tc-bar input[type="checkbox"] {
-    --checkbox-color: var(--text-muted);
-    --checkbox-color-hover: var(--text-muted);
-    --checkbox-border-color: var(--text-faint);
-    accent-color: var(--text-muted);
-    opacity: 0.7;
-}
-.tc-tl-cb { transform: scale(0.78); margin: 0 !important; flex-shrink: 0; }
-
-/* whole card is clickable — no underline */
-.tc-clickable { cursor: pointer; }
-.tc-clickable:hover { text-decoration: none; }
-
-/* done = semi-transparent;  recurring = dashed border only (not transparent) */
-.tc-row-done, .tc-bar-done, .tc-tl-done { opacity: 0.5; }
-.tc-row.tc-virtual, .tc-bar.tc-virtual, .tc-tl-event.tc-virtual { opacity: 1; }
-
-/* timeline event card: checkbox + body(bold title, small grey time at the bottom) */
-.tc-tl-event { display: flex; align-items: stretch; gap: 4px; }
-.tc-tl-event-body { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
-.tc-tl-event-title {
-    font-weight: var(--font-normal);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: clip;
-    -webkit-mask-image: linear-gradient(90deg, #000 82%, transparent);
-    mask-image: linear-gradient(90deg, #000 82%, transparent);
-}
-.tc-tl-event-time { font-size: 0.85em; color: var(--text-muted); font-weight: var(--font-normal); margin-top: 1px; }
-
-/* fade-out instead of ellipsis on month bars + single-line all-day names */
-.tc-bar-text {
-    text-overflow: clip;
-    -webkit-mask-image: linear-gradient(90deg, #000 82%, transparent);
-    mask-image: linear-gradient(90deg, #000 82%, transparent);
-}
-.tc-tl-allday .tc-label {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: clip;
-    -webkit-mask-image: linear-gradient(90deg, #000 82%, transparent);
-    mask-image: linear-gradient(90deg, #000 82%, transparent);
-}
-
-/* month: equal-size cells, clip overflow */
-.tc-day-cell { height: 96px; min-height: 0; overflow: hidden; }
-
-/* drag-to-create preview */
-.tc-tl-preview {
-    background: color-mix(in srgb, var(--interactive-accent) 22%, transparent);
-    border: 1px dashed var(--interactive-accent);
-    pointer-events: none;
-}
-
-/* active filter icon */
-.clickable-icon.is-active { color: var(--interactive-accent); }
-
-/* editor: description fixed (no resize) */
-.tc-editor-desc { width: 100%; resize: none; margin-bottom: var(--size-4-2); }
-.tc-fullwidth { width: 100%; }
-
-/* chip inputs (tags / group) */
-.tc-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    align-items: center;
-    width: 100%;
-    border: 1px solid var(--background-modifier-border);
-    border-radius: var(--radius-s);
-    padding: 3px 5px;
-    background: var(--background-modifier-form-field);
-}
-.tc-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: var(--background-modifier-hover);
-    border-radius: var(--radius-l);
-    padding: 0 4px 0 8px;
-    font-size: var(--font-ui-smaller);
-}
-.tc-chip-x { cursor: pointer; color: var(--text-faint); }
-.tc-chip-x:hover { color: var(--text-error); }
-.tc-chip-input { flex: 1; min-width: 70px; border: none; background: transparent; color: var(--text-normal); font-size: var(--font-ui-smaller); outline: none; }
-
-/* ── Habits: today block in list, heatmap, stats ─────────────────────────── */
-.tc-habits-today { margin-bottom: var(--size-4-3); padding-bottom: var(--size-4-2); border-bottom: 1px solid var(--background-modifier-border); }
-.tc-habits-today .tc-group-title { margin-bottom: var(--size-4-1); display: block; }
-.tc-habit-listval { margin-left: auto; color: var(--text-muted); font-variant-numeric: tabular-nums; font-size: var(--font-ui-smaller); }
-.tc-habit-listinput { margin-left: auto; max-width: 84px; }
-.tc-habit-auto { color: var(--text-muted); font-variant-numeric: tabular-nums; }
-
-.tc-hr { border-top: 1px solid var(--background-modifier-border); margin: var(--size-4-4) 0; }
-
-.tc-heat-ctrls { display: flex; align-items: center; gap: var(--size-4-2); flex-wrap: wrap; margin-bottom: var(--size-4-3); }
-.tc-heat-title { font-weight: var(--font-semibold); margin-left: auto; font-variant-numeric: tabular-nums; }
-
-.tc-heat-month { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; max-width: 340px; }
-.tc-heat-wd { font-size: var(--font-ui-smaller); color: var(--text-faint); text-align: center; }
-.tc-heat-month .tc-heat-cell { aspect-ratio: 1 / 1; border-radius: var(--radius-s); }
-
-.tc-heat-year { display: flex; gap: 3px; overflow-x: auto; padding-bottom: var(--size-4-1); }
-.tc-heat-col { display: flex; flex-direction: column; gap: 3px; }
-.tc-heat-year .tc-heat-cell { width: 12px; height: 12px; border-radius: 2px; }
-
-.tc-heat-cell { background: var(--background-modifier-border); }
+/* Деталі: heatmap за рік (кубик 15–20px, скрол якщо не влазить) */
+.tc-heatblock { margin-top: 22px; }
+.tc-heat-year { display: flex; gap: 3px; width: 100%; overflow-x: auto; }
+.tc-heat-col { flex: 1 1 15px; min-width: 15px; max-width: 20px; display: flex; flex-direction: column; gap: 3px; }
+.tc-heat-cell { background: var(--background-modifier-border); width: 100%; aspect-ratio: 1; border-radius: 3px; }
 .tc-heat-dim { opacity: 0.3; }
+.tc-heat-col-active { outline: 1.5px solid var(--interactive-accent); outline-offset: 1px; border-radius: 4px; }
 
-.tc-stats { display: flex; gap: var(--size-4-2); margin-top: var(--size-4-4); flex-wrap: wrap; }
-.tc-stat-card { flex: 1; min-width: 120px; background: var(--background-secondary); border-radius: var(--radius-m); padding: var(--size-4-3); text-align: center; }
-.tc-stat-label { font-size: var(--font-ui-smaller); color: var(--text-muted); }
-.tc-stat-value { font-size: 1.7em; font-weight: var(--font-bold); line-height: 1.2; margin: 2px 0; }
-.tc-stat-sub { font-size: var(--font-ui-smaller); color: var(--text-faint); }
 
-/* list rows: time pinned to the right end */
-.tc-row .tc-time { margin-left: auto; }
+/* ═══ 10. СТВОРЕННЯ ЗАДАЧІ ═══════════════════════════════════════════════════ */
 
-/* ── Smart list (mobile-first agenda) ────────────────────────────────────── */
-.tc-smart { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--size-4-3); }
-.tc-smart .tc-add-row { margin-top: 0; }
-
-.tc-smart-habits { display: flex; gap: var(--size-4-2); overflow-x: auto; padding-bottom: 4px; }
-.tc-habit-chip {
-    flex-shrink: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 2px;
-    min-width: 68px;
-    padding: var(--size-4-2);
-    border: 1px solid var(--background-modifier-border);
-    border-radius: var(--radius-m);
-    background: var(--background-secondary);
-    cursor: pointer;
-}
-.tc-habit-chip:hover { background: var(--background-modifier-hover); }
-.tc-habit-chip-emoji { font-size: 1.5em; line-height: 1; }
-.tc-habit-chip-name { font-size: var(--font-ui-smaller); color: var(--text-muted); white-space: nowrap; max-width: 92px; overflow: hidden; text-overflow: ellipsis; }
-
-.tc-smart-sec { display: flex; flex-direction: column; gap: 2px; }
-.tc-smart-h {
-    font-size: var(--font-ui-smaller);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-faint);
-    font-weight: var(--font-semibold);
-    margin-bottom: var(--size-4-1);
-}
-.tc-smart-divider { border-top: 1px dashed var(--background-modifier-border); margin: var(--size-4-1) 0; }
-
-.tc-agenda-day { margin-bottom: var(--size-4-2); }
-.tc-agenda-date {
-    font-size: var(--font-ui-smaller);
-    font-weight: var(--font-medium);
-    color: var(--text-muted);
-    font-variant-numeric: tabular-nums;
-    padding: 2px 0;
-}
-
-/* ════════════════════════════════════════════════════════════════════════════
-   Mobile (Android / iOS) — larger fonts & touch targets, full-screen feel
-   ════════════════════════════════════════════════════════════════════════════ */
-.is-mobile .tc-pane { padding: 12px 14px; -webkit-overflow-scrolling: touch; }
-
-/* typography */
-.is-mobile .tc-label { font-size: var(--font-ui-medium); line-height: 1.45; }
-.is-mobile .tc-smart-h { font-size: var(--font-ui-small); }
-.is-mobile .tc-cal-title { font-size: var(--font-ui-large); }
-.is-mobile .tc-badge { font-size: var(--font-ui-smaller); padding: 1px 9px; }
-.is-mobile .tc-time { font-size: var(--font-ui-small); }
-
-/* rows: roomier, bigger tap area */
-.is-mobile .tc-row { padding: 9px 10px; gap: 12px; border-radius: var(--radius-m); }
-.is-mobile .tc-list { gap: 3px; }
-
-/* bigger checkboxes */
-.is-mobile input[type="checkbox"] { width: 22px; height: 22px; }
-.is-mobile .tc-row > input[type="checkbox"] { margin-top: 1px; }
-.is-mobile .tc-tl input[type="checkbox"], .is-mobile .tc-bar input[type="checkbox"] { width: 18px; height: 18px; transform: none; }
-
-/* inputs / selects */
-.is-mobile .tc-input, .is-mobile .tc-select, .is-mobile .tc-habit-input, .is-mobile .dropdown {
-    font-size: var(--font-ui-medium);
-    padding: 9px 12px;
-    min-height: 40px;
-}
-
-/* icon buttons / nav — 40px touch targets */
-.is-mobile .clickable-icon, .is-mobile .tc-icon-btn { width: 40px; height: 40px; border-radius: var(--radius-m); }
-.is-mobile .clickable-icon .svg-icon, .is-mobile .tc-icon-btn .svg-icon { width: 22px; height: 22px; }
-.is-mobile .tc-nav-btn, .is-mobile button { font-size: var(--font-ui-small); }
-
-/* toolbar */
-.is-mobile .tc-toolbar { gap: 10px; padding-bottom: 10px; }
-
-/* ── Smart list ── */
-.is-mobile .tc-smart { max-width: none; gap: 18px; }
-.is-mobile .tc-smart-habits { gap: 10px; }
-.is-mobile .tc-habit-chip { min-width: 88px; padding: 12px 10px; border-radius: var(--radius-l); }
-.is-mobile .tc-habit-chip-emoji { font-size: 1.9em; }
-.is-mobile .tc-habit-chip-name { font-size: var(--font-ui-smaller); max-width: 110px; }
-.is-mobile .tc-agenda-date { font-size: var(--font-ui-small); }
-
-/* ── Habits page ── */
-.is-mobile .tc-habit-title { font-size: var(--font-ui-small); }
-.is-mobile .tc-habit-cell { min-height: 40px; }
-.is-mobile .tc-stat-value { font-size: 2em; }
-.is-mobile .tc-heat-year .tc-heat-cell { width: 14px; height: 14px; }
-
-/* ── Calendar / month ── */
-.is-mobile .tc-day-cell { height: 84px; }
-.is-mobile .tc-bar { font-size: var(--font-ui-smaller); padding: 2px 6px; }
-.is-mobile .tc-cal-controls { gap: 8px; width: 100%; }
-.is-mobile .tc-cal-header { gap: 8px; }
-
-/* ── Modals: comfortable spacing ── */
-.is-mobile .tc-editor h3 { font-size: var(--font-ui-large); }
-.is-mobile .tc-editor-desc { font-size: var(--font-ui-medium); }
-.is-mobile .tc-modal-btns button, .is-mobile .tc-editor-footer button { min-height: 40px; padding: 0 16px; }
-.is-mobile .tc-chip { font-size: var(--font-ui-small); padding: 2px 6px 2px 10px; }
-.is-mobile .tc-chip-input { min-width: 90px; font-size: var(--font-ui-medium); }
-
-/* ── List view: flat rows, prominent group headers ───────────────────────── */
-.tc-listview .tc-list { gap: 0; }
-
-.tc-listview .tc-row {
-    padding: 10px 4px;
-    gap: 11px;
-    border-radius: 0;
-    background: transparent;
-    box-shadow: none;
-    border-left-width: 3px;
-    border-bottom: 1px solid var(--background-modifier-border);
-    align-items: center;
-}
-.tc-listview .tc-row.tc-event { background: transparent; }
-.tc-listview .tc-label { font-size: var(--font-ui-medium); }
-.tc-listview .tc-row > input[type="checkbox"] { margin-top: 0; width: 18px; height: 18px; }
-
-/* group spacing + header that reads like a section title */
-.tc-listview .tc-group { margin-bottom: var(--size-4-6); }
-.tc-listview .tc-group-head {
-    align-items: baseline;
-    gap: var(--size-4-2);
-    margin-bottom: var(--size-4-3);
-    padding-bottom: var(--size-4-2);
-    border-bottom: 1px solid var(--background-modifier-border);
-    position: sticky;
-    top: 0;
-    background: var(--background-primary);
-    z-index: 1;
-}
-.tc-listview .tc-group-title {
-    font-size: var(--font-ui-large);
-    font-weight: var(--font-bold);
-    color: var(--text-normal);
-}
-.tc-listview .tc-group-count {
-    font-size: var(--font-ui-smaller);
-    padding: 1px 8px;
-}
-
-/* mobile: a touch bigger */
-.is-mobile .tc-listview .tc-row { padding: 13px 4px; }
-.is-mobile .tc-listview .tc-group-title { font-size: var(--font-ui-large); }
-
-/* ════════════════════════════════════════════════════════════════════════════
-   v0.22 — month full-screen, agenda(dots), mobile calendar/habits, checkbox inset
-   ════════════════════════════════════════════════════════════════════════════ */
-
-/* checkbox inset in task lists — balance edge vs text gap */
-.tc-row > input[type="checkbox"], .tc-row > input[type="radio"] { margin-inline-start: 6px; }
-.tc-listview .tc-row { padding-left: 0; }
-
-/* desktop month: fill all available width & height (no bottom panel) */
-.tc-cal-fill { display: flex; flex-direction: column; height: 100%; }
-.tc-cal-fill .tc-cal-header { flex: 0 0 auto; }
-.tc-cal-fill .tc-month-grid {
-    flex: 1 1 auto;
-    min-height: 0;
-    grid-template-rows: auto repeat(6, minmax(0, 1fr));
-}
-.tc-cal-fill .tc-day-cell { height: auto; min-height: 0; }
-
-/* "Перелік" — dots calendar */
-.tc-dots-cell { min-height: 52px; align-items: center; justify-content: flex-start; gap: 4px; }
-.tc-dots-num { font-size: var(--font-ui-smaller); font-variant-numeric: tabular-nums; }
-.tc-dots-cell .tc-dots { justify-content: center; }
-.tc-dot { box-sizing: border-box; }
-.tc-dot-hollow { background: transparent !important; border: 1.5px solid var(--text-muted); }
-
-/* month inline expansion (mobile tap) */
-.tc-month-expand {
-    grid-column: 1 / -1;
-    background: var(--background-secondary);
-    border-radius: var(--radius-m);
-    padding: var(--size-4-2) var(--size-4-3);
-    margin: 2px 0 6px;
-}
-.tc-month-expand .tc-day-detail-head { margin-bottom: var(--size-4-2); }
-
-/* ── Mobile calendar ── */
-.is-mobile .tc-cal-header { gap: 6px; flex-wrap: nowrap; }
-.is-mobile .tc-cal-title { flex: 1; text-align: center; font-size: var(--font-ui-medium); }
-.is-mobile .tc-cal-controls { gap: 2px; }
-.is-mobile .tc-day-cell { height: auto; min-height: 62px; }
-.is-mobile .tc-bar { font-size: 0.72em; padding: 1px 5px; gap: 4px; }
-.is-mobile .tc-bar-time { display: none; }
-.is-mobile .tc-dots-cell { min-height: 56px; }
-.is-mobile .tc-dot { width: 7px; height: 7px; }
-
-/* ── Mobile habits: stacked cards ── */
-.tc-habit-cards { display: flex; flex-direction: column; gap: var(--size-4-2); }
-.tc-habit-card {
-    background: var(--background-secondary);
-    border-radius: var(--radius-m);
-    padding: var(--size-4-3);
-}
-.tc-habit-card .tc-habit-title { font-size: var(--font-ui-medium); margin-bottom: var(--size-4-2); }
-.tc-habit-week { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
-.tc-habit-daycell {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 0;
-    border-radius: var(--radius-s);
-}
-.tc-habit-daycell.tc-habit-today { background: color-mix(in srgb, var(--interactive-accent) 14%, transparent); }
-.tc-habit-dl { font-size: 0.66em; color: var(--text-faint); }
-.tc-habit-ctl { display: flex; align-items: center; justify-content: center; min-height: 28px; }
-.tc-habit-ctl .tc-habit-input { max-width: 100%; padding: 4px 2px; }
-.is-mobile .tc-heat-month { max-width: none; }
-
-/* ── Editable title input (editor & create modal) ────────────────────────── */
-.tc-title-input {
-    width: 100%;
-    border: none;
-    background: transparent;
-    color: var(--text-normal);
-    font-size: var(--font-ui-large);
-    font-weight: var(--font-bold);
-    padding: 4px 0;
-    margin-bottom: var(--size-4-2);
-    outline: none;
-    border-bottom: 1px solid transparent;
-}
-.tc-title-input:focus { border-bottom-color: var(--background-modifier-border); }
-
-/* ── Inline task composer: icons sit inside the input; options open in popovers */
+/* Інлайн-композер (список, панель дня): іконки всередині інпута */
 .tc-composer-field { position: relative; flex: 1; min-width: 0; display: flex; }
-.tc-composer-input { flex: 1; min-width: 0; padding-right: 56px; }
-.tc-composer-icons { position: absolute; right: 3px; top: 50%; transform: translateY(-50%); display: flex; }
+.tc-composer-input { flex: 1; min-width: 0; padding-right: 60px; border-radius: var(--tc-radius-row); }
+.tc-composer-icons { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); display: flex; }
 .tc-composer-icons .clickable-icon { width: 26px; height: 26px; }
 .tc-composer-icons .svg-icon { width: 16px; height: 16px; }
-.tc-toolbar-spacer { flex: 1; }
-.tc-smart .tc-composer-field { margin-bottom: var(--size-4-2); }
 
-.tc-popover {
-    position: fixed;
-    z-index: 50;
-    width: 290px;
-    max-width: 92vw;
-    background: var(--background-primary);
-    border: 1px solid var(--background-modifier-border);
-    border-radius: var(--radius-m);
-    box-shadow: var(--shadow-l);
-    padding: var(--size-4-2) var(--size-4-3);
+/* Повне вікно створення */
+.tc-create .tc-quick-row { display: flex; gap: 6px; margin: 12px 0 4px; }
+.tc-quick-summary { font-size: var(--font-ui-smaller); color: var(--text-muted); min-height: 1.2em; margin-bottom: 6px; }
+.tc-rec-preview { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-top: 8px; }
+
+/* Smart-опис: текст + чипи знизу */
+.tc-smartdesc-input { width: 100%; }
+.tc-smartdesc-chips { margin-top: 6px; }
+.tc-smartdesc-chips.tc-empty { display: none; }
+.tc-chip-group { /* група-чип; колір — через .tc-tinted */ }
+
+/* Інлайн-автодоповнення #/@ */
+.tc-suggest { position: fixed; z-index: 60; background: var(--background-primary); border: 1px solid var(--tc-hairline); border-radius: var(--tc-radius-card); box-shadow: var(--shadow-l); max-height: 220px; overflow-y: auto; padding: 4px; }
+.tc-suggest-item { padding: 5px 10px; border-radius: var(--radius-s); cursor: pointer; font-size: var(--font-ui-small); white-space: nowrap; }
+.tc-suggest-item.is-active, .tc-suggest-item:hover { background: var(--background-modifier-hover); }
+
+/* Діалог дати: швидкі кнопки */
+.tc-quick-dates { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.tc-quick-dates button { flex: 1 1 auto; }
+
+
+/* ═══ 11. РЕДАГУВАННЯ ЗАДАЧІ (4 шари, live-save) ═════════════════════════════ */
+
+.modal:has(.tc-task-edit) { width: min(540px, 94vw); }
+
+/* Спільне: редагований заголовок + опис */
+.tc-title-input {
+    width: 100%; border: none; background: transparent; color: var(--text-normal);
+    font-size: var(--font-ui-large); font-weight: var(--font-bold);
+    padding: 4px 0; margin-bottom: var(--size-4-2); outline: none;
+    border-bottom: 1px solid transparent;
+    transition: border-color var(--tc-transition);
 }
-.tc-popover .setting-item { padding: var(--size-4-1) 0; border: none; }
+.tc-title-input:focus { border-bottom-color: var(--tc-hairline); }
+.tc-te-title { font-size: 1.4em; margin: 2px 0 10px; }
+.tc-editor-desc { width: 100%; resize: none; margin-bottom: var(--size-4-2); }
 
-/* ── Floating action button (mobile) ─────────────────────────────────────── */
-.tc-fab {
-    position: fixed;
-    right: 18px;
-    bottom: calc(18px + var(--safe-area-inset-bottom, 0px));
-    width: 56px;
-    height: 56px;
-    border-radius: 50%;
-    background: var(--interactive-accent);
-    color: var(--text-on-accent);
-    border: none;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 30;
-    cursor: pointer;
+/* Шар 1: статус · дата/час · пріоритет */
+.tc-te-l1 { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.tc-te-check { width: var(--tc-check-lg); height: var(--tc-check-lg); accent-color: var(--interactive-accent); flex-shrink: 0; }
+.tc-te-date {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--background-secondary); border: none; border-radius: var(--tc-radius-pill);
+    padding: 5px 13px; color: var(--text-normal); cursor: pointer; font-size: var(--font-ui-small);
+    transition: background var(--tc-transition);
 }
-.tc-fab:active { transform: scale(0.94); }
-.tc-fab .svg-icon { width: 28px; height: 28px; }
+.tc-te-date:hover { background: var(--background-modifier-hover); }
+.tc-te-date-ic { display: inline-flex; color: var(--interactive-accent); }
+.tc-te-date-ic .svg-icon { width: 15px; height: 15px; }
+.tc-te-prio { margin-left: auto; }
 
-/* overdue: red date instead of time; emphasised group title */
-.tc-overdue-date { color: var(--text-error); font-weight: var(--font-medium); opacity: 1; }
-.tc-overdue-group .tc-group-title { color: var(--text-error); }
+/* Шар 3: опис + підзадачі + чипи тегів (скролиться за межею висоти) */
+.tc-te-l3 { max-height: 48vh; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 2px; }
+.tc-te-l3 .tc-editor-desc { resize: vertical; margin-bottom: 0; }
+.tc-te-subs { display: flex; flex-direction: column; gap: 2px; }
+.tc-te-tags.tc-chips { border: none; padding: 0; gap: 6px; background: transparent; }
+.tc-te-tags.tc-chips:empty { display: none; }
 
-/* month: equal cells, overflow → "+N" */
-.tc-day-items { flex: 1 1 auto; min-height: 0; overflow: hidden; }
-.tc-bar-more {
-    background: transparent;
-    border-left-color: transparent;
-    color: var(--text-muted);
-    font-size: var(--font-ui-smaller);
-    cursor: pointer;
-    padding-left: 6px;
+/* Шар 4: бейдж групи + ⋯ */
+.tc-te-l4 { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--tc-hairline-soft); }
+.tc-te-group {
+    display: inline-flex; align-items: center; gap: 6px;
+    border: none; border-radius: var(--tc-radius-pill); padding: 5px 14px;
+    font-size: var(--font-ui-small); font-weight: var(--font-semibold); cursor: pointer;
+    transition: background var(--tc-transition);
 }
-.tc-bar-more:hover { color: var(--text-normal); }
-.is-mobile .tc-day-cell { height: 88px; min-height: 0; }
+.tc-te-group.tc-te-nogroup { background: var(--background-secondary); color: var(--text-muted); }
+.tc-te-group.tc-te-nogroup:hover { background: var(--background-modifier-hover); }
 
-/* ════════════════════════════════════════════════════════════════════════════
-   Compact layout when the PANE is narrow (split view / small window / mobile)
-   ════════════════════════════════════════════════════════════════════════════ */
-@container (max-width: 560px) {
-    .tc-label { font-size: var(--font-ui-medium); line-height: 1.45; }
-    .tc-smart-h { font-size: var(--font-ui-small); }
-    .tc-cal-title { font-size: var(--font-ui-medium); }
-    .tc-badge { font-size: var(--font-ui-smaller); padding: 1px 9px; }
 
-    .tc-row { padding: 9px 6px; gap: 10px; }
-    input[type="checkbox"] { width: 20px; height: 20px; }
-    .tc-tl input[type="checkbox"], .tc-bar input[type="checkbox"] { width: 17px; height: 17px; transform: none; }
+/* ═══ 12. НАЛАШТУВАННЯ ═══════════════════════════════════════════════════════ */
 
-    .tc-input, .tc-select, .dropdown, .tc-habit-input { font-size: var(--font-ui-medium); padding: 8px 10px; min-height: 38px; }
-    .clickable-icon, .tc-icon-btn { width: 38px; height: 38px; }
-    .clickable-icon .svg-icon, .tc-icon-btn .svg-icon { width: 22px; height: 22px; }
+/* Секції побудовані нативною структурою Obsidian (.setting-group → heading +
+   .setting-items) — картки, розділювачі й відступи малює сам Obsidian, власних
+   стилів для них немає. Нижче — лише те, чого немає в нативному наборі. */
 
-    .tc-smart { max-width: none; gap: 16px; }
-    .tc-smart-habits { gap: 10px; }
-    .tc-habit-chip { min-width: 84px; padding: 12px 10px; border-radius: var(--radius-l); }
-    .tc-habit-chip-emoji { font-size: 1.8em; }
+/* Нотатка-пояснення всередині групи */
+.setting-items > .tc-group-note { margin: 0; padding: 10px 0 4px; color: var(--text-muted); font-size: var(--font-ui-smaller); }
 
-    .tc-cal-header { gap: 6px; flex-wrap: nowrap; }
-    .tc-cal-title { flex: 1; text-align: center; }
-    .tc-cal-controls { gap: 2px; }
-    .tc-bar { font-size: 0.72em; padding: 1px 5px; gap: 4px; }
-    .tc-bar-time { display: none; }
-    .tc-day-cell { height: 88px; }
-    .tc-dots-cell { min-height: 56px; }
-    .tc-dot { width: 7px; height: 7px; }
+/* Менеджер-модалка: повний список (сценарії/статуси/кольори/…) в одному вікні */
+.tc-list-modal .modal-content { max-height: 70vh; }
+.tc-list-modal-body { max-height: 55vh; overflow-y: auto; margin: 10px 0; }
 
-    .tc-stat-value { font-size: 1.8em; }
-    .tc-heat-month { max-width: none; }
-
-    .tc-listview .tc-row { padding: 12px 4px; }
-    .tc-listview .tc-group-title { font-size: var(--font-ui-large); }
+/* Живий прев'ю іконки біля пікера в редакторі статусу */
+.tc-icon-preview {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; margin-inline-start: 6px; flex-shrink: 0;
+    border-radius: var(--radius-s); background: var(--background-modifier-border);
+    color: var(--text-muted); font-size: 13px;
 }
+.tc-icon-preview svg { width: 14px; height: 14px; }
+
+/* Прев'ю-бейдж на початку кожного рядка статусу */
+.tc-status-row-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 28px; height: 28px; margin-inline-end: 4px; flex-shrink: 0;
+    border-radius: var(--radius-s); align-self: center;
+    background: var(--background-modifier-border);
+    color: var(--text-muted); font-size: 14px;
+}
+.tc-status-row-icon svg { width: 16px; height: 16px; }

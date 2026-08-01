@@ -1,3851 +1,4995 @@
-'use strict';
-
-var obsidian = require('obsidian');
-
-const LIST_VIEW   = 'md-task-calendar-list';
-const CAL_VIEW    = 'md-task-calendar-cal';
-const HABITS_VIEW = 'md-task-calendar-habits';
-const MINI_VIEW   = 'md-task-calendar-mini';
-const SMART_VIEW  = 'md-task-calendar-smart';
-
-// Coloring config is data-driven (from settings.colors); these are updated by applyConfig()
-let priorityKeys = ['low', 'med', 'high', 'urgent'];
-let priorityRank = { low: 1, med: 2, high: 3, urgent: 4 };
-let COLORS = { priorities: {}, tags: {}, groups: {} };
-let weekStartDay = 1;   // 0 = Sunday, 1 = Monday
-
-function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
-// ─── i18n (Ukrainian source strings → English) ─────────────────────────────────
-let LANG = 'uk';
-function resolveLang(settings) {
-    const s = settings && settings.language;
-    if (s === 'uk' || s === 'en') return s;
-    const l = ((window.localStorage && window.localStorage.getItem('language')) || '').toLowerCase();
-    return l.startsWith('uk') ? 'uk' : 'en';   // auto: Ukrainian app → uk, otherwise English
-}
-function t(s) { return LANG === 'en' ? (I18N[s] || s) : s; }
-
-function applyConfig(settings) {
-    const c = (settings && settings.colors) || {};
-    priorityKeys = (c.priorities || []).map(p => p.key).filter(Boolean);
-    if (!priorityKeys.length) priorityKeys = ['low', 'med', 'high', 'urgent'];
-    priorityRank = {};
-    priorityKeys.forEach((k, i) => priorityRank[k] = i + 1);
-    COLORS = { priorities: {}, tags: {}, groups: {} };
-    (c.priorities || []).forEach(p => { if (p.key) COLORS.priorities[p.key] = p.color; });
-    (c.tags || []).forEach(t => { if (t.name) COLORS.tags[t.name] = t.color; });
-    (c.groups || []).forEach(g => { if (g.name) COLORS.groups[g.name] = g.color; });
-    weekStartDay = (settings && settings.firstDayOfWeek != null) ? settings.firstDayOfWeek : 1;
-    LANG = resolveLang(settings);
-    MONTHS_UA = LANG === 'en' ? MONTHS_EN : MONTHS_UK;
-    MONTHS_GEN = LANG === 'en' ? MONTHS_EN : MONTHS_GEN_UK;
-    WD_UA = LANG === 'en' ? WD_EN : WD_UK;
-    WD_FULL = LANG === 'en' ? WD_FULL_EN : WD_FULL_UK;
-}
-
-function prioColor(key) { return COLORS.priorities[key] || '#888888'; }
-
-// "Compact" UI = real mobile OR a narrow pane (split view, small window)
-const COMPACT_WIDTH = 560;
-function compactMode(view) {
-    if (obsidian.Platform.isMobile) return true;
-    const w = view.containerEl ? view.containerEl.clientWidth : 0;
-    return w > 0 && w < COMPACT_WIDTH;
-}
-
-// Deterministic pastel for a tag/group that has no explicit color
-function autoColor(str) {
-    let h = 0;
-    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
-    return `hsl(${h % 360}, 60%, 72%)`;
-}
-
-// Base color used to tint a task card, per the chosen colorBy mode (or null)
-function cardColor(task, colorBy) {
-    if (colorBy === 'tag') { const t = task.tags && task.tags[0]; return t ? (COLORS.tags[t] || autoColor(t)) : null; }
-    if (colorBy === 'group') { return task.group ? (COLORS.groups[task.group] || autoColor(task.group)) : null; }
-    if (colorBy === 'none') return null;
-    return task.priority ? prioColor(task.priority) : null;   // default: priority
-}
-
-const MONTHS_UK = ['Січень', 'Лютий', 'Березень', 'Квітень', 'Травень', 'Червень',
-                   'Липень', 'Серпень', 'Вересень', 'Жовтень', 'Листопад', 'Грудень'];
-const MONTHS_GEN_UK = ['січня', 'лютого', 'березня', 'квітня', 'травня', 'червня',
-                       'липня', 'серпня', 'вересня', 'жовтня', 'листопада', 'грудня'];
-const MONTHS_EN = ['January', 'February', 'March', 'April', 'May', 'June',
-                   'July', 'August', 'September', 'October', 'November', 'December'];
-const WD_UK = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Нд'];
-const WD_EN = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-const WD_FULL_UK = ['Понеділок', 'Вівторок', 'Середа', 'Четвер', 'Пʼятниця', 'Субота', 'Неділя'];
-const WD_FULL_EN = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-
-// these are swapped to the EN variants by applyConfig() when the language is English
-let MONTHS_UA = MONTHS_UK;
-let MONTHS_GEN = MONTHS_GEN_UK;
-let WD_UA = WD_UK;
-let WD_FULL = WD_FULL_UK;
-
-// Human-friendly date header, e.g. "Сьогодні · 28 червня" / "Today · 28 June"
-function humanDate(iso) {
-    const d = parseISO(iso);
-    const dayMonth = LANG === 'en' ? `${d.getDate()} ${MONTHS_GEN[d.getMonth()]}` : `${d.getDate()} ${MONTHS_GEN[d.getMonth()]}`;
-    if (iso === todayISO()) return `${t('Сьогодні')} · ${dayMonth}`;
-    if (iso === toISO(addDays(new Date(), 1))) return `${t('Завтра')} · ${dayMonth}`;
-    if (iso === toISO(addDays(new Date(), -1))) return `${t('Вчора')} · ${dayMonth}`;
-    return `${WD_FULL[(d.getDay() + 6) % 7]}, ${dayMonth}`;
-}
-
-const I18N = {
-    // views / commands / ribbon
-    'Розумний список': 'Smart list', 'Календар': 'Calendar', 'Список задач': 'Tasks',
-    'Звички': 'Habits', 'Міні-календар': 'Mini calendar',
-    'Markday — Розумний список': 'Markday — Smart list',
-    'Markday — Календар': 'Markday — Calendar',
-    'Markday — Список': 'Markday — Tasks',
-    'Markday — Звички': 'Markday — Habits',
-    'Markday — Міні-календар': 'Markday — Mini calendar',
-    'Відкрити Розумний список': 'Open Smart list', 'Відкрити Календар': 'Open Calendar',
-    'Відкрити Список задач': 'Open Tasks', 'Відкрити Звички': 'Open Habits',
-    'Відкрити Міні-календар (бічна панель)': 'Open Mini calendar (sidebar)',
-    'Відкрити/створити нотатку сьогодні': "Open/create today's note",
-    'Створити задачу': 'Create task', 'Створити звичку': 'Create habit',
-    // calendar
-    'Місяць': 'Month', 'Перелік': 'Overview', 'Тиждень': 'Week', 'Робочий тиждень': 'Work week', '3 дні': '3 days',
-    'Колір: пріоритет': 'Color: priority', 'Колір: тег': 'Color: tag', 'Колір: група': 'Color: group', 'Без кольору': 'No color',
-    'Колір': 'Color', 'Сьогодні': 'Today', 'Завтра': 'Tomorrow', 'Вчора': 'Yesterday',
-    'Фільтр': 'Filter', 'Режим': 'Mode', 'Відображення': 'Display', 'Назад': 'Back', 'Вперед': 'Forward',
-    'Без фільтра': 'No filter', 'Теги': 'Tags', 'Групи': 'Groups', 'Пріоритети': 'Priorities',
-    'Фільтр…': 'Filter…', 'Фільтр: змінити/зняти': 'Filter: change / clear',
-    'Показувати теги': 'Show tags', 'Показувати групи': 'Show groups', 'Показувати пріоритети': 'Show priorities',
-    'Крапка пріоритету': 'Priority dot', 'Задач немає': 'No tasks', 'Відкрити нотатку': 'Open note', 'Нотатка': 'Note',
-    '+ задача': '+ task', 'весь день': 'all-day', 'Нова подія': 'New event',
-    // list
-    'Нова задача…': 'New task…', 'Нова задача (сьогодні)…': 'New task (today)…', 'Нова задача на сьогодні…': 'New task for today…',
-    'Усі': 'All', 'Наступні 7 днів': 'Next 7 days', 'Наступні 30 днів': 'Next 30 days',
-    'Без груп': 'No grouping', 'За датою': 'By date', 'За тегом': 'By tag', 'За групою': 'By group', 'За пріоритетом': 'By priority',
-    'Групування': 'Grouping', 'Сортування': 'Sorting', 'Сортування та групування': 'Sort & group', 'Період': 'Period', 'Більше': 'More',
-    'Пріоритет': 'Priority', 'Дата': 'Date', 'Час': 'Time', 'Назва': 'Name',
-    'Протерміновані': 'Overdue', 'Сховати виконані': 'Hide done', 'Показувати деталі': 'Show details', 'Звички сьогодні': "Today's habits",
-    'Задач не знайдено.': 'No tasks found.', 'Без групи': 'No group', 'Без тегів': 'No tags', 'Без пріоритету': 'No priority',
-    'Наступні 7 днів': 'Next 7 days', 'Без часу (найближче)': 'No time (upcoming)', 'Немає задач на сьогодні': 'No tasks for today',
-    'Немає запланованих задач': 'No scheduled tasks',
-    // habits
-    'Цей тиждень': 'This week', 'так/ні': 'yes/no', 'Усі звички': 'All habits', 'Рік': 'Year',
-    'Звичок ще немає. Створіть їх через Ctrl+P → Звичка.': 'No habits yet. Create them via Ctrl+P → Habit.',
-    'Найдовша серія': 'Longest streak', 'днів підряд': 'days in a row', 'Рекорд за день': 'Best day',
-    'За місяць': 'This month', 'За рік': 'This year', 'разів': 'times', 'звичок': 'habits', 'слів': 'words', 'сторінки': 'pages',
-    'Скільки': 'How much', 'Виконано': 'Done', 'Не виконано': 'Not done', 'Скасовано': 'Cancelled', 'Статус': 'Status', 'Активна': 'Active', 'Виконана': 'Done', 'Скасована': 'Cancelled',
-    'Не виконана': 'Not done', 'Відмінена': 'Cancelled', 'Опис': 'Description', 'Опис, теги #, групи @…': 'Description, tags #, groups @…',
-    'Без повтору': 'No repeat', 'Щоденно': 'Daily', 'Щотижнево (поточний день)': 'Weekly (this weekday)', 'Щотижнево у робочі дні (Пн–Пт)': 'Weekly (Mon–Fri)',
-    'Щомісячно (поточне число)': 'Monthly (this day)', 'Щорічно (поточний день)': 'Yearly (this day)', 'Кастомне налаштування…': 'Custom…',
-    'Завтра': 'Tomorrow', 'Наступного понеділка': 'Next Monday', 'Дата та час': 'Date & time', 'Очистити': 'Clear',
-    'Одиниця': 'Unit', 'Інтервал': 'Interval', 'День': 'Day', 'Тиждень': 'Week', 'Місяць': 'Month', 'Рік': 'Year',
-    'За днем місяця': 'By day of month', 'За днем тижня': 'By weekday', 'Робочий день': 'Working day', 'Режим': 'Mode', 'Який': 'Which', 'Число місяця': 'Day of month',
-    'перший': 'first', 'другий': 'second', 'третій': 'third', 'четвертий': 'fourth', 'останній': 'last',
-    'Кастомне повторення': 'Custom recurrence', 'Дата виконання': 'Due date', 'Пріоритет: ': 'Priority: ', 'Повторення: ': 'Repeat: ',
-    'Щомісячні перевірки': 'Monthly checks', 'Загальна реєстрація': 'Total log', 'Щомісячна ставка реєстрації': 'Monthly rate',
-    'Поточна серія': 'Current streak', 'Щомісячне виконання': 'Monthly total', 'Загальний обсяг виконання': 'Overall total',
-    'Рахунок': 'Count', 'Ціль на день': 'Daily goal', 'Журнал звички': 'Habit log', 'Найкраща серія': 'Best streak', '← Назад': '← Back',
-    'Немає записів': 'No entries', 'Оберіть звичку': 'Select a habit', 'Необов’язково — для кілець прогресу та %': 'Optional — for progress rings & %', 'дн.': 'd', 'Нова звичка': 'New habit', 'До поточного': 'To current', 'Ціль': 'Goal',
-    'Без дати': 'No date', 'Ще': 'More', 'Відкрити нотатку': 'Open note', 'Не буде виконано': 'Won’t do', 'без групи': 'no group',
-    'Додати тег у опис': 'Add a tag in the description', 'Редагувати регулярну задачу': 'Edit recurring task', 'Зробити регулярною': 'Make recurring',
-    // editor / create
-    'Назва задачі': 'Task name', 'Опис (деталі)…': 'Description (details)…', 'Задача виконана': 'Task done',
-    'Час (необов.)': 'Time (optional)', 'Група': 'Group', 'Enter — додати': 'Enter to add', 'Підзадачі': 'Subtasks',
-    '+ підзадача': '+ subtask', 'Відхилити зміни': 'Discard changes', 'Зберегти зміни': 'Save changes', 'Видалити задачу': 'Delete task',
-    'Дата / час / повтор': 'Date / time / repeat', 'Теги / пріоритет / група': 'Tags / priority / group',
-    'Повторювати': 'Repeat', 'Без повтору': "Don't repeat", 'Щодня': 'Daily', 'Щотижня': 'Weekly', 'Щомісяця': 'Monthly', 'Щороку': 'Yearly',
-    'Кожні N': 'Every N', 'Дні тижня': 'Weekdays', 'Створити': 'Create', 'Скасувати': 'Cancel', 'Готово': 'Done', 'Додати': 'Add', 'Зберегти': 'Save',
-    'щодня': 'daily', 'щотижня': 'weekly', 'щомісяця': 'monthly', 'щороку': 'yearly', 'Кінець (необов.)': 'End (optional)', 'Початок': 'Start',
-    'Нова звичка': 'New habit', 'Введіть назву задачі': 'Enter a task name', 'група': 'group', '+ тег': '+ tag',
-    'Емодзі': 'Emoji', 'Компактна іконка звички': 'Compact habit icon', 'Назва property': 'Property name',
-    'Ключ у властивостях файлу (напр. pages_read)': 'Frontmatter key (e.g. pages_read)', 'Тип виміру': 'Measure type',
-    'Кількість': 'Quantity', 'Так / Ні': 'Yes / No', 'Одиниці виміру': 'Units', 'напр. сторінки, км, хвилини': 'e.g. pages, km, minutes',
-    'Введіть назву': 'Enter a name', 'Введіть назву property': 'Enter a property name', 'Введіть текст задачі': 'Enter task text',
-    'Оберіть хоча б один день тижня': 'Pick at least one weekday',
-    // settings
-    'Рівень заголовка': 'Heading level', 'Під яким рівнем заголовка зберігати задачі (# = 1 … ###### = 6)': 'Heading level to store tasks under (# = 1 … ###### = 6)',
-    'Текст заголовка': 'Heading text', 'Назва заголовка, під яким будуть задачі (напр. "Задачі" або "Tasks")': 'Heading the tasks live under (e.g. "Задачі" or "Tasks")',
-    'Робочі години — початок': 'Working hours — start', 'Робочі години — кінець': 'Working hours — end',
-    'На часовій шкалі раніші години згорнуті (можна розгорнути)': 'Earlier hours are collapsed on the timeline (expandable)',
-    'На часовій шкалі пізніші години згорнуті (можна розгорнути)': 'Later hours are collapsed on the timeline (expandable)',
-    'Крок часової шкали': 'Timeline step', 'Прилипання при перетягуванні/зміні розміру': 'Snap when dragging / resizing',
-    'Перший день тижня': 'First day of week', 'Понеділок': 'Monday', 'Неділя': 'Sunday', 'Мова': 'Language', 'Авто': 'Auto',
-    'Стандартні значення': 'Defaults', 'Підставляються в нову задачу, якщо не вказані вручну.': 'Applied to new tasks unless set manually.',
-    'Стандартний тег': 'Default tag', 'Стандартна група': 'Default group', 'Стандартний пріоритет': 'Default priority',
-    'Регулярні задачі': 'Recurring tasks', 'Створення — через швидке створення (Ctrl+P). Тут — редагування та видалення.': 'Create via quick-create (Ctrl+P). Here — edit and delete.',
-    'Поки немає регулярних задач.': 'No recurring tasks yet.', 'Поки немає звичок.': 'No habits yet.',
-    'Редагувати': 'Edit', 'Видалити': 'Delete', 'Вище': 'Up', 'Нижче': 'Down', 'Редагувати регулярну задачу': 'Edit recurring task', 'Редагувати звичку': 'Edit habit',
-    'Кольори та пріоритети': 'Colors & priorities',
-    'Ключ використовується у тексті задачі як !ключ. Порядок = ранг (нижчий зверху, вищий знизу).': 'The key is used in task text as !key. Order = rank (lower on top, higher below).',
-    'Кольори тегів': 'Tag colors', 'Кольори груп': 'Group colors', '+ пріоритет': '+ priority', '+ додати': '+ add',
-    'Звичка: кількість написаних слів': 'Habit: words written', 'Автоматично рахує слова в нотатці дня': "Auto-counts words in the day's note",
-    '— емодзі': '— emoji', '— колір': '— color', 'Текст у форматі задачі: "14:00 Полити квіти #дім !med"': 'Task-format text: "14:00 Water plants #home !med"',
-    'Формат задачі: "14:00 Полити квіти #дім !med"': 'Task format: "14:00 Water plants #home !med"',
-    'напр. Полити квіти #дім': 'e.g. Water plants #home', 'Число місяця': 'Day of month', 'Інтервал': 'Interval',
-    'Створити нотатку на ': 'Create a note for ', 'Створити нотатку': 'Create note', 'Створити': 'Create',
-    'Задачі': 'Tasks',
+/*
+Markday — bundled by esbuild from src/. Do not edit this file directly;
+edit src/*.js and run `npm run build`.
+*/
+var __create = Object.create;
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
 };
-
-const DEFAULT_SETTINGS = {
-    headingLevel: 2,
-    headingText: 'Задачі',
-    recurrences: [],  // [{ id, raw, freq, interval, weekdays, monthday, start, end, exceptions }]
-    habits: [],       // [{ id, name, property, unit, type: 'number'|'bool' }]
-    workStart: 8,     // timeline working-hours start (hour 0-23); earlier hours collapse
-    workEnd: 20,      // timeline working-hours end (hour 1-24); later hours collapse
-    snapMinutes: 15,  // timeline drag/resize snap step in minutes
-    colorBy: 'priority',   // card coloring: priority | tag | group | none
-    priorityDot: true,     // when colorBy != priority, show priority as a dot
-    firstDayOfWeek: 1,     // 0 = Sunday, 1 = Monday
-    language: 'auto',      // auto | uk | en
-    showTags: true,        // show tag badges on cards
-    showGroups: true,      // show group badges on cards
-    showPriority: true,    // show priority badge/label on cards
-    defaultTag: '',        // applied to new tasks when set
-    defaultGroup: '',
-    defaultPriority: '',
-    wordCount: { enabled: false, name: 'Написано слів', emoji: '✍️', color: '#9aa0a6' },
-    colors: {
-        priorities: [
-            { key: 'low', color: '#8b949e' },
-            { key: 'med', color: '#58a6ff' },
-            { key: 'high', color: '#d29922' },
-            { key: 'urgent', color: '#e5534b' }
-        ],
-        tags: [],     // [{ name, color }]
-        groups: []    // [{ name, color }]
-    }
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
 };
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-const LIST_HORIZON_DAYS = 60;   // how far ahead virtual recurrences are projected in the list
+// src/main.js
+var main_exports = {};
+__export(main_exports, {
+  TaskCalendarPlugin: () => TaskCalendarPlugin,
+  default: () => main_default
+});
+module.exports = __toCommonJS(main_exports);
+var obsidian13 = __toESM(require("obsidian"), 1);
 
-// ─── Date utils ──────────────────────────────────────────────────────────────
+// src/calendar-view.js
+var obsidian9 = __toESM(require("obsidian"), 1);
 
-function pad(n) { return String(n).padStart(2, '0'); }
-function toISO(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
-function parseISO(s) { const [y, m, day] = s.split('-').map(Number); return new Date(y, m - 1, day); }
-function todayISO() { return toISO(new Date()); }
-function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
-function startOfWeek(d) { const x = new Date(d); const off = (x.getDay() - weekStartDay + 7) % 7; x.setDate(x.getDate() - off); return x; }
-function startOfWorkWeek(d) { const x = new Date(d); const off = (x.getDay() + 6) % 7; x.setDate(x.getDate() - off); return x; } // Monday
-// Weekday header labels ordered from the configured first day
-function weekdayHeaders() {
-    const startIdx = (weekStartDay + 6) % 7;   // WD_UA index of the first column (Mon=0)
-    return WD_UA.map((_, i) => WD_UA[(startIdx + i) % 7]);
-}
+// src/core.js
+var obsidian2 = __toESM(require("obsidian"), 1);
 
-function normTime(t) { const [h, m] = t.split(':'); return `${pad(Number(h))}:${m}`; }
-function timeMin(t) { const [h, m] = t.split(':').map(Number); return h * 60 + m; }
-
-// Ordering within a single day: events first (by start time), then timeless tasks (file order)
-function dayOrder(a, b) {
-    const ae = a.start != null, be = b.start != null;
-    if (ae !== be) return ae ? -1 : 1;
-    if (ae && be) return timeMin(a.start) - timeMin(b.start);
-    return 0;
-}
-
-function daysBetween(a, b) { return Math.round((b.getTime() - a.getTime()) / 86400000); }
-function genId() { return Math.random().toString(36).slice(2, 8); }
-
-// ─── Recurrence engine ───────────────────────────────────────────────────────
-
-// Does a recurrence rule fire on the given Date?
-function lastDayOfMonth(y, m) { return new Date(y, m + 1, 0).getDate(); }
-function clampMonthDay(y, m, d) { return Math.min(d, lastDayOfMonth(y, m)); }
-
-// nth occurrence of a weekday (0=Mon..6=Sun) in month; nth=-1 → last. Returns day-of-month or null.
-function nthWeekdayOfMonth(y, m, wd0Mon, nth) {
-    if (nth === -1) {
-        for (let d = lastDayOfMonth(y, m); d >= 1; d--) {
-            if ((new Date(y, m, d).getDay() + 6) % 7 === wd0Mon) return d;
-        }
-        return null;
+// src/parser.js
+var INLINE_DATE_RE = /(^|\s)>(\d{4}-\d{2}-\d{2})(?=\s|$)/;
+function parseTaskLine(line, lineNum, opts) {
+  const m = line.match(/^(\s*)- \[(.)\] (.*)$/);
+  if (!m) return null;
+  const statusChar = m[2];
+  const st = statusForChar(statusChar);
+  const done = st.behavior === "done";
+  const cancelled = st.behavior === "cancelled";
+  let body = m[3];
+  let recId = null, descId = null, bm;
+  while (bm = body.match(/\s+\^(rc-[A-Za-z0-9]+|tcd-[A-Za-z0-9]+)\s*$/)) {
+    const tok = bm[1];
+    if (tok.startsWith("rc-")) recId = tok.slice(3);
+    else descId = tok.slice(4);
+    body = body.slice(0, bm.index);
+  }
+  let start = null, end = null;
+  let rest = body;
+  const tmatch = body.match(/^(\d{1,2}:\d{2})(?:\s*-\s*(\d{1,2}:\d{2}))?\s+/);
+  if (tmatch) {
+    start = normTime(tmatch[1]);
+    if (tmatch[2]) end = normTime(tmatch[2]);
+    rest = body.slice(tmatch[0].length);
+  }
+  const pAlt = priorityKeys.map(escapeRe).join("|") || "x^";
+  let priority = null;
+  const pm = rest.match(new RegExp(`!(${pAlt})\\b`, "i"));
+  if (pm) priority = priorityKeys.find((k) => k.toLowerCase() === pm[1].toLowerCase()) || pm[1];
+  let group = null;
+  const gm = rest.match(/@([^\s]+)/);
+  if (gm) group = gm[1];
+  const tags = [];
+  let tm;
+  const tagRe = /#([^\s#]+)/g;
+  while ((tm = tagRe.exec(rest)) !== null) tags.push(tm[1]);
+  let dateToken = null;
+  let rest2 = rest;
+  if (opts && opts.inlineDate) {
+    const dm = rest.match(INLINE_DATE_RE);
+    if (dm) {
+      dateToken = dm[2];
+      rest2 = rest.slice(0, dm.index) + rest.slice(dm.index + dm[0].length);
     }
-    let count = 0;
-    for (let d = 1; d <= lastDayOfMonth(y, m); d++) {
-        if ((new Date(y, m, d).getDay() + 6) % 7 === wd0Mon && ++count === nth) return d;
-    }
-    return null;
+  }
+  const text = rest2.replace(new RegExp(`!(${pAlt})\\b`, "ig"), "").replace(/@[^\s]+/g, "").replace(/#[^\s#]+/g, "").replace(/\s{2,}/g, " ").trim();
+  return { done, cancelled, statusChar, text, tags, group, priority, start, end, recId, descId, dateToken, line: lineNum };
 }
-
-// first/last working day (Mon–Fri) of a month → day-of-month
-function workdayOfMonth(y, m, which) {
-    if (which === 'last') {
-        for (let d = lastDayOfMonth(y, m); d >= 1; d--) {
-            if ((new Date(y, m, d).getDay() + 6) % 7 <= 4) return d;
-        }
-    } else {
-        for (let d = 1; d <= lastDayOfMonth(y, m); d++) {
-            if ((new Date(y, m, d).getDay() + 6) % 7 <= 4) return d;
-        }
-    }
-    return null;
-}
-
-// Does `date` match the rule's month-mode within month (y,m)? (shared by monthly + yearly)
-function matchesMonthMode(rule, date, y, m, fallbackDay) {
-    const mode = rule.monthMode || 'day';
-    if (mode === 'weekday') {
-        const day = nthWeekdayOfMonth(y, m, rule.weekday || 0, rule.nth || 1);
-        return day != null && date.getDate() === day;
-    }
-    if (mode === 'workday') {
-        const day = workdayOfMonth(y, m, rule.which || 'first');
-        return day != null && date.getDate() === day;
-    }
-    return date.getDate() === clampMonthDay(y, m, rule.monthday || fallbackDay);
-}
-
-function occursOn(rule, date) {
-    const start = parseISO(rule.start);
-    if (daysBetween(start, date) < 0) return false;
-    if (rule.end && daysBetween(date, parseISO(rule.end)) < 0) return false;
-
-    const interval = rule.interval || 1;
-    switch (rule.freq) {
-        case 'daily':
-            return daysBetween(start, date) % interval === 0;
-        case 'weekly': {
-            const wd = (date.getDay() + 6) % 7; // 0 = Mon
-            const weekdays = (rule.weekdays && rule.weekdays.length)
-                ? rule.weekdays : [(start.getDay() + 6) % 7];
-            if (!weekdays.includes(wd)) return false;
-            const weeks = Math.floor(daysBetween(startOfWeek(start), date) / 7);
-            return weeks % interval === 0;
-        }
-        case 'monthly': {
-            const months = (date.getFullYear() - start.getFullYear()) * 12
-                + (date.getMonth() - start.getMonth());
-            if (months < 0 || months % interval !== 0) return false;
-            return matchesMonthMode(rule, date, date.getFullYear(), date.getMonth(), start.getDate());
-        }
-        case 'yearly': {
-            const ym = (rule.month != null) ? rule.month : start.getMonth();
-            if (date.getMonth() !== ym) return false;
-            const years = date.getFullYear() - start.getFullYear();
-            if (years < 0 || years % interval !== 0) return false;
-            // legacy rules (no monthMode) keep exact start day-of-month
-            if (!rule.monthMode) return date.getDate() === start.getDate();
-            return matchesMonthMode(rule, date, date.getFullYear(), ym, start.getDate());
-        }
-    }
-    return false;
-}
-
-function describeRule(rule) {
-    const i = rule.interval || 1;
-    const en = LANG === 'en';
-    const ev = n => en ? `every ${i} ${n}` : `кожні ${i} ${n}`;
-    const ord = { '1': en ? 'first' : 'перший', '2': en ? 'second' : 'другий', '3': en ? 'third' : 'третій',
-                  '4': en ? 'fourth' : 'четвертий', '-1': en ? 'last' : 'останній' };
-    const monthModePart = () => {
-        const mode = rule.monthMode || 'day';
-        if (mode === 'weekday') return `${ord[String(rule.nth || 1)]} ${WD_FULL[rule.weekday || 0]}`;
-        if (mode === 'workday') return rule.which === 'last'
-            ? (en ? 'last working day' : 'останній робочий день')
-            : (en ? 'first working day' : 'перший робочий день');
-        return en ? `day ${rule.monthday || '?'}` : `${rule.monthday || '?'} числа`;
-    };
-    if (rule.freq === 'daily') return i === 1 ? t('щодня') : ev(en ? 'days' : 'дн.');
-    if (rule.freq === 'weekly') {
-        const wd = (rule.weekdays || []).slice().sort((a, b) => a - b).map(d => WD_UA[d]).join(', ');
-        return (i === 1 ? t('щотижня') : ev(en ? 'weeks' : 'тиж.')) + (wd ? ` (${wd})` : '');
-    }
-    if (rule.freq === 'monthly') return (i === 1 ? t('щомісяця') : ev(en ? 'months' : 'міс.')) + ', ' + monthModePart();
-    if (rule.freq === 'yearly') {
-        const base = i === 1 ? t('щороку') : ev(en ? 'years' : 'р.');
-        if (rule.month == null) return base;
-        return `${base} — ${monthModePart()} ${MONTHS_GEN[rule.month]}`;
-    }
-    return '';
-}
-
-// date(ISO) -> Set(recId) of recurrences already materialized as real lines that day
-function buildMaterializedIndex(realMap) {
-    const idx = new Map();
-    for (const [date, entry] of realMap) {
-        const set = new Set();
-        for (const t of entry.tasks) if (t.recId) set.add(t.recId);
-        idx.set(date, set);
-    }
-    return idx;
-}
-
-// Inject virtual recurrence instances into realMap for [startISO, endISO]
-function addVirtuals(realMap, rules, startISO, endISO) {
-    if (!rules || !rules.length) return realMap;
-    const matIdx = buildMaterializedIndex(realMap);
-    const end = parseISO(endISO);
-    for (let d = parseISO(startISO); daysBetween(d, end) >= 0; d = addDays(d, 1)) {
-        const iso = toISO(d);
-        const matSet = matIdx.get(iso) || new Set();
-        for (const rule of rules) {
-            if (matSet.has(rule.id)) continue;
-            if (rule.exceptions && rule.exceptions.includes(iso)) continue;
-            if (!occursOn(rule, d)) continue;
-            const t = parseTaskLine(`- [ ] ${rule.raw}`, -1);
-            if (!t) continue;
-            t.date = iso;
-            t.recId = rule.id;
-            t.raw = rule.raw;
-            t.virtual = true;
-            if (realMap.has(iso)) realMap.get(iso).tasks.push(t);
-            else realMap.set(iso, { file: null, tasks: [t] });
-        }
-    }
-    return realMap;
-}
-
-// Materialize a virtual instance into its daily note (with ^rc- marker)
-async function materializeVirtual(app, task, done, settings) {
-    const file = await getOrCreateDateFile(app, task.date);
-    const line = `- [${done ? 'x' : ' '}] ${task.raw} ^rc-${task.recId}`;
-    await insertLineUnderHeading(app, file, line, settings);
-}
-
-// ─── Habits ──────────────────────────────────────────────────────────────────
-
-// Read a day note's frontmatter (or {} if no file)
-function readFrontmatter(app, isoDate) {
-    const file = app.vault.getAbstractFileByPath(dateToPath(app, parseISO(isoDate)));
-    if (!file) return {};
-    return (app.metadataCache.getFileCache(file) || {}).frontmatter || {};
-}
-
-// Write/clear a habit value in a day note's frontmatter (merges with existing props)
-async function setHabitValue(app, isoDate, habit, value) {
-    const file = await getOrCreateDateFile(app, isoDate);
-    await app.fileManager.processFrontMatter(file, fm => {
-        if (value === null || value === '' || value === false) delete fm[habit.property];
-        else fm[habit.property] = value;
-    });
-}
-
-// Count words in a day note's body (frontmatter stripped)
-function countWords(content) {
-    const body = content.replace(/^---\n[\s\S]*?\n---\n?/, '');
-    const m = body.match(/\S+/g);
-    return m ? m.length : 0;
-}
-
-// Effective habit list = user habits (+ the built-in word-count habit when enabled)
-function habitList(settings) {
-    const arr = (settings.habits || []).slice();
-    const wc = settings.wordCount;
-    if (wc && wc.enabled) {
-        arr.push({ id: '__words', name: wc.name || 'Написано слів', emoji: wc.emoji || '✍️', color: wc.color || '', unit: 'слів', type: 'number', auto: 'words', goal: wc.goal || null });
-    }
-    return arr;
-}
-
-// A habit's numeric value for a date (bool→0/1; word-count read from the file)
-async function getHabitValue(app, isoDate, habit) {
-    if (habit.auto === 'words') {
-        const file = app.vault.getAbstractFileByPath(dateToPath(app, parseISO(isoDate)));
-        if (!file) return 0;
-        return countWords(await app.vault.read(file));
-    }
-    const v = readFrontmatter(app, isoDate)[habit.property];
-    if (habit.type === 'bool') return (v === true || v === 'true') ? 1 : 0;
-    return Number(v) || 0;
-}
-
-// A day's completion fraction (0..1) for a habit
-function habitProgress(value, habit) {
-    if (habit.type === 'bool') return value > 0 ? 1 : 0;
-    if (habit.goal > 0) return Math.max(0, Math.min(1, value / habit.goal));
-    return value > 0 ? 1 : 0;
-}
-// Whether a day counts as "done" (goal met, or any value when no goal)
-function habitDone(value, habit) {
-    if (habit.type === 'bool') return value > 0;
-    if (habit.goal > 0) return value >= habit.goal;
-    return value > 0;
-}
-
-// ─── Daily Notes integration ─────────────────────────────────────────────────
-
-function getDailyNotesConfig(app) {
-    let folder = '';
-    let format = 'YYYY-MM-DD';
-    let template = '';
-    try {
-        const dn = app.internalPlugins.getPluginById('daily-notes');
-        const opts = dn && dn.instance && dn.instance.options;
-        if (opts) {
-            if (opts.folder) folder = String(opts.folder).trim();
-            if (opts.format) format = String(opts.format).trim() || 'YYYY-MM-DD';
-            if (opts.template) template = String(opts.template).trim();
-        }
-    } catch (e) { /* daily-notes unavailable → defaults */ }
-    // strip leading/trailing slashes from folder
-    folder = folder.replace(/^\/+|\/+$/g, '');
-    return { folder, format, template };
-}
-
-// Substitute Daily-Notes template placeholders for a given date
-function applyTemplate(content, date, format) {
-    const m = obsidian.moment(date);
-    const now = obsidian.moment();
-    return content
-        .replace(/{{\s*date\s*:\s*([^}]+)}}/gi, (_, f) => m.format(f.trim()))
-        .replace(/{{\s*time\s*:\s*([^}]+)}}/gi, (_, f) => now.format(f.trim()))
-        .replace(/{{\s*date\s*}}/gi, m.format(format))
-        .replace(/{{\s*time\s*}}/gi, now.format('HH:mm'))
-        .replace(/{{\s*title\s*}}/gi, m.format(format));
-}
-
-// Read the configured Daily-Notes template and resolve it for `date`
-async function readTemplate(app, templatePath, date, format) {
-    if (!templatePath) return null;
-    let path = templatePath.replace(/^\/+/, '');
-    let f = app.vault.getAbstractFileByPath(path);
-    if (!f && !/\.md$/i.test(path)) f = app.vault.getAbstractFileByPath(path + '.md');
-    if (!(f instanceof obsidian.TFile)) return null;
-    const raw = await app.vault.read(f);
-    return applyTemplate(raw, date, format);
-}
-
-// JS Date → vault path of its daily note
-function dateToPath(app, date) {
-    const { folder, format } = getDailyNotesConfig(app);
-    const name = obsidian.moment(date).format(format);
-    const path = folder ? `${folder}/${name}.md` : `${name}.md`;
-    return obsidian.normalizePath(path);
-}
-
-// TFile → JS Date (or null if it is not a daily note for the current config)
-function fileToDate(file, folder, format) {
-    let rel = file.path.replace(/\.md$/i, '');
-    if (folder) {
-        const prefix = folder + '/';
-        if (!rel.startsWith(prefix)) return null;
-        rel = rel.slice(prefix.length);
-    }
-    const m = obsidian.moment(rel, format, true); // strict parse
-    return m.isValid() ? m.toDate() : null;
-}
-
-async function ensureFolders(app, filePath) {
-    const parts = filePath.split('/');
-    parts.pop(); // drop filename
-    let cur = '';
-    for (const p of parts) {
-        cur = cur ? `${cur}/${p}` : p;
-        if (!app.vault.getAbstractFileByPath(cur)) {
-            try { await app.vault.createFolder(cur); } catch (e) { /* race / exists */ }
-        }
-    }
-}
-
-// ─── Task parsing ────────────────────────────────────────────────────────────
-
-function parseTaskLine(line, lineNum) {
-    const m = line.match(/^(\s*)- \[(x| |-)\] (.*)$/);
-    if (!m) return null;
-
-    const done = m[2] === 'x';
-    const cancelled = m[2] === '-';
-    let body = m[3];
-
-    // trailing block ids: ^rc-<id> (recurrence rule) and ^tcd-<id> (description heading)
-    let recId = null, descId = null, bm;
-    while ((bm = body.match(/\s+\^(rc-[A-Za-z0-9]+|tcd-[A-Za-z0-9]+)\s*$/))) {
-        const tok = bm[1];
-        if (tok.startsWith('rc-')) recId = tok.slice(3);
-        else descId = tok.slice(4);
-        body = body.slice(0, bm.index);
-    }
-
-    // leading time → event:  "14:00 ..."  or  "14:00-15:30 ..."
-    let start = null, end = null;
-    let rest = body;
-    const tmatch = body.match(/^(\d{1,2}:\d{2})(?:\s*-\s*(\d{1,2}:\d{2}))?\s+/);
-    if (tmatch) {
-        start = normTime(tmatch[1]);
-        if (tmatch[2]) end = normTime(tmatch[2]);
-        rest = body.slice(tmatch[0].length);
-    }
-
-    const pAlt = priorityKeys.map(escapeRe).join('|') || 'x^';
-    let priority = null;
-    const pm = rest.match(new RegExp(`!(${pAlt})\\b`, 'i'));
-    if (pm) priority = priorityKeys.find(k => k.toLowerCase() === pm[1].toLowerCase()) || pm[1];
-
-    let group = null;
-    const gm = rest.match(/@([^\s]+)/);
-    if (gm) group = gm[1];
-
-    const tags = [];
-    let tm;
-    const tagRe = /#([^\s#]+)/g;
-    while ((tm = tagRe.exec(rest)) !== null) tags.push(tm[1]);
-
-    const text = rest
-        .replace(new RegExp(`!(${pAlt})\\b`, 'ig'), '')
-        .replace(/@[^\s]+/g, '')
-        .replace(/#[^\s#]+/g, '')
-        .replace(/\s{2,}/g, ' ')
-        .trim();
-
-    return { done, cancelled, text, tags, group, priority, start, end, recId, descId, line: lineNum };
-}
-
-// Find a task's description (content under the `^tcd-<id>` heading); returns {text, headingLine, endLine}
 function findDescription(lines, descId) {
-    const re = new RegExp(`^(#{1,6})\\s+.*\\^tcd-${descId}\\s*$`);
-    for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(re);
-        if (!m) continue;
-        const level = m[1].length;
-        let end = lines.length;
-        for (let j = i + 1; j < lines.length; j++) {
-            const h = lines[j].match(/^(#{1,6})\s+/);
-            if (h && h[1].length <= level) { end = j; break; }
-        }
-        const text = lines.slice(i + 1, end).join('\n').trim();
-        return { text, headingLine: i, endLine: end };
+  const re = new RegExp(`^(#{1,6})\\s+.*\\^tcd-${descId}\\s*$`);
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(re);
+    if (!m) continue;
+    const level = m[1].length;
+    let end = lines.length;
+    for (let j = i + 1; j < lines.length; j++) {
+      const h = lines[j].match(/^(#{1,6})\s+/);
+      if (h && h[1].length <= level) {
+        end = j;
+        break;
+      }
     }
-    return null;
+    const text = lines.slice(i + 1, end).join("\n").trim();
+    return { text, headingLine: i, endLine: end };
+  }
+  return null;
+}
+var CHILD_INDENT = "    ";
+function parseTasks(content, opts) {
+  const lines = content.split("\n");
+  const tasks = [];
+  let current = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const cb = line.match(/^(\s*)- \[(.)\] (.*)$/);
+    if (cb) {
+      if (cb[1].length === 0) {
+        current = parseTaskLine(line, i, opts);
+        current.subtasks = [];
+        current.comments = [];
+        tasks.push(current);
+      } else if (current) {
+        current.subtasks.push(parseTaskLine(line, i, opts));
+      }
+      continue;
+    }
+    const bullet = line.match(/^(\s+)- (.*)$/);
+    if (bullet && current) {
+      current.comments.push({ text: bullet[2].trim(), line: i });
+      continue;
+    }
+    if (line.trim() !== "") current = null;
+  }
+  for (const t2 of tasks) {
+    if (!t2.descId) continue;
+    const d = findDescription(lines, t2.descId);
+    if (d) t2.desc = d.text;
+  }
+  return tasks;
 }
 
-const CHILD_INDENT = '    ';   // indentation used for subtasks / comments
-
-// Top-level tasks (indent 0). Indented checkbox lines → subtasks; indented bullets → comments.
-function parseTasks(content) {
-    const lines = content.split('\n');
-    const tasks = [];
-    let current = null;
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const cb = line.match(/^(\s*)- \[(x| )\] (.*)$/);
-        if (cb) {
-            if (cb[1].length === 0) {
-                current = parseTaskLine(line, i);
-                current.subtasks = [];
-                current.comments = [];
-                tasks.push(current);
-            } else if (current) {
-                current.subtasks.push(parseTaskLine(line, i));
-            }
-            continue;
-        }
-        const bullet = line.match(/^(\s+)- (.*)$/);   // indented bullet, no checkbox → comment
-        if (bullet && current) {
-            current.comments.push({ text: bullet[2].trim(), line: i });
-            continue;
-        }
-        if (line.trim() !== '') current = null;   // any other non-blank line ends the child block
-    }
-    // attach descriptions (content under each task's ^tcd- heading)
-    for (const t of tasks) {
-        if (!t.descId) continue;
-        const d = findDescription(lines, t.descId);
-        if (d) t.desc = d.text;
-    }
-    return tasks;
-}
-
-// ─── Vault helpers ───────────────────────────────────────────────────────────
-
+// src/store.js
+var obsidian = __toESM(require("obsidian"), 1);
 function getDateFiles(app) {
-    const { folder, format } = getDailyNotesConfig(app);
-    return app.vault.getMarkdownFiles()
-        .map(f => {
-            const d = fileToDate(f, folder, format);
-            return d ? { file: f, date: toISO(d) } : null;
-        })
-        .filter(Boolean);
+  const { folder, format } = getDailyNotesConfig(app);
+  return app.vault.getMarkdownFiles().map((f) => {
+    const d = fileToDate(f, folder, format);
+    return d ? { file: f, date: toISO(d) } : null;
+  }).filter(Boolean);
 }
-
+var _parseCache = /* @__PURE__ */ new Map();
+function invalidateTaskCache(path) {
+  if (path) _parseCache.delete(path);
+  else _parseCache.clear();
+}
+async function parseFileCached(app, file, mode) {
+  const st = file.stat || {};
+  const hit = _parseCache.get(file.path);
+  if (hit && hit.mtime === st.mtime && hit.size === st.size && hit.mode === mode) return hit.tasks;
+  const content = await app.vault.read(file);
+  const tasks = parseTasks(content, mode === "project" ? { inlineDate: true } : void 0);
+  _parseCache.set(file.path, { mtime: st.mtime, size: st.size, mode, tasks });
+  return tasks;
+}
 async function loadAllTasks(app) {
-    const map = new Map(); // dateStr(ISO) -> { file, tasks }
-    for (const { file, date } of getDateFiles(app)) {
-        const content = await app.vault.read(file);
-        const tasks = parseTasks(content).map(t => ({ ...t, file, date }));
-        map.set(date, { file, tasks });
+  const map = /* @__PURE__ */ new Map();
+  const claimed = /* @__PURE__ */ new Set();
+  if (SCENARIOS.length) {
+    for (const file of app.vault.getMarkdownFiles()) {
+      const sc = matchScenario(file.path);
+      if (!sc) continue;
+      claimed.add(file.path);
+      for (const raw of await parseFileCached(app, file, "project")) {
+        const t2 = { ...raw, date: raw.dateToken, file, project: true };
+        const key = t2.date || `__undated:${file.path}`;
+        if (map.has(key)) map.get(key).tasks.push(t2);
+        else map.set(key, { file, tasks: [t2] });
+      }
     }
-    return map;
+  }
+  for (const { file, date } of getDateFiles(app)) {
+    if (claimed.has(file.path)) continue;
+    const tasks = (await parseFileCached(app, file, "daily")).map((t2) => ({ ...t2, file, date }));
+    if (map.has(date)) map.get(date).tasks.push(...tasks);
+    else map.set(date, { file, tasks });
+  }
+  return map;
 }
-
 async function getOrCreateDateFile(app, isoDate) {
-    const cfg = getDailyNotesConfig(app);
-    const date = parseISO(isoDate);
-    const path = dateToPath(app, date);
-    let f = app.vault.getAbstractFileByPath(path);
-    if (!f) {
-        await ensureFolders(app, path);
-        const tpl = await readTemplate(app, cfg.template, date, cfg.format);
-        f = await app.vault.create(path, tpl != null ? tpl : '');
-    }
-    return f;
+  const cfg = getDailyNotesConfig(app);
+  const date = parseISO(isoDate);
+  const path = dateToPath(app, date);
+  let f = app.vault.getAbstractFileByPath(path);
+  if (!f) {
+    await ensureFolders(app, path);
+    const tpl = await readTemplate(app, cfg.template, date, cfg.format);
+    f = await app.vault.create(path, tpl != null ? tpl : "");
+  }
+  return f;
 }
-
-// Ask before creating a day file that doesn't exist yet (guards accidental clicks)
 function confirmCreate(app, isoDate) {
-    return new Promise(resolve => new ConfirmModal(app, `${t('Створити нотатку на ')}${isoDate}?`, resolve).open());
+  return new Promise((resolve) => new ConfirmModal(app, `${t("\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u043D\u043E\u0442\u0430\u0442\u043A\u0443 \u043D\u0430 ")}${isoDate}?`, resolve).open());
 }
-
-// Open a day's note; if it doesn't exist, confirm before creating
 async function openDay(app, isoDate) {
-    const existing = app.vault.getAbstractFileByPath(dateToPath(app, parseISO(isoDate)));
-    if (existing) {
-        app.workspace.getLeaf().openFile(existing);
-        return;
-    }
-    if (!(await confirmCreate(app, isoDate))) return;
-    const f = await getOrCreateDateFile(app, isoDate);
-    app.workspace.getLeaf().openFile(f);
+  const existing = app.vault.getAbstractFileByPath(dateToPath(app, parseISO(isoDate)));
+  if (existing) {
+    app.workspace.getLeaf().openFile(existing);
+    return;
+  }
+  if (!await confirmCreate(app, isoDate)) return;
+  const f = await getOrCreateDateFile(app, isoDate);
+  app.workspace.getLeaf().openFile(f);
 }
-
-class ConfirmModal extends obsidian.Modal {
-    constructor(app, message, resolve) {
-        super(app);
-        this.message = message;
-        this.resolve = resolve;
-        this.decided = false;
-    }
-    finish(val) {
-        if (this.decided) return;
-        this.decided = true;
-        this.resolve(val);
-        this.close();
-    }
-    onOpen() {
-        this.contentEl.createEl('p', { text: this.message });
-        const btns = this.contentEl.createEl('div', { cls: 'tc-modal-btns' });
-        btns.createEl('button', { text: t('Скасувати') }).onclick = () => this.finish(false);
-        btns.createEl('button', { text: t('Створити'), cls: 'mod-cta' }).onclick = () => this.finish(true);
-    }
-    onClose() {
-        this.contentEl.empty();
-        this.finish(false);   // dismissed via Esc / click-outside
-    }
+var ConfirmModal = class extends obsidian.Modal {
+  constructor(app, message, resolve) {
+    super(app);
+    this.message = message;
+    this.resolve = resolve;
+    this.decided = false;
+  }
+  finish(val) {
+    if (this.decided) return;
+    this.decided = true;
+    this.resolve(val);
+    this.close();
+  }
+  onOpen() {
+    this.contentEl.createEl("p", { text: this.message });
+    const btns = this.contentEl.createEl("div", { cls: "tc-modal-btns" });
+    btns.createEl("button", { text: t("\u0421\u043A\u0430\u0441\u0443\u0432\u0430\u0442\u0438") }).onclick = () => this.finish(false);
+    btns.createEl("button", { text: t("\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438"), cls: "mod-cta" }).onclick = () => this.finish(true);
+  }
+  onClose() {
+    this.contentEl.empty();
+    this.finish(false);
+  }
+};
+var _fileWriteQueues = /* @__PURE__ */ new Map();
+function queueFileEdit(app, file, editFn) {
+  const prev = _fileWriteQueues.get(file.path) || Promise.resolve();
+  const run = prev.then(async () => {
+    const content = await app.vault.read(file);
+    const lines = content.split("\n");
+    const result = await editFn(lines);
+    const next = lines.join("\n");
+    if (next !== content) await app.vault.modify(file, next);
+    return result;
+  });
+  const tail = run.catch(() => {
+  });
+  _fileWriteQueues.set(file.path, tail);
+  tail.then(() => {
+    if (_fileWriteQueues.get(file.path) === tail) _fileWriteQueues.delete(file.path);
+  });
+  return run;
 }
-
 function setCheckbox(line, done) {
-    return line.replace(/^(\s*)- \[(x| |-)\]/, done ? '$1- [x]' : '$1- [ ]');
+  return line.replace(/^(\s*)- \[.\]/, done ? "$1- [x]" : "$1- [ ]");
 }
-
-// Set a task line's status mark: 'done' → [x], 'cancelled' → [-], 'todo' → [ ]
-function statusMark(status) { return status === 'done' ? 'x' : status === 'cancelled' ? '-' : ' '; }
-
-async function setTaskStatus(app, file, lineNum, status) {
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
-    lines[lineNum] = lines[lineNum].replace(/^(\s*)- \[(x| |-)\]/, `$1- [${statusMark(status)}]`);
-    await app.vault.modify(file, lines.join('\n'));
+async function setTaskStatus(app, file, lineNum, statusId) {
+  return queueFileEdit(app, file, (lines) => {
+    lines[lineNum] = lines[lineNum].replace(/^(\s*)- \[.\]/, `$1- [${charForStatusId(statusId)}]`);
+  });
 }
-
 async function toggleTask(app, file, lineNum, done) {
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
+  return queueFileEdit(app, file, (lines) => {
     lines[lineNum] = setCheckbox(lines[lineNum], done);
-    await app.vault.modify(file, lines.join('\n'));
+  });
 }
-
-// Toggle a parent and cascade the same state to all its subtasks
 async function toggleTaskCascade(app, file, task, done) {
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
+  return queueFileEdit(app, file, (lines) => {
     lines[task.line] = setCheckbox(lines[task.line], done);
     for (const s of task.subtasks) lines[s.line] = setCheckbox(lines[s.line], done);
-    await app.vault.modify(file, lines.join('\n'));
+  });
 }
-
-// Recompute parent checkbox from its subtasks (all done → [x]; otherwise → [ ])
 function syncParent(lines, parentLineNum) {
-    let total = 0, done = 0;
-    for (let i = parentLineNum + 1; i < lines.length; i++) {
-        const cb = lines[i].match(/^(\s+)- \[(x| |-)\] /);
-        if (cb) { if (cb[2] === '-') continue; total++; if (cb[2] === 'x') done++; continue; }
-        if (lines[i].trim() === '') continue;          // blank inside block
-        if (/^\s+- /.test(lines[i])) continue;         // indented comment
-        break;                                          // top-level content → end of children
+  let total = 0, done = 0;
+  for (let i = parentLineNum + 1; i < lines.length; i++) {
+    const cb = lines[i].match(/^(\s+)- \[(.)\] /);
+    if (cb) {
+      const behavior = statusForChar(cb[2]).behavior;
+      if (behavior === "cancelled") continue;
+      total++;
+      if (behavior === "done") done++;
+      continue;
     }
-    if (total === 0) return;
-    lines[parentLineNum] = setCheckbox(lines[parentLineNum], done === total);
+    if (lines[i].trim() === "") continue;
+    if (/^\s+- /.test(lines[i])) continue;
+    break;
+  }
+  if (total === 0) return;
+  lines[parentLineNum] = setCheckbox(lines[parentLineNum], done === total);
 }
-
-// Toggle a subtask and re-sync the parent's checkbox
 async function toggleSubtask(app, file, parentLineNum, subLineNum, done) {
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
+  return queueFileEdit(app, file, (lines) => {
     lines[subLineNum] = setCheckbox(lines[subLineNum], done);
     syncParent(lines, parentLineNum);
-    await app.vault.modify(file, lines.join('\n'));
+  });
 }
-
-// Insert an indented child line (subtask or comment) after the parent's existing children
 async function addChild(app, file, parentTask, childLine) {
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
+  return queueFileEdit(app, file, (lines) => {
     let insertAt = parentTask.line + 1;
     for (let i = parentTask.line + 1; i < lines.length; i++) {
-        if (/^\s+- /.test(lines[i])) insertAt = i + 1;
-        else if (lines[i].trim() === '') continue;
-        else break;
+      if (/^\s+- /.test(lines[i])) insertAt = i + 1;
+      else if (lines[i].trim() === "") continue;
+      else break;
     }
     lines.splice(insertAt, 0, CHILD_INDENT + childLine);
     syncParent(lines, parentTask.line);
-    await app.vault.modify(file, lines.join('\n'));
+  });
 }
-
-// Rebuild a task line body from its fields (canonical order: time, text, tags, !prio, @group)
-function serializeTaskBody(t) {
-    const parts = [];
-    if (t.start) parts.push(t.end ? `${t.start}-${t.end}` : t.start);
-    if (t.text) parts.push(t.text);
-    for (const tag of (t.tags || [])) parts.push(`#${tag}`);
-    if (t.priority) parts.push(`!${t.priority}`);
-    if (t.group) parts.push(`@${t.group}`);
-    return parts.join(' ');
+function serializeTaskBody(t2) {
+  const parts = [];
+  if (t2.start) parts.push(t2.end ? `${t2.start}-${t2.end}` : t2.start);
+  if (t2.text) parts.push(t2.text);
+  if (t2.project && t2.date) parts.push(`>${t2.date}`);
+  for (const tag of t2.tags || []) parts.push(`#${tag}`);
+  if (t2.priority) parts.push(`!${t2.priority}`);
+  if (t2.group) parts.push(`@${t2.group}`);
+  return parts.join(" ");
 }
-
 function taskMarkers(task) {
-    return (task.recId ? ` ^rc-${task.recId}` : '') + (task.descId ? ` ^tcd-${task.descId}` : '');
+  return (task.recId ? ` ^rc-${task.recId}` : "") + (task.descId ? ` ^tcd-${task.descId}` : "");
 }
-
-// Rewrite a single task line from a (possibly edited) task object, preserving indent + block markers
 async function rewriteTaskLine(app, file, lineNum, task) {
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
-    const indent = (lines[lineNum].match(/^(\s*)/) || ['', ''])[1];
-    const mark = task.cancelled ? '-' : task.done ? 'x' : ' ';
+  return queueFileEdit(app, file, (lines) => {
+    const indent = (lines[lineNum].match(/^(\s*)/) || ["", ""])[1];
+    const mark = taskMark(task);
     lines[lineNum] = `${indent}- [${mark}] ${serializeTaskBody(task)}${taskMarkers(task)}`;
-    await app.vault.modify(file, lines.join('\n'));
+  });
 }
-
-// Create / update / remove a task's free-form description (heading one level below the tasks heading)
 async function setDescription(app, file, task, text, settings) {
-    text = (text || '').trim();
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
-    const level = Math.min(6, settings.headingLevel + 1);
-
+  text = (text || "").trim();
+  const level = Math.min(6, settings.headingLevel + 1);
+  return queueFileEdit(app, file, (lines) => {
     if (task.descId) {
-        const d = findDescription(lines, task.descId);
-        if (text === '') {
-            if (d) lines.splice(d.headingLine, d.endLine - d.headingLine);
-            lines[task.line] = lines[task.line].replace(/\s+\^tcd-[A-Za-z0-9]+/, '');
-            task.descId = null;
-            await app.vault.modify(file, lines.join('\n'));
-            return;
-        }
-        if (d) {
-            lines.splice(d.headingLine, d.endLine - d.headingLine, lines[d.headingLine], ...text.split('\n'));
-            await app.vault.modify(file, lines.join('\n'));
-            return;
-        }
+      const d = findDescription(lines, task.descId);
+      if (text === "") {
+        if (d) lines.splice(d.headingLine, d.endLine - d.headingLine);
+        lines[task.line] = lines[task.line].replace(/\s+\^tcd-[A-Za-z0-9]+/, "");
+        task.descId = null;
+        return;
+      }
+      if (d) {
+        lines.splice(d.headingLine, d.endLine - d.headingLine, lines[d.headingLine], ...text.split("\n"));
+        return;
+      }
     }
-
-    if (text === '') return;
+    if (text === "") return;
     const id = task.descId || genId();
     task.descId = id;
     if (!new RegExp(`\\^tcd-${id}\\b`).test(lines[task.line])) {
-        lines[task.line] = lines[task.line].replace(/\s*$/, '') + ` ^tcd-${id}`;
+      lines[task.line] = lines[task.line].replace(/\s*$/, "") + ` ^tcd-${id}`;
     }
-    if (lines.length && lines[lines.length - 1].trim() !== '') lines.push('');
-    lines.push(`${'#'.repeat(level)} ${task.text} ^tcd-${id}`, ...text.split('\n'));
-    await app.vault.modify(file, lines.join('\n'));
+    if (lines.length && lines[lines.length - 1].trim() !== "") lines.push("");
+    lines.push(`${"#".repeat(level)} ${task.text} ^tcd-${id}`, ...text.split("\n"));
+  });
 }
-
-// Existing tag names (from Obsidian) and group names (known to the plugin) for autocomplete
 function collectTags(app) {
-    const tg = (app.metadataCache.getTags && app.metadataCache.getTags()) || {};
-    return Object.keys(tg).map(k => k.replace(/^#/, '')).sort();
+  const tg = app.metadataCache.getTags && app.metadataCache.getTags() || {};
+  return Object.keys(tg).map((k) => k.replace(/^#/, "")).sort();
 }
 async function collectGroups(app, settings) {
-    const set = new Set();
-    (settings.colors.groups || []).forEach(g => g.name && set.add(g.name));
-    const map = await loadAllTasks(app);
-    for (const { tasks } of map.values()) for (const t of tasks) if (t.group) set.add(t.group);
-    return [...set].sort();
+  const set = /* @__PURE__ */ new Set();
+  (settings.colors.groups || []).forEach((g) => g.name && set.add(g.name));
+  const map = await loadAllTasks(app);
+  for (const { tasks } of map.values()) for (const t2 of tasks) if (t2.group) set.add(t2.group);
+  return [...set].sort();
 }
-
-async function removeLine(app, file, lineNum) {
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
-    lines.splice(lineNum, 1);
-    await app.vault.modify(file, lines.join('\n'));
-}
-
-// Remove a subtask line and re-sync its parent's checkbox
 async function removeSubtask(app, file, parentLine, subLine) {
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
+  return queueFileEdit(app, file, (lines) => {
     lines.splice(subLine, 1);
-    syncParent(lines, parentLine);   // parentLine < subLine → index still valid
-    await app.vault.modify(file, lines.join('\n'));
+    syncParent(lines, parentLine);
+  });
 }
-
-// Remove a top-level task together with its indented children
 async function removeTaskBlock(app, file, task) {
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
+  return queueFileEdit(app, file, (lines) => {
     let end = task.line + 1;
     while (end < lines.length && /^\s+- /.test(lines[end])) end++;
     lines.splice(task.line, end - task.line);
-    await app.vault.modify(file, lines.join('\n'));
+  });
 }
-
-// Append default tag/group/priority (from settings) when the text doesn't already specify them
 function applyDefaults(text, settings) {
-    if (!settings) return text;
-    let out = text;
-    if (settings.defaultTag && !/#[^\s#]+/.test(out)) out += ` #${settings.defaultTag}`;
-    if (settings.defaultGroup && !/@[^\s]+/.test(out)) out += ` @${settings.defaultGroup}`;
-    const pAlt = priorityKeys.map(escapeRe).join('|') || 'x^';
-    if (settings.defaultPriority && !new RegExp(`!(${pAlt})\\b`).test(out)) out += ` !${settings.defaultPriority}`;
-    return out;
+  if (!settings) return text;
+  let out = text;
+  if (settings.defaultTag && !/#[^\s#]+/.test(out)) out += ` #${settings.defaultTag}`;
+  if (settings.defaultGroup && !/@[^\s]+/.test(out)) out += ` @${settings.defaultGroup}`;
+  const pAlt = priorityKeys.map(escapeRe).join("|") || "x^";
+  if (settings.defaultPriority && !new RegExp(`!(${pAlt})\\b`).test(out)) out += ` !${settings.defaultPriority}`;
+  return out;
 }
-
 async function addTask(app, file, text, settings) {
-    return insertBlockUnderHeading(app, file, [`- [ ] ${applyDefaults(text, settings)}`], settings);
+  return insertBlockUnderHeading(app, file, [`- [ ] ${applyDefaults(text, settings)}`], settings);
 }
-
 async function insertLineUnderHeading(app, file, taskLine, settings) {
-    return insertBlockUnderHeading(app, file, [taskLine], settings);
+  return insertBlockUnderHeading(app, file, [taskLine], settings);
 }
-
-// Insert one or more lines (a task + its indented children) under the configured heading
 async function insertBlockUnderHeading(app, file, blockLines, settings) {
-    const level = settings.headingLevel;
-    const headingText = settings.headingText;
-    const headingLine = `${'#'.repeat(level)} ${headingText}`;
-
-    const content = await app.vault.read(file);
-    const lines = content.split('\n');
-
+  const level = settings.headingLevel;
+  const headingText = settings.headingText;
+  const headingLine = `${"#".repeat(level)} ${headingText}`;
+  return queueFileEdit(app, file, (lines) => {
     let idx = -1;
     for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(/^(#{1,6})\s+(.*?)\s*$/);
-        if (m && m[1].length === level && m[2].toLowerCase() === headingText.toLowerCase()) { idx = i; break; }
+      const m = lines[i].match(/^(#{1,6})\s+(.*?)\s*$/);
+      if (m && m[1].length === level && m[2].toLowerCase() === headingText.toLowerCase()) {
+        idx = i;
+        break;
+      }
     }
-
     let insertedAt;
     if (idx === -1) {
-        if (lines.length && lines[lines.length - 1].trim() !== '') lines.push('');
-        lines.push(headingLine, ...blockLines);
-        insertedAt = lines.length - blockLines.length;
+      if (lines.length && lines[lines.length - 1].trim() !== "") lines.push("");
+      lines.push(headingLine, ...blockLines);
+      insertedAt = lines.length - blockLines.length;
     } else {
-        let end = lines.length;
-        for (let i = idx + 1; i < lines.length; i++) {
-            const m = lines[i].match(/^(#{1,6})\s+/);
-            if (m && m[1].length <= level) { end = i; break; }
+      let end = lines.length;
+      for (let i = idx + 1; i < lines.length; i++) {
+        const m = lines[i].match(/^(#{1,6})\s+/);
+        if (m && m[1].length <= level) {
+          end = i;
+          break;
         }
-        // after the last top-level task in the section…
-        let insertAt = idx + 1;
-        for (let i = idx + 1; i < end; i++) {
-            if (/^\s*- \[(x| |-)\]/.test(lines[i]) && /^\S/.test(lines[i])) insertAt = i + 1;
-        }
-        // …and past that task's indented children
-        while (insertAt < end && /^\s+- /.test(lines[insertAt])) insertAt++;
-        lines.splice(insertAt, 0, ...blockLines);
-        insertedAt = insertAt;
+      }
+      let insertAt = idx + 1;
+      for (let i = idx + 1; i < end; i++) {
+        if (/^\s*- \[.\]/.test(lines[i]) && /^\S/.test(lines[i])) insertAt = i + 1;
+      }
+      while (insertAt < end && /^\s+- /.test(lines[insertAt])) insertAt++;
+      lines.splice(insertAt, 0, ...blockLines);
+      insertedAt = insertAt;
     }
-
-    await app.vault.modify(file, lines.join('\n'));
     return insertedAt;
+  });
 }
-
-// Move a task (with its children) to another day's note, updating its time
 async function moveTaskToDay(app, task, destISO, newStart, newEnd, settings) {
-    const srcFile = task.file;
-    const content = await app.vault.read(srcFile);
-    const lines = content.split('\n');
-
+  if (task.project) {
+    const updated = { ...task, date: destISO, start: newStart, end: newEnd };
+    await rewriteTaskLine(app, task.file, task.line, updated);
+    return { file: task.file, line: task.line };
+  }
+  const srcFile = task.file;
+  const block = await queueFileEdit(app, srcFile, (lines) => {
     let end = task.line + 1;
     while (end < lines.length && /^\s+- /.test(lines[end])) end++;
-    const block = lines.slice(task.line, end);
-
-    const indent = (block[0].match(/^(\s*)/) || ['', ''])[1];
+    const blk = lines.slice(task.line, end);
+    const indent = (blk[0].match(/^(\s*)/) || ["", ""])[1];
     const marker = taskMarkers(task);
-    const mark = task.cancelled ? '-' : task.done ? 'x' : ' ';
+    const mark = taskMark(task);
     const updated = { ...task, start: newStart, end: newEnd };
-    block[0] = `${indent}- [${mark}] ${serializeTaskBody(updated)}${marker}`;
-
+    blk[0] = `${indent}- [${mark}] ${serializeTaskBody(updated)}${marker}`;
     lines.splice(task.line, end - task.line);
-    await app.vault.modify(srcFile, lines.join('\n'));
-
-    const destFile = await getOrCreateDateFile(app, destISO);
-    const line = await insertBlockUnderHeading(app, destFile, block, settings);
-    return { file: destFile, line };
+    return blk;
+  });
+  const destFile = await getOrCreateDateFile(app, destISO);
+  const line = await insertBlockUnderHeading(app, destFile, block, settings);
+  return { file: destFile, line };
 }
 
-// ─── Reusable creation forms (shared by settings tab & quick-create modal) ─────
+// src/core.js
+var LIST_VIEW = "md-task-calendar-list";
+var CAL_VIEW = "md-task-calendar-cal";
+var HABITS_VIEW = "md-task-calendar-habits";
+var MINI_VIEW = "md-task-calendar-mini";
+var priorityKeys = ["low", "med", "high", "urgent"];
+var priorityRank = { low: 1, med: 2, high: 3, urgent: 4 };
+var COLORS = { priorities: {}, tags: {}, groups: {} };
+var weekStartDay = 1;
+var SCENARIOS = [];
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+var DEFAULT_CHECKBOX_STATUSES = [
+  { id: "todo", char: " ", label: "\u041D\u0435 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u043E", behavior: "active", icon: "" },
+  { id: "done", char: "x", label: "\u0412\u0438\u043A\u043E\u043D\u0430\u043D\u043E", behavior: "done", icon: "" },
+  { id: "cancelled", char: "-", label: "\u0421\u043A\u0430\u0441\u043E\u0432\u0430\u043D\u043E", behavior: "cancelled", icon: "x" },
+  { id: "in-progress", char: "/", label: "\u0423 \u0440\u043E\u0431\u043E\u0442\u0456", behavior: "active", icon: "clock" },
+  { id: "forwarded", char: ">", label: "\u041F\u0435\u0440\u0435\u043D\u0435\u0441\u0435\u043D\u043E", behavior: "cancelled", icon: "corner-up-right" },
+  { id: "scheduled", char: "<", label: "\u0417\u0430\u043F\u043B\u0430\u043D\u043E\u0432\u0430\u043D\u043E", behavior: "active", icon: "calendar-clock" },
+  { id: "important", char: "!", label: "\u0412\u0430\u0436\u043B\u0438\u0432\u043E", behavior: "active", icon: "alert-triangle" },
+  { id: "question", char: "?", label: "\u041F\u0456\u0434 \u043F\u0438\u0442\u0430\u043D\u043D\u044F\u043C", behavior: "active", icon: "help-circle" }
+];
+var CHECKBOX_ICON_CHOICES = [
+  "x",
+  "clock",
+  "corner-up-right",
+  "corner-down-right",
+  "calendar-clock",
+  "alert-triangle",
+  "help-circle",
+  "flag",
+  "star",
+  "flame",
+  "zap",
+  "pause",
+  "play",
+  "rewind",
+  "fast-forward",
+  "ban",
+  "circle-slash",
+  "thumbs-up",
+  "thumbs-down",
+  "message-circle",
+  "info",
+  "alert-circle",
+  "bookmark",
+  "pin",
+  "eye",
+  "lock",
+  "circle-dot",
+  "loader-circle"
+];
+var STATUSES = DEFAULT_CHECKBOX_STATUSES;
+var STATUS_BY_CHAR = new Map(STATUSES.map((s) => [s.char, s]));
+function statusForChar(ch) {
+  return STATUS_BY_CHAR.get(ch) || { id: null, char: ch, label: ch, behavior: ch === "x" ? "done" : ch === "-" ? "cancelled" : "active" };
+}
+function charForStatusId(id) {
+  const found = STATUSES.find((s) => s.id === id);
+  if (found) return found.char;
+  if (id === "done") return "x";
+  if (id === "cancelled") return "-";
+  return " ";
+}
+function taskMark(task) {
+  return task.statusChar != null ? task.statusChar : task.cancelled ? "-" : task.done ? "x" : " ";
+}
+var LANG = "uk";
+function resolveLang(settings) {
+  const s = settings && settings.language;
+  if (s === "uk" || s === "en") return s;
+  const l = (window.localStorage && window.localStorage.getItem("language") || "").toLowerCase();
+  return l.startsWith("uk") ? "uk" : "en";
+}
+function t(s) {
+  return LANG === "en" ? I18N[s] || s : s;
+}
+function applyConfig(settings) {
+  const c = settings && settings.colors || {};
+  priorityKeys = (c.priorities || []).map((p) => p.key).filter(Boolean);
+  if (!priorityKeys.length) priorityKeys = ["low", "med", "high", "urgent"];
+  priorityRank = {};
+  priorityKeys.forEach((k, i) => priorityRank[k] = i + 1);
+  COLORS = { priorities: {}, tags: {}, groups: {} };
+  (c.priorities || []).forEach((p) => {
+    if (p.key) COLORS.priorities[p.key] = p.color;
+  });
+  (c.tags || []).forEach((t2) => {
+    if (t2.name) COLORS.tags[t2.name] = t2.color;
+  });
+  (c.groups || []).forEach((g) => {
+    if (g.name) COLORS.groups[g.name] = g.color;
+  });
+  weekStartDay = settings && settings.firstDayOfWeek != null ? settings.firstDayOfWeek : 1;
+  SCENARIOS = settings && settings.scenarios || [];
+  STATUSES = settings && settings.checkboxStatuses && settings.checkboxStatuses.length ? settings.checkboxStatuses : DEFAULT_CHECKBOX_STATUSES;
+  STATUS_BY_CHAR = new Map(STATUSES.map((s) => [s.char, s]));
+  LANG = resolveLang(settings);
+  MONTHS_UA = LANG === "en" ? MONTHS_EN : MONTHS_UK;
+  MONTHS_GEN = LANG === "en" ? MONTHS_EN : MONTHS_GEN_UK;
+  WD_UA = LANG === "en" ? WD_EN : WD_UK;
+  WD_FULL = LANG === "en" ? WD_FULL_EN : WD_FULL_UK;
+}
+function prioColor(key) {
+  return COLORS.priorities[key] || "#888888";
+}
+var COMPACT_WIDTH = 560;
+function compactMode(view) {
+  if (obsidian2.Platform.isMobile) return true;
+  const w = view.containerEl ? view.containerEl.clientWidth : 0;
+  return w > 0 && w < COMPACT_WIDTH;
+}
+function autoColor(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = h * 31 + str.charCodeAt(i) >>> 0;
+  return `hsl(${h % 360}, 60%, 72%)`;
+}
+function cardColor(task, colorBy) {
+  if (colorBy === "tag") {
+    const t2 = task.tags && task.tags[0];
+    return t2 ? COLORS.tags[t2] || autoColor(t2) : null;
+  }
+  if (colorBy === "group") {
+    return task.group ? COLORS.groups[task.group] || autoColor(task.group) : null;
+  }
+  if (colorBy === "none") return null;
+  return task.priority ? prioColor(task.priority) : null;
+}
+var MONTHS_UK = [
+  "\u0421\u0456\u0447\u0435\u043D\u044C",
+  "\u041B\u044E\u0442\u0438\u0439",
+  "\u0411\u0435\u0440\u0435\u0437\u0435\u043D\u044C",
+  "\u041A\u0432\u0456\u0442\u0435\u043D\u044C",
+  "\u0422\u0440\u0430\u0432\u0435\u043D\u044C",
+  "\u0427\u0435\u0440\u0432\u0435\u043D\u044C",
+  "\u041B\u0438\u043F\u0435\u043D\u044C",
+  "\u0421\u0435\u0440\u043F\u0435\u043D\u044C",
+  "\u0412\u0435\u0440\u0435\u0441\u0435\u043D\u044C",
+  "\u0416\u043E\u0432\u0442\u0435\u043D\u044C",
+  "\u041B\u0438\u0441\u0442\u043E\u043F\u0430\u0434",
+  "\u0413\u0440\u0443\u0434\u0435\u043D\u044C"
+];
+var MONTHS_GEN_UK = [
+  "\u0441\u0456\u0447\u043D\u044F",
+  "\u043B\u044E\u0442\u043E\u0433\u043E",
+  "\u0431\u0435\u0440\u0435\u0437\u043D\u044F",
+  "\u043A\u0432\u0456\u0442\u043D\u044F",
+  "\u0442\u0440\u0430\u0432\u043D\u044F",
+  "\u0447\u0435\u0440\u0432\u043D\u044F",
+  "\u043B\u0438\u043F\u043D\u044F",
+  "\u0441\u0435\u0440\u043F\u043D\u044F",
+  "\u0432\u0435\u0440\u0435\u0441\u043D\u044F",
+  "\u0436\u043E\u0432\u0442\u043D\u044F",
+  "\u043B\u0438\u0441\u0442\u043E\u043F\u0430\u0434\u0430",
+  "\u0433\u0440\u0443\u0434\u043D\u044F"
+];
+var MONTHS_EN = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December"
+];
+var WD_UK = ["\u041F\u043D", "\u0412\u0442", "\u0421\u0440", "\u0427\u0442", "\u041F\u0442", "\u0421\u0431", "\u041D\u0434"];
+var WD_EN = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+var WD_FULL_UK = ["\u041F\u043E\u043D\u0435\u0434\u0456\u043B\u043E\u043A", "\u0412\u0456\u0432\u0442\u043E\u0440\u043E\u043A", "\u0421\u0435\u0440\u0435\u0434\u0430", "\u0427\u0435\u0442\u0432\u0435\u0440", "\u041F\u02BC\u044F\u0442\u043D\u0438\u0446\u044F", "\u0421\u0443\u0431\u043E\u0442\u0430", "\u041D\u0435\u0434\u0456\u043B\u044F"];
+var WD_FULL_EN = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+var MONTHS_UA = MONTHS_UK;
+var MONTHS_GEN = MONTHS_GEN_UK;
+var WD_UA = WD_UK;
+var WD_FULL = WD_FULL_UK;
+function humanDate(iso) {
+  const d = parseISO(iso);
+  const dayMonth = `${d.getDate()} ${MONTHS_GEN[d.getMonth()]}`;
+  if (iso === todayISO()) return `${t("\u0421\u044C\u043E\u0433\u043E\u0434\u043D\u0456")} \xB7 ${dayMonth}`;
+  if (iso === toISO(addDays(/* @__PURE__ */ new Date(), 1))) return `${t("\u0417\u0430\u0432\u0442\u0440\u0430")} \xB7 ${dayMonth}`;
+  if (iso === toISO(addDays(/* @__PURE__ */ new Date(), -1))) return `${t("\u0412\u0447\u043E\u0440\u0430")} \xB7 ${dayMonth}`;
+  return `${WD_FULL[mondayIdx(d)]}, ${dayMonth}`;
+}
+var I18N = {
+  // views / commands / ribbon
+  "\u041A\u0430\u043B\u0435\u043D\u0434\u0430\u0440": "Calendar",
+  "\u0421\u043F\u0438\u0441\u043E\u043A \u0437\u0430\u0434\u0430\u0447": "Tasks",
+  "\u0417\u0432\u0438\u0447\u043A\u0438": "Habits",
+  "\u041C\u0456\u043D\u0456-\u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440": "Mini calendar",
+  "Markday \u2014 \u041A\u0430\u043B\u0435\u043D\u0434\u0430\u0440": "Markday \u2014 Calendar",
+  "Markday \u2014 \u0421\u043F\u0438\u0441\u043E\u043A": "Markday \u2014 Tasks",
+  "Markday \u2014 \u0417\u0432\u0438\u0447\u043A\u0438": "Markday \u2014 Habits",
+  "Markday \u2014 \u041C\u0456\u043D\u0456-\u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440": "Markday \u2014 Mini calendar",
+  "\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u041A\u0430\u043B\u0435\u043D\u0434\u0430\u0440": "Open Calendar",
+  "\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u0421\u043F\u0438\u0441\u043E\u043A \u0437\u0430\u0434\u0430\u0447": "Open Tasks",
+  "\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u0417\u0432\u0438\u0447\u043A\u0438": "Open Habits",
+  "\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u041C\u0456\u043D\u0456-\u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440 (\u0431\u0456\u0447\u043D\u0430 \u043F\u0430\u043D\u0435\u043B\u044C)": "Open Mini calendar (sidebar)",
+  "\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438/\u0441\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u043D\u043E\u0442\u0430\u0442\u043A\u0443 \u0441\u044C\u043E\u0433\u043E\u0434\u043D\u0456": "Open/create today's note",
+  "\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u0437\u0430\u0434\u0430\u0447\u0443": "Create task",
+  "\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u0437\u0432\u0438\u0447\u043A\u0443": "Create habit",
+  // calendar
+  "\u041F\u0435\u0440\u0435\u043B\u0456\u043A": "Overview",
+  "\u0420\u043E\u0431\u043E\u0447\u0438\u0439 \u0442\u0438\u0436\u0434\u0435\u043D\u044C": "Work week",
+  "3 \u0434\u043D\u0456": "3 days",
+  "\u041A\u043E\u043B\u0456\u0440: \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442": "Color: priority",
+  "\u041A\u043E\u043B\u0456\u0440: \u0442\u0435\u0433": "Color: tag",
+  "\u041A\u043E\u043B\u0456\u0440: \u0433\u0440\u0443\u043F\u0430": "Color: group",
+  "\u0411\u0435\u0437 \u043A\u043E\u043B\u044C\u043E\u0440\u0443": "No color",
+  "\u041A\u043E\u043B\u0456\u0440": "Color",
+  "\u0421\u044C\u043E\u0433\u043E\u0434\u043D\u0456": "Today",
+  "\u0412\u0447\u043E\u0440\u0430": "Yesterday",
+  "\u0412\u0456\u0434\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u043D\u044F": "Display",
+  "\u041D\u0430\u0437\u0430\u0434": "Back",
+  "\u0412\u043F\u0435\u0440\u0435\u0434": "Forward",
+  "\u0411\u0435\u0437 \u0444\u0456\u043B\u044C\u0442\u0440\u0430": "No filter",
+  "\u041F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438": "Priorities",
+  "\u0424\u0456\u043B\u044C\u0442\u0440\u2026": "Filter\u2026",
+  "\u0424\u0456\u043B\u044C\u0442\u0440: \u0437\u043C\u0456\u043D\u0438\u0442\u0438/\u0437\u043D\u044F\u0442\u0438": "Filter: change / clear",
+  "\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u0442\u0435\u0433\u0438": "Show tags",
+  "\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u0433\u0440\u0443\u043F\u0438": "Show groups",
+  "\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438": "Show priorities",
+  "\u041A\u0440\u0430\u043F\u043A\u0430 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0443": "Priority dot",
+  "\u0417\u0430\u0434\u0430\u0447 \u043D\u0435\u043C\u0430\u0454": "No tasks",
+  "\u041D\u043E\u0442\u0430\u0442\u043A\u0430": "Note",
+  "+ \u0437\u0430\u0434\u0430\u0447\u0430": "+ task",
+  "\u0432\u0435\u0441\u044C \u0434\u0435\u043D\u044C": "all-day",
+  "\u041D\u043E\u0432\u0430 \u043F\u043E\u0434\u0456\u044F": "New event",
+  // list
+  "\u041D\u043E\u0432\u0430 \u0437\u0430\u0434\u0430\u0447\u0430\u2026": "New task\u2026",
+  "\u041D\u043E\u0432\u0430 \u0437\u0430\u0434\u0430\u0447\u0430 (\u0441\u044C\u043E\u0433\u043E\u0434\u043D\u0456)\u2026": "New task (today)\u2026",
+  "\u041D\u043E\u0432\u0430 \u0437\u0430\u0434\u0430\u0447\u0430 \u043D\u0430 \u0441\u044C\u043E\u0433\u043E\u0434\u043D\u0456\u2026": "New task for today\u2026",
+  "\u0423\u0441\u0456": "All",
+  "\u041D\u0430\u0441\u0442\u0443\u043F\u043D\u0456 30 \u0434\u043D\u0456\u0432": "Next 30 days",
+  "\u0411\u0435\u0437 \u0433\u0440\u0443\u043F": "No grouping",
+  "\u0417\u0430 \u0434\u0430\u0442\u043E\u044E": "By date",
+  "\u0417\u0430 \u0442\u0435\u0433\u043E\u043C": "By tag",
+  "\u0417\u0430 \u0433\u0440\u0443\u043F\u043E\u044E": "By group",
+  "\u0417\u0430 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u043E\u043C": "By priority",
+  "\u0413\u0440\u0443\u043F\u0443\u0432\u0430\u043D\u043D\u044F": "Grouping",
+  "\u0421\u043E\u0440\u0442\u0443\u0432\u0430\u043D\u043D\u044F": "Sorting",
+  "\u0421\u043E\u0440\u0442\u0443\u0432\u0430\u043D\u043D\u044F \u0442\u0430 \u0433\u0440\u0443\u043F\u0443\u0432\u0430\u043D\u043D\u044F": "Sort & group",
+  "\u041F\u0435\u0440\u0456\u043E\u0434": "Period",
+  "\u041F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442": "Priority",
+  "\u0414\u0430\u0442\u0430": "Date",
+  "\u0427\u0430\u0441": "Time",
+  "\u041D\u0430\u0437\u0432\u0430": "Name",
+  "\u041F\u0440\u043E\u0442\u0435\u0440\u043C\u0456\u043D\u043E\u0432\u0430\u043D\u0456": "Overdue",
+  "\u0421\u0445\u043E\u0432\u0430\u0442\u0438 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u0456": "Hide done",
+  "\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u0434\u0435\u0442\u0430\u043B\u0456": "Show details",
+  "\u0417\u0432\u0438\u0447\u043A\u0438 \u0441\u044C\u043E\u0433\u043E\u0434\u043D\u0456": "Today's habits",
+  "\u0417\u0430\u0434\u0430\u0447 \u043D\u0435 \u0437\u043D\u0430\u0439\u0434\u0435\u043D\u043E.": "No tasks found.",
+  "\u0411\u0435\u0437 \u0433\u0440\u0443\u043F\u0438": "No group",
+  "\u0411\u0435\u0437 \u0442\u0435\u0433\u0456\u0432": "No tags",
+  "\u0411\u0435\u0437 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0443": "No priority",
+  "\u0411\u0435\u0437 \u0447\u0430\u0441\u0443 (\u043D\u0430\u0439\u0431\u043B\u0438\u0436\u0447\u0435)": "No time (upcoming)",
+  "\u041D\u0435\u043C\u0430\u0454 \u0437\u0430\u0434\u0430\u0447 \u043D\u0430 \u0441\u044C\u043E\u0433\u043E\u0434\u043D\u0456": "No tasks for today",
+  "\u041D\u0435\u043C\u0430\u0454 \u0437\u0430\u043F\u043B\u0430\u043D\u043E\u0432\u0430\u043D\u0438\u0445 \u0437\u0430\u0434\u0430\u0447": "No scheduled tasks",
+  // habits
+  "\u0426\u0435\u0439 \u0442\u0438\u0436\u0434\u0435\u043D\u044C": "This week",
+  "\u0442\u0430\u043A/\u043D\u0456": "yes/no",
+  "\u0423\u0441\u0456 \u0437\u0432\u0438\u0447\u043A\u0438": "All habits",
+  "\u0417\u0432\u0438\u0447\u043E\u043A \u0449\u0435 \u043D\u0435\u043C\u0430\u0454. \u0421\u0442\u0432\u043E\u0440\u0456\u0442\u044C \u0457\u0445 \u0447\u0435\u0440\u0435\u0437 Ctrl+P \u2192 \u0417\u0432\u0438\u0447\u043A\u0430.": "No habits yet. Create them via Ctrl+P \u2192 Habit.",
+  "\u041D\u0430\u0439\u0434\u043E\u0432\u0448\u0430 \u0441\u0435\u0440\u0456\u044F": "Longest streak",
+  "\u0434\u043D\u0456\u0432 \u043F\u0456\u0434\u0440\u044F\u0434": "days in a row",
+  "\u0420\u0435\u043A\u043E\u0440\u0434 \u0437\u0430 \u0434\u0435\u043D\u044C": "Best day",
+  "\u0417\u0430 \u043C\u0456\u0441\u044F\u0446\u044C": "This month",
+  "\u0417\u0430 \u0440\u0456\u043A": "This year",
+  "\u0440\u0430\u0437\u0456\u0432": "times",
+  "\u0437\u0432\u0438\u0447\u043E\u043A": "habits",
+  "\u0441\u043B\u0456\u0432": "words",
+  "\u0441\u0442\u043E\u0440\u0456\u043D\u043A\u0438": "pages",
+  "\u0421\u043A\u0456\u043B\u044C\u043A\u0438": "How much",
+  "\u0412\u0438\u043A\u043E\u043D\u0430\u043D\u043E": "Done",
+  "\u041D\u0435 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u043E": "Not done",
+  "\u0421\u043A\u0430\u0441\u043E\u0432\u0430\u043D\u043E": "Cancelled",
+  "\u0421\u0442\u0430\u0442\u0443\u0441": "Status",
+  "\u0410\u043A\u0442\u0438\u0432\u043D\u0430": "Active",
+  "\u0412\u0438\u043A\u043E\u043D\u0430\u043D\u0430": "Done",
+  "\u0421\u043A\u0430\u0441\u043E\u0432\u0430\u043D\u0430": "Cancelled",
+  "\u041D\u0435 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u0430": "Not done",
+  "\u0412\u0456\u0434\u043C\u0456\u043D\u0435\u043D\u0430": "Cancelled",
+  "\u041E\u043F\u0438\u0441": "Description",
+  "\u041E\u043F\u0438\u0441, \u0442\u0435\u0433\u0438 #, \u0433\u0440\u0443\u043F\u0438 @\u2026": "Description, tags #, groups @\u2026",
+  "\u0429\u043E\u0434\u0435\u043D\u043D\u043E": "Daily",
+  "\u0429\u043E\u0442\u0438\u0436\u043D\u0435\u0432\u043E (\u043F\u043E\u0442\u043E\u0447\u043D\u0438\u0439 \u0434\u0435\u043D\u044C)": "Weekly (this weekday)",
+  "\u0429\u043E\u0442\u0438\u0436\u043D\u0435\u0432\u043E \u0443 \u0440\u043E\u0431\u043E\u0447\u0456 \u0434\u043D\u0456 (\u041F\u043D\u2013\u041F\u0442)": "Weekly (Mon\u2013Fri)",
+  "\u0429\u043E\u043C\u0456\u0441\u044F\u0447\u043D\u043E (\u043F\u043E\u0442\u043E\u0447\u043D\u0435 \u0447\u0438\u0441\u043B\u043E)": "Monthly (this day)",
+  "\u0429\u043E\u0440\u0456\u0447\u043D\u043E (\u043F\u043E\u0442\u043E\u0447\u043D\u0438\u0439 \u0434\u0435\u043D\u044C)": "Yearly (this day)",
+  "\u041A\u0430\u0441\u0442\u043E\u043C\u043D\u0435 \u043D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u043D\u043D\u044F\u2026": "Custom\u2026",
+  "\u0417\u0430\u0432\u0442\u0440\u0430": "Tomorrow",
+  "\u041D\u0430\u0441\u0442\u0443\u043F\u043D\u043E\u0433\u043E \u043F\u043E\u043D\u0435\u0434\u0456\u043B\u043A\u0430": "Next Monday",
+  "\u0414\u0430\u0442\u0430 \u0442\u0430 \u0447\u0430\u0441": "Date & time",
+  "\u041E\u0447\u0438\u0441\u0442\u0438\u0442\u0438": "Clear",
+  "\u041E\u0434\u0438\u043D\u0438\u0446\u044F": "Unit",
+  "\u0414\u0435\u043D\u044C": "Day",
+  "\u0422\u0438\u0436\u0434\u0435\u043D\u044C": "Week",
+  "\u041C\u0456\u0441\u044F\u0446\u044C": "Month",
+  "\u0420\u0456\u043A": "Year",
+  "\u0417\u0430 \u0434\u043D\u0435\u043C \u043C\u0456\u0441\u044F\u0446\u044F": "By day of month",
+  "\u0417\u0430 \u0434\u043D\u0435\u043C \u0442\u0438\u0436\u043D\u044F": "By weekday",
+  "\u0420\u043E\u0431\u043E\u0447\u0438\u0439 \u0434\u0435\u043D\u044C": "Working day",
+  "\u0420\u0435\u0436\u0438\u043C": "Mode",
+  "\u042F\u043A\u0438\u0439": "Which",
+  "\u043F\u0435\u0440\u0448\u0438\u0439": "first",
+  "\u0434\u0440\u0443\u0433\u0438\u0439": "second",
+  "\u0442\u0440\u0435\u0442\u0456\u0439": "third",
+  "\u0447\u0435\u0442\u0432\u0435\u0440\u0442\u0438\u0439": "fourth",
+  "\u043E\u0441\u0442\u0430\u043D\u043D\u0456\u0439": "last",
+  "\u041A\u0430\u0441\u0442\u043E\u043C\u043D\u0435 \u043F\u043E\u0432\u0442\u043E\u0440\u0435\u043D\u043D\u044F": "Custom recurrence",
+  "\u0414\u0430\u0442\u0430 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u043D\u044F": "Due date",
+  "\u041F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442: ": "Priority: ",
+  "\u041F\u043E\u0432\u0442\u043E\u0440\u0435\u043D\u043D\u044F: ": "Repeat: ",
+  "\u0429\u043E\u043C\u0456\u0441\u044F\u0447\u043D\u0456 \u043F\u0435\u0440\u0435\u0432\u0456\u0440\u043A\u0438": "Monthly checks",
+  "\u0417\u0430\u0433\u0430\u043B\u044C\u043D\u0430 \u0440\u0435\u0454\u0441\u0442\u0440\u0430\u0446\u0456\u044F": "Total log",
+  "\u0429\u043E\u043C\u0456\u0441\u044F\u0447\u043D\u0430 \u0441\u0442\u0430\u0432\u043A\u0430 \u0440\u0435\u0454\u0441\u0442\u0440\u0430\u0446\u0456\u0457": "Monthly rate",
+  "\u041F\u043E\u0442\u043E\u0447\u043D\u0430 \u0441\u0435\u0440\u0456\u044F": "Current streak",
+  "\u0429\u043E\u043C\u0456\u0441\u044F\u0447\u043D\u0435 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u043D\u044F": "Monthly total",
+  "\u0417\u0430\u0433\u0430\u043B\u044C\u043D\u0438\u0439 \u043E\u0431\u0441\u044F\u0433 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u043D\u044F": "Overall total",
+  "\u0420\u0430\u0445\u0443\u043D\u043E\u043A": "Count",
+  "\u0426\u0456\u043B\u044C \u043D\u0430 \u0434\u0435\u043D\u044C": "Daily goal",
+  "\u0416\u0443\u0440\u043D\u0430\u043B \u0437\u0432\u0438\u0447\u043A\u0438": "Habit log",
+  "\u041D\u0430\u0439\u043A\u0440\u0430\u0449\u0430 \u0441\u0435\u0440\u0456\u044F": "Best streak",
+  "\u2190 \u041D\u0430\u0437\u0430\u0434": "\u2190 Back",
+  "\u041D\u0435\u043C\u0430\u0454 \u0437\u0430\u043F\u0438\u0441\u0456\u0432": "No entries",
+  "\u041E\u0431\u0435\u0440\u0456\u0442\u044C \u0437\u0432\u0438\u0447\u043A\u0443": "Select a habit",
+  "\u041D\u0435\u043E\u0431\u043E\u0432\u2019\u044F\u0437\u043A\u043E\u0432\u043E \u2014 \u0434\u043B\u044F \u043A\u0456\u043B\u0435\u0446\u044C \u043F\u0440\u043E\u0433\u0440\u0435\u0441\u0443 \u0442\u0430 %": "Optional \u2014 for progress rings & %",
+  "\u0434\u043D.": "d",
+  "\u0414\u043E \u043F\u043E\u0442\u043E\u0447\u043D\u043E\u0433\u043E": "To current",
+  "\u0426\u0456\u043B\u044C": "Goal",
+  "\u0411\u0435\u0437 \u0434\u0430\u0442\u0438": "No date",
+  "\u0429\u0435": "More",
+  "\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u043D\u043E\u0442\u0430\u0442\u043A\u0443": "Open note",
+  "\u041D\u0435 \u0431\u0443\u0434\u0435 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u043E": "Won\u2019t do",
+  "\u0431\u0435\u0437 \u0433\u0440\u0443\u043F\u0438": "no group",
+  "\u0414\u043E\u0434\u0430\u0442\u0438 \u0442\u0435\u0433 \u0443 \u043E\u043F\u0438\u0441": "Add a tag in the description",
+  "\u0417\u0440\u043E\u0431\u0438\u0442\u0438 \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u043E\u044E": "Make recurring",
+  "\u041F\u0435\u0440\u0435\u0433\u043B\u044F\u0434\u0438": "Views",
+  "\u0413\u0440\u0443\u043F\u0438": "Lists",
+  "\u0422\u0435\u0433\u0438": "Tags",
+  "\u041F\u0430\u043D\u0435\u043B\u044C \u0444\u0456\u043B\u044C\u0442\u0440\u0456\u0432": "Filters panel",
+  "\u0424\u0456\u043B\u044C\u0442\u0440": "Filter",
+  "\u0423\u0441\u0456 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438": "All priorities",
+  "\u0412\u0441\u0456": "All",
+  "\u041D\u0430\u0441\u0442\u0443\u043F\u043D\u0456 7 \u0434\u043D\u0456\u0432": "Next 7 days",
+  "\u0411\u0456\u043B\u044C\u0448\u0435": "More",
+  "\u041F\u0456\u0437\u043D\u0456\u0448\u0435": "Later",
+  "\u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0430 \u0437\u0430\u0434\u0430\u0447\u0430 \u0443 \u0441\u043F\u0438\u0441\u043A\u0443": "Recurring task in the list",
+  "\u0421\u043A\u0456\u043B\u044C\u043A\u0438 \u043D\u0430\u0441\u0442\u0443\u043F\u043D\u0438\u0445 \u043F\u043E\u0432\u0442\u043E\u0440\u0456\u0432 \u043F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u0443 \u0441\u043F\u0438\u0441\u043A\u0443": "How many upcoming occurrences to show in the list",
+  "\u0421\u0442\u0430\u0442\u0443\u0441\u0438 \u0447\u0435\u043A\u0431\u043E\u043A\u0441\u0456\u0432": "Checkbox statuses",
+  '\u0421\u0438\u043C\u0432\u043E\u043B, \u0449\u043E \u0437\u0430\u043F\u0438\u0441\u0443\u0454\u0442\u044C\u0441\u044F \u0432 "- [ ]". \u041A\u043B\u0456\u043A \u043F\u043E \u0447\u0435\u043A\u0431\u043E\u043A\u0441\u0443 \u0437\u0430\u0432\u0436\u0434\u0438 \u043F\u0435\u0440\u0435\u043C\u0438\u043A\u0430\u0454 \u0437\u0432\u0438\u0447\u0430\u0439\u043D\u0435 todo/done; \u0456\u043D\u0448\u0456 \u0441\u0442\u0430\u0442\u0443\u0441\u0438 \u2014 \u0447\u0435\u0440\u0435\u0437 \u043F\u0440\u0430\u0432\u0443 \u043A\u043D\u043E\u043F\u043A\u0443 \u043C\u0438\u0448\u0456.': 'The character written into "- [ ]". Clicking the checkbox always toggles plain todo/done; other statuses are set via right-click.',
+  "\u0423 \u0440\u043E\u0431\u043E\u0442\u0456": "In progress",
+  "\u041F\u0435\u0440\u0435\u043D\u0435\u0441\u0435\u043D\u043E": "Forwarded",
+  "\u0417\u0430\u043F\u043B\u0430\u043D\u043E\u0432\u0430\u043D\u043E": "Scheduled",
+  "\u0412\u0430\u0436\u043B\u0438\u0432\u043E": "Important",
+  "\u041F\u0456\u0434 \u043F\u0438\u0442\u0430\u043D\u043D\u044F\u043C": "Question",
+  "+ \u0441\u0442\u0430\u0442\u0443\u0441": "+ status",
+  "\u0421\u043A\u0438\u043D\u0443\u0442\u0438 \u0434\u043E \u0441\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u0438\u0445": "Reset to defaults",
+  "\u041D\u043E\u0432\u0430": "New",
+  "\u0421\u0438\u043C\u0432\u043E\u043B": "Character",
+  '\u041E\u0434\u0438\u043D \u0441\u0438\u043C\u0432\u043E\u043B, \u0449\u043E \u0437\u0430\u043F\u0438\u0441\u0443\u0454\u0442\u044C\u0441\u044F \u044F\u043A "- [X] \u0442\u0435\u043A\u0441\u0442 \u0437\u0430\u0434\u0430\u0447\u0456"': 'A single character written as "- [X] task text"',
+  "\u041F\u043E\u0432\u0435\u0434\u0456\u043D\u043A\u0430": "Behavior",
+  "\u042F\u043A \u0441\u0442\u0430\u0442\u0443\u0441 \u0432\u0440\u0430\u0445\u043E\u0432\u0443\u0454\u0442\u044C\u0441\u044F: \u044F\u043A \u0432\u0456\u0434\u043A\u0440\u0438\u0442\u0430 \u0437\u0430\u0434\u0430\u0447\u0430, \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u0430 \u0447\u0438 \u0441\u043A\u0430\u0441\u043E\u0432\u0430\u043D\u0430": "How the status is counted: as open, done, or cancelled",
+  "\u0406\u043A\u043E\u043D\u043A\u0430": "Icon",
+  "\u041F\u043E\u043A\u0430\u0437\u0443\u0454\u0442\u044C\u0441\u044F \u0443 \u0441\u043F\u0438\u0441\u043A\u0430\u0445/\u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u0456 Markday \u0437\u0430\u043C\u0456\u0441\u0442\u044C \u0441\u0438\u043C\u0432\u043E\u043B\u0443 (\u043F\u0440\u0430\u0446\u044E\u0454 \u0431\u0435\u0437 \u0441\u0442\u043E\u0440\u043E\u043D\u043D\u0456\u0445 \u0442\u0435\u043C \u0447\u0438 \u043F\u043B\u0430\u0433\u0456\u043D\u0456\u0432)": "Shown in Markday's own list/calendar instead of the plain character (works with no themes or plugins installed)",
+  "\u0411\u0435\u0437 \u0456\u043A\u043E\u043D\u043A\u0438 (\u043B\u0438\u0448\u0435 \u0441\u0438\u043C\u0432\u043E\u043B)": "No icon (character only)",
+  "\u0406\u043D\u0448\u0430\u2026": "Other\u2026",
+  "\u041D\u043E\u0432\u0438\u0439 \u0441\u0442\u0430\u0442\u0443\u0441": "New status",
+  "\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438 \u0441\u0442\u0430\u0442\u0443\u0441": "Edit status",
+  "\u0448\u0442.": "items",
+  "\u041F\u043E\u0440\u043E\u0436\u043D\u044C\u043E": "Empty",
+  "\u041F\u0440\u043E\u0454\u043A\u0442\u043D\u0456 \u0442\u0435\u043A\u0438": "Project folders",
+  "\u0421\u0442\u0430\u0442\u0443\u0441\u0438": "Statuses",
+  "\u041A\u043B\u044E\u0447 \u0432\u0438\u043A\u043E\u0440\u0438\u0441\u0442\u043E\u0432\u0443\u0454\u0442\u044C\u0441\u044F \u0443 \u0442\u0435\u043A\u0441\u0442\u0456 \u0437\u0430\u0434\u0430\u0447\u0456 \u044F\u043A !\u043A\u043B\u044E\u0447. \u041F\u043E\u0440\u044F\u0434\u043E\u043A = \u0440\u0430\u043D\u0433.": "The key is used in task text as !key. Order = rank.",
+  // editor / create
+  "\u041D\u0430\u0437\u0432\u0430 \u0437\u0430\u0434\u0430\u0447\u0456": "Task name",
+  "\u041E\u043F\u0438\u0441 (\u0434\u0435\u0442\u0430\u043B\u0456)\u2026": "Description (details)\u2026",
+  "\u0417\u0430\u0434\u0430\u0447\u0430 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u0430": "Task done",
+  "\u0427\u0430\u0441 (\u043D\u0435\u043E\u0431\u043E\u0432.)": "Time (optional)",
+  "\u0413\u0440\u0443\u043F\u0430": "Group",
+  "Enter \u2014 \u0434\u043E\u0434\u0430\u0442\u0438": "Enter to add",
+  "\u041F\u0456\u0434\u0437\u0430\u0434\u0430\u0447\u0456": "Subtasks",
+  "+ \u043F\u0456\u0434\u0437\u0430\u0434\u0430\u0447\u0430": "+ subtask",
+  "\u0412\u0456\u0434\u0445\u0438\u043B\u0438\u0442\u0438 \u0437\u043C\u0456\u043D\u0438": "Discard changes",
+  "\u0417\u0431\u0435\u0440\u0435\u0433\u0442\u0438 \u0437\u043C\u0456\u043D\u0438": "Save changes",
+  "\u0412\u0438\u0434\u0430\u043B\u0438\u0442\u0438 \u0437\u0430\u0434\u0430\u0447\u0443": "Delete task",
+  "\u0414\u0430\u0442\u0430 / \u0447\u0430\u0441 / \u043F\u043E\u0432\u0442\u043E\u0440": "Date / time / repeat",
+  "\u0422\u0435\u0433\u0438 / \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442 / \u0433\u0440\u0443\u043F\u0430": "Tags / priority / group",
+  "\u041F\u043E\u0432\u0442\u043E\u0440\u044E\u0432\u0430\u0442\u0438": "Repeat",
+  "\u0411\u0435\u0437 \u043F\u043E\u0432\u0442\u043E\u0440\u0443": "Don't repeat",
+  "\u0429\u043E\u0434\u043D\u044F": "Daily",
+  "\u0429\u043E\u0442\u0438\u0436\u043D\u044F": "Weekly",
+  "\u0429\u043E\u043C\u0456\u0441\u044F\u0446\u044F": "Monthly",
+  "\u0429\u043E\u0440\u043E\u043A\u0443": "Yearly",
+  "\u041A\u043E\u0436\u043D\u0456 N": "Every N",
+  "\u0414\u043D\u0456 \u0442\u0438\u0436\u043D\u044F": "Weekdays",
+  "\u0421\u043A\u0430\u0441\u0443\u0432\u0430\u0442\u0438": "Cancel",
+  "\u0413\u043E\u0442\u043E\u0432\u043E": "Done",
+  "\u0414\u043E\u0434\u0430\u0442\u0438": "Add",
+  "\u0417\u0431\u0435\u0440\u0435\u0433\u0442\u0438": "Save",
+  "\u0449\u043E\u0434\u043D\u044F": "daily",
+  "\u0449\u043E\u0442\u0438\u0436\u043D\u044F": "weekly",
+  "\u0449\u043E\u043C\u0456\u0441\u044F\u0446\u044F": "monthly",
+  "\u0449\u043E\u0440\u043E\u043A\u0443": "yearly",
+  "\u041A\u0456\u043D\u0435\u0446\u044C (\u043D\u0435\u043E\u0431\u043E\u0432.)": "End (optional)",
+  "\u041F\u043E\u0447\u0430\u0442\u043E\u043A": "Start",
+  "\u041D\u043E\u0432\u0430 \u0437\u0432\u0438\u0447\u043A\u0430": "New habit",
+  "\u0412\u0432\u0435\u0434\u0456\u0442\u044C \u043D\u0430\u0437\u0432\u0443 \u0437\u0430\u0434\u0430\u0447\u0456": "Enter a task name",
+  "\u0433\u0440\u0443\u043F\u0430": "group",
+  "+ \u0442\u0435\u0433": "+ tag",
+  "\u0415\u043C\u043E\u0434\u0437\u0456": "Emoji",
+  "\u041A\u043E\u043C\u043F\u0430\u043A\u0442\u043D\u0430 \u0456\u043A\u043E\u043D\u043A\u0430 \u0437\u0432\u0438\u0447\u043A\u0438": "Compact habit icon",
+  "\u041D\u0430\u0437\u0432\u0430 property": "Property name",
+  "\u041A\u043B\u044E\u0447 \u0443 \u0432\u043B\u0430\u0441\u0442\u0438\u0432\u043E\u0441\u0442\u044F\u0445 \u0444\u0430\u0439\u043B\u0443 (\u043D\u0430\u043F\u0440. pages_read)": "Frontmatter key (e.g. pages_read)",
+  "\u0422\u0438\u043F \u0432\u0438\u043C\u0456\u0440\u0443": "Measure type",
+  "\u041A\u0456\u043B\u044C\u043A\u0456\u0441\u0442\u044C": "Quantity",
+  "\u0422\u0430\u043A / \u041D\u0456": "Yes / No",
+  "\u041E\u0434\u0438\u043D\u0438\u0446\u0456 \u0432\u0438\u043C\u0456\u0440\u0443": "Units",
+  "\u043D\u0430\u043F\u0440. \u0441\u0442\u043E\u0440\u0456\u043D\u043A\u0438, \u043A\u043C, \u0445\u0432\u0438\u043B\u0438\u043D\u0438": "e.g. pages, km, minutes",
+  "\u0412\u0432\u0435\u0434\u0456\u0442\u044C \u043D\u0430\u0437\u0432\u0443": "Enter a name",
+  "\u0412\u0432\u0435\u0434\u0456\u0442\u044C \u043D\u0430\u0437\u0432\u0443 property": "Enter a property name",
+  "\u0412\u0432\u0435\u0434\u0456\u0442\u044C \u0442\u0435\u043A\u0441\u0442 \u0437\u0430\u0434\u0430\u0447\u0456": "Enter task text",
+  "\u041E\u0431\u0435\u0440\u0456\u0442\u044C \u0445\u043E\u0447\u0430 \u0431 \u043E\u0434\u0438\u043D \u0434\u0435\u043D\u044C \u0442\u0438\u0436\u043D\u044F": "Pick at least one weekday",
+  // settings
+  "\u0420\u0456\u0432\u0435\u043D\u044C \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0430": "Heading level",
+  "\u041F\u0456\u0434 \u044F\u043A\u0438\u043C \u0440\u0456\u0432\u043D\u0435\u043C \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0430 \u0437\u0431\u0435\u0440\u0456\u0433\u0430\u0442\u0438 \u0437\u0430\u0434\u0430\u0447\u0456 (# = 1 \u2026 ###### = 6)": "Heading level to store tasks under (# = 1 \u2026 ###### = 6)",
+  "\u0422\u0435\u043A\u0441\u0442 \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0430": "Heading text",
+  '\u041D\u0430\u0437\u0432\u0430 \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0430, \u043F\u0456\u0434 \u044F\u043A\u0438\u043C \u0431\u0443\u0434\u0443\u0442\u044C \u0437\u0430\u0434\u0430\u0447\u0456 (\u043D\u0430\u043F\u0440. "\u0417\u0430\u0434\u0430\u0447\u0456" \u0430\u0431\u043E "Tasks")': 'Heading the tasks live under (e.g. "\u0417\u0430\u0434\u0430\u0447\u0456" or "Tasks")',
+  "\u0420\u043E\u0431\u043E\u0447\u0456 \u0433\u043E\u0434\u0438\u043D\u0438 \u2014 \u043F\u043E\u0447\u0430\u0442\u043E\u043A": "Working hours \u2014 start",
+  "\u0420\u043E\u0431\u043E\u0447\u0456 \u0433\u043E\u0434\u0438\u043D\u0438 \u2014 \u043A\u0456\u043D\u0435\u0446\u044C": "Working hours \u2014 end",
+  "\u041D\u0430 \u0447\u0430\u0441\u043E\u0432\u0456\u0439 \u0448\u043A\u0430\u043B\u0456 \u0440\u0430\u043D\u0456\u0448\u0456 \u0433\u043E\u0434\u0438\u043D\u0438 \u0437\u0433\u043E\u0440\u043D\u0443\u0442\u0456 (\u043C\u043E\u0436\u043D\u0430 \u0440\u043E\u0437\u0433\u043E\u0440\u043D\u0443\u0442\u0438)": "Earlier hours are collapsed on the timeline (expandable)",
+  "\u041D\u0430 \u0447\u0430\u0441\u043E\u0432\u0456\u0439 \u0448\u043A\u0430\u043B\u0456 \u043F\u0456\u0437\u043D\u0456\u0448\u0456 \u0433\u043E\u0434\u0438\u043D\u0438 \u0437\u0433\u043E\u0440\u043D\u0443\u0442\u0456 (\u043C\u043E\u0436\u043D\u0430 \u0440\u043E\u0437\u0433\u043E\u0440\u043D\u0443\u0442\u0438)": "Later hours are collapsed on the timeline (expandable)",
+  "\u041A\u0440\u043E\u043A \u0447\u0430\u0441\u043E\u0432\u043E\u0457 \u0448\u043A\u0430\u043B\u0438": "Timeline step",
+  "\u041F\u0440\u0438\u043B\u0438\u043F\u0430\u043D\u043D\u044F \u043F\u0440\u0438 \u043F\u0435\u0440\u0435\u0442\u044F\u0433\u0443\u0432\u0430\u043D\u043D\u0456/\u0437\u043C\u0456\u043D\u0456 \u0440\u043E\u0437\u043C\u0456\u0440\u0443": "Snap when dragging / resizing",
+  "\u041F\u0435\u0440\u0448\u0438\u0439 \u0434\u0435\u043D\u044C \u0442\u0438\u0436\u043D\u044F": "First day of week",
+  "\u041F\u043E\u043D\u0435\u0434\u0456\u043B\u043E\u043A": "Monday",
+  "\u041D\u0435\u0434\u0456\u043B\u044F": "Sunday",
+  "\u041C\u043E\u0432\u0430": "Language",
+  "\u0410\u0432\u0442\u043E": "Auto",
+  "\u0417\u0430\u0433\u0430\u043B\u044C\u043D\u0435": "General",
+  "\u0427\u0430\u0441\u043E\u0432\u0430 \u0448\u043A\u0430\u043B\u0430": "Timeline",
+  "\u0421\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u0456 \u0437\u043D\u0430\u0447\u0435\u043D\u043D\u044F": "Defaults",
+  "\u041F\u0456\u0434\u0441\u0442\u0430\u0432\u043B\u044F\u044E\u0442\u044C\u0441\u044F \u0432 \u043D\u043E\u0432\u0443 \u0437\u0430\u0434\u0430\u0447\u0443, \u044F\u043A\u0449\u043E \u043D\u0435 \u0432\u043A\u0430\u0437\u0430\u043D\u0456 \u0432\u0440\u0443\u0447\u043D\u0443.": "Applied to new tasks unless set manually.",
+  "\u0421\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u0438\u0439 \u0442\u0435\u0433": "Default tag",
+  "\u0421\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u0430 \u0433\u0440\u0443\u043F\u0430": "Default group",
+  "\u0421\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u0438\u0439 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442": "Default priority",
+  "\u0421\u0446\u0435\u043D\u0430\u0440\u0456\u0457 \u043F\u0430\u0440\u0441\u0438\u043D\u0433\u0443": "Parsing scenarios",
+  "\u0417\u0430\u0434\u0430\u0447\u0456 \u0432 \u0446\u0438\u0445 \u0442\u0435\u043A\u0430\u0445 \u0447\u0438\u0442\u0430\u044E\u0442\u044C\u0441\u044F \u0437 \u0434\u0430\u0442\u043E\u044E \u043F\u043E\u0440\u0443\u0447 \u0456\u0437 \u0442\u0435\u043A\u0441\u0442\u043E\u043C (>\u0420\u0420\u0420\u0420-\u041C\u041C-\u0414\u0414), \u0430 \u043D\u0435 \u0437 \u043D\u0430\u0437\u0432\u0438 \u0444\u0430\u0439\u043B\u0443. \u041F\u0435\u0440\u0448\u0438\u0439 \u0437\u0431\u0456\u0433 \u0442\u0435\u043A\u0438 \u043F\u0435\u0440\u0435\u043C\u0430\u0433\u0430\u0454; \u0440\u0435\u0448\u0442\u0430 \u043D\u043E\u0442\u0430\u0442\u043E\u043A \u043B\u0438\u0448\u0430\u0454\u0442\u044C\u0441\u044F \u0449\u043E\u0434\u0435\u043D\u043D\u0438\u043C\u0438.": "Tasks in these folders read their date from an inline token (>YYYY-MM-DD) next to the text, not the file name. The first matching folder wins; everything else stays daily notes.",
+  "\u0422\u0435\u043A\u0430 \u043F\u0440\u043E\u0454\u043A\u0442\u0443": "Project folder",
+  "\u041F\u043E\u043A\u0438 \u043D\u0435\u043C\u0430\u0454 \u0441\u0446\u0435\u043D\u0430\u0440\u0456\u0457\u0432.": "No scenarios yet.",
+  "+ \u0441\u0446\u0435\u043D\u0430\u0440\u0456\u0439": "+ scenario",
+  "\u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0456 \u0437\u0430\u0434\u0430\u0447\u0456": "Recurring tasks",
+  "\u0421\u0442\u0432\u043E\u0440\u0435\u043D\u043D\u044F \u2014 \u0447\u0435\u0440\u0435\u0437 \u0448\u0432\u0438\u0434\u043A\u0435 \u0441\u0442\u0432\u043E\u0440\u0435\u043D\u043D\u044F (Ctrl+P). \u0422\u0443\u0442 \u2014 \u0440\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u043D\u043D\u044F \u0442\u0430 \u0432\u0438\u0434\u0430\u043B\u0435\u043D\u043D\u044F.": "Create via quick-create (Ctrl+P). Here \u2014 edit and delete.",
+  "\u041F\u043E\u043A\u0438 \u043D\u0435\u043C\u0430\u0454 \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0438\u0445 \u0437\u0430\u0434\u0430\u0447.": "No recurring tasks yet.",
+  "\u041F\u043E\u043A\u0438 \u043D\u0435\u043C\u0430\u0454 \u0437\u0432\u0438\u0447\u043E\u043A.": "No habits yet.",
+  "\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438": "Edit",
+  "\u0412\u0438\u0434\u0430\u043B\u0438\u0442\u0438": "Delete",
+  "\u0412\u0438\u0449\u0435": "Up",
+  "\u041D\u0438\u0436\u0447\u0435": "Down",
+  "\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438 \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0443 \u0437\u0430\u0434\u0430\u0447\u0443": "Edit recurring task",
+  "\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438 \u0437\u0432\u0438\u0447\u043A\u0443": "Edit habit",
+  "\u041A\u043E\u043B\u044C\u043E\u0440\u0438 \u0442\u0430 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438": "Colors & priorities",
+  "\u041A\u043B\u044E\u0447 \u0432\u0438\u043A\u043E\u0440\u0438\u0441\u0442\u043E\u0432\u0443\u0454\u0442\u044C\u0441\u044F \u0443 \u0442\u0435\u043A\u0441\u0442\u0456 \u0437\u0430\u0434\u0430\u0447\u0456 \u044F\u043A !\u043A\u043B\u044E\u0447. \u041F\u043E\u0440\u044F\u0434\u043E\u043A = \u0440\u0430\u043D\u0433 (\u043D\u0438\u0436\u0447\u0438\u0439 \u0437\u0432\u0435\u0440\u0445\u0443, \u0432\u0438\u0449\u0438\u0439 \u0437\u043D\u0438\u0437\u0443).": "The key is used in task text as !key. Order = rank (lower on top, higher below).",
+  "\u041A\u043E\u043B\u044C\u043E\u0440\u0438 \u0442\u0435\u0433\u0456\u0432": "Tag colors",
+  "\u041A\u043E\u043B\u044C\u043E\u0440\u0438 \u0433\u0440\u0443\u043F": "Group colors",
+  "+ \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442": "+ priority",
+  "+ \u0434\u043E\u0434\u0430\u0442\u0438": "+ add",
+  "\u0417\u0432\u0438\u0447\u043A\u0430: \u043A\u0456\u043B\u044C\u043A\u0456\u0441\u0442\u044C \u043D\u0430\u043F\u0438\u0441\u0430\u043D\u0438\u0445 \u0441\u043B\u0456\u0432": "Habit: words written",
+  "\u0410\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u043D\u043E \u0440\u0430\u0445\u0443\u0454 \u0441\u043B\u043E\u0432\u0430 \u0432 \u043D\u043E\u0442\u0430\u0442\u0446\u0456 \u0434\u043D\u044F": "Auto-counts words in the day's note",
+  "\u2014 \u0435\u043C\u043E\u0434\u0437\u0456": "\u2014 emoji",
+  "\u2014 \u043A\u043E\u043B\u0456\u0440": "\u2014 color",
+  '\u0422\u0435\u043A\u0441\u0442 \u0443 \u0444\u043E\u0440\u043C\u0430\u0442\u0456 \u0437\u0430\u0434\u0430\u0447\u0456: "14:00 \u041F\u043E\u043B\u0438\u0442\u0438 \u043A\u0432\u0456\u0442\u0438 #\u0434\u0456\u043C !med"': 'Task-format text: "14:00 Water plants #home !med"',
+  '\u0424\u043E\u0440\u043C\u0430\u0442 \u0437\u0430\u0434\u0430\u0447\u0456: "14:00 \u041F\u043E\u043B\u0438\u0442\u0438 \u043A\u0432\u0456\u0442\u0438 #\u0434\u0456\u043C !med"': 'Task format: "14:00 Water plants #home !med"',
+  "\u043D\u0430\u043F\u0440. \u041F\u043E\u043B\u0438\u0442\u0438 \u043A\u0432\u0456\u0442\u0438 #\u0434\u0456\u043C": "e.g. Water plants #home",
+  "\u0427\u0438\u0441\u043B\u043E \u043C\u0456\u0441\u044F\u0446\u044F": "Day of month",
+  "\u0406\u043D\u0442\u0435\u0440\u0432\u0430\u043B": "Interval",
+  "\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u043D\u043E\u0442\u0430\u0442\u043A\u0443 \u043D\u0430 ": "Create a note for ",
+  "\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u043D\u043E\u0442\u0430\u0442\u043A\u0443": "Create note",
+  "\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438": "Create",
+  "\u0417\u0430\u0434\u0430\u0447\u0456": "Tasks"
+};
+var DEFAULT_SETTINGS = {
+  headingLevel: 2,
+  headingText: "\u0417\u0430\u0434\u0430\u0447\u0456",
+  recurrences: [],
+  // [{ id, raw, freq, interval, weekdays, monthday, start, end, exceptions }]
+  habits: [],
+  // [{ id, name, property, unit, type: 'number'|'bool' }]
+  scenarios: [],
+  // [{ id, folder, mode: 'project' }] ordered; folders parsed with an inline >date token instead of daily notes
+  checkboxStatuses: DEFAULT_CHECKBOX_STATUSES.map((x) => ({ ...x })),
+  // [{ id, char, label, behavior: 'active'|'done'|'cancelled' }]
+  workStart: 8,
+  // timeline working-hours start (hour 0-23); earlier hours collapse
+  workEnd: 20,
+  // timeline working-hours end (hour 1-24); later hours collapse
+  snapMinutes: 15,
+  // timeline drag/resize snap step in minutes
+  colorBy: "priority",
+  // card coloring: priority | tag | group | none
+  priorityDot: true,
+  // when colorBy != priority, show priority as a dot
+  firstDayOfWeek: 1,
+  // 0 = Sunday, 1 = Monday
+  recurrenceAhead: 1,
+  // list: how many upcoming occurrences of a recurrence to show
+  language: "auto",
+  // auto | uk | en
+  showTags: true,
+  // show tag badges on cards
+  showGroups: true,
+  // show group badges on cards
+  showPriority: true,
+  // show priority badge/label on cards
+  defaultTag: "",
+  // applied to new tasks when set
+  defaultGroup: "",
+  defaultPriority: "",
+  wordCount: { enabled: false, name: "\u041D\u0430\u043F\u0438\u0441\u0430\u043D\u043E \u0441\u043B\u0456\u0432", emoji: "\u270D\uFE0F", color: "#9aa0a6" },
+  colors: {
+    priorities: [
+      { key: "low", color: "#8b949e" },
+      { key: "med", color: "#58a6ff" },
+      { key: "high", color: "#d29922" },
+      { key: "urgent", color: "#e5534b" }
+    ],
+    tags: [],
+    // [{ name, color }]
+    groups: []
+    // [{ name, color }]
+  }
+};
+var LIST_HORIZON_DAYS = 60;
+function pad(n) {
+  return String(n).padStart(2, "0");
+}
+function toISO(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function parseISO(s) {
+  const [y, m, day] = s.split("-").map(Number);
+  return new Date(y, m - 1, day);
+}
+function todayISO() {
+  return toISO(/* @__PURE__ */ new Date());
+}
+function addDays(d, n) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n);
+  return x;
+}
+function mondayIdx(d) {
+  return (d.getDay() + 6) % 7;
+}
+function startOfWeek(d) {
+  const x = new Date(d);
+  const off = (x.getDay() - weekStartDay + 7) % 7;
+  x.setDate(x.getDate() - off);
+  return x;
+}
+function startOfWorkWeek(d) {
+  const x = new Date(d);
+  x.setDate(x.getDate() - mondayIdx(x));
+  return x;
+}
+function weekdayHeaders() {
+  const startIdx = (weekStartDay + 6) % 7;
+  return WD_UA.map((_, i) => WD_UA[(startIdx + i) % 7]);
+}
+function monthGridDays(y, m) {
+  const start = startOfWeek(new Date(y, m, 1));
+  return Array.from({ length: 42 }, (_, i) => addDays(start, i));
+}
+function normTime(t2) {
+  const [h, m] = t2.split(":");
+  return `${pad(Number(h))}:${m}`;
+}
+function timeMin(t2) {
+  const [h, m] = t2.split(":").map(Number);
+  return h * 60 + m;
+}
+function dayOrder(a, b) {
+  const ae = a.start != null, be = b.start != null;
+  if (ae !== be) return ae ? -1 : 1;
+  if (ae && be) return timeMin(a.start) - timeMin(b.start);
+  return 0;
+}
+function daysBetween(a, b) {
+  return Math.round((b.getTime() - a.getTime()) / 864e5);
+}
+function genId() {
+  return Math.random().toString(36).slice(2, 8);
+}
+function lastDayOfMonth(y, m) {
+  return new Date(y, m + 1, 0).getDate();
+}
+function clampMonthDay(y, m, d) {
+  return Math.min(d, lastDayOfMonth(y, m));
+}
+function nthWeekdayOfMonth(y, m, wd0Mon, nth) {
+  if (nth === -1) {
+    for (let d = lastDayOfMonth(y, m); d >= 1; d--) {
+      if (mondayIdx(new Date(y, m, d)) === wd0Mon) return d;
+    }
+    return null;
+  }
+  let count = 0;
+  for (let d = 1; d <= lastDayOfMonth(y, m); d++) {
+    if (mondayIdx(new Date(y, m, d)) === wd0Mon && ++count === nth) return d;
+  }
+  return null;
+}
+function workdayOfMonth(y, m, which) {
+  if (which === "last") {
+    for (let d = lastDayOfMonth(y, m); d >= 1; d--) {
+      if (mondayIdx(new Date(y, m, d)) <= 4) return d;
+    }
+  } else {
+    for (let d = 1; d <= lastDayOfMonth(y, m); d++) {
+      if (mondayIdx(new Date(y, m, d)) <= 4) return d;
+    }
+  }
+  return null;
+}
+function matchesMonthMode(rule, date, y, m, fallbackDay) {
+  const mode = rule.monthMode || "day";
+  if (mode === "weekday") {
+    const day = nthWeekdayOfMonth(y, m, rule.weekday || 0, rule.nth || 1);
+    return day != null && date.getDate() === day;
+  }
+  if (mode === "workday") {
+    const day = workdayOfMonth(y, m, rule.which || "first");
+    return day != null && date.getDate() === day;
+  }
+  return date.getDate() === clampMonthDay(y, m, rule.monthday || fallbackDay);
+}
+function occursOn(rule, date) {
+  const start = parseISO(rule.start);
+  if (daysBetween(start, date) < 0) return false;
+  if (rule.end && daysBetween(date, parseISO(rule.end)) < 0) return false;
+  const interval = rule.interval || 1;
+  switch (rule.freq) {
+    case "daily":
+      return daysBetween(start, date) % interval === 0;
+    case "weekly": {
+      const wd = mondayIdx(date);
+      const weekdays = rule.weekdays && rule.weekdays.length ? rule.weekdays : [mondayIdx(start)];
+      if (!weekdays.includes(wd)) return false;
+      const weeks = Math.floor(daysBetween(startOfWeek(start), date) / 7);
+      return weeks % interval === 0;
+    }
+    case "monthly": {
+      const months = (date.getFullYear() - start.getFullYear()) * 12 + (date.getMonth() - start.getMonth());
+      if (months < 0 || months % interval !== 0) return false;
+      return matchesMonthMode(rule, date, date.getFullYear(), date.getMonth(), start.getDate());
+    }
+    case "yearly": {
+      const ym = rule.month != null ? rule.month : start.getMonth();
+      if (date.getMonth() !== ym) return false;
+      const years = date.getFullYear() - start.getFullYear();
+      if (years < 0 || years % interval !== 0) return false;
+      if (!rule.monthMode) return date.getDate() === start.getDate();
+      return matchesMonthMode(rule, date, date.getFullYear(), ym, start.getDate());
+    }
+  }
+  return false;
+}
+function describeRule(rule) {
+  const i = rule.interval || 1;
+  const en = LANG === "en";
+  const ev = (n) => en ? `every ${i} ${n}` : `\u043A\u043E\u0436\u043D\u0456 ${i} ${n}`;
+  const ord = {
+    "1": en ? "first" : "\u043F\u0435\u0440\u0448\u0438\u0439",
+    "2": en ? "second" : "\u0434\u0440\u0443\u0433\u0438\u0439",
+    "3": en ? "third" : "\u0442\u0440\u0435\u0442\u0456\u0439",
+    "4": en ? "fourth" : "\u0447\u0435\u0442\u0432\u0435\u0440\u0442\u0438\u0439",
+    "-1": en ? "last" : "\u043E\u0441\u0442\u0430\u043D\u043D\u0456\u0439"
+  };
+  const monthModePart = () => {
+    const mode = rule.monthMode || "day";
+    if (mode === "weekday") return `${ord[String(rule.nth || 1)]} ${WD_FULL[rule.weekday || 0]}`;
+    if (mode === "workday") return rule.which === "last" ? en ? "last working day" : "\u043E\u0441\u0442\u0430\u043D\u043D\u0456\u0439 \u0440\u043E\u0431\u043E\u0447\u0438\u0439 \u0434\u0435\u043D\u044C" : en ? "first working day" : "\u043F\u0435\u0440\u0448\u0438\u0439 \u0440\u043E\u0431\u043E\u0447\u0438\u0439 \u0434\u0435\u043D\u044C";
+    return en ? `day ${rule.monthday || "?"}` : `${rule.monthday || "?"} \u0447\u0438\u0441\u043B\u0430`;
+  };
+  if (rule.freq === "daily") return i === 1 ? t("\u0449\u043E\u0434\u043D\u044F") : ev(en ? "days" : "\u0434\u043D.");
+  if (rule.freq === "weekly") {
+    const wd = (rule.weekdays || []).slice().sort((a, b) => a - b).map((d) => WD_UA[d]).join(", ");
+    return (i === 1 ? t("\u0449\u043E\u0442\u0438\u0436\u043D\u044F") : ev(en ? "weeks" : "\u0442\u0438\u0436.")) + (wd ? ` (${wd})` : "");
+  }
+  if (rule.freq === "monthly") return (i === 1 ? t("\u0449\u043E\u043C\u0456\u0441\u044F\u0446\u044F") : ev(en ? "months" : "\u043C\u0456\u0441.")) + ", " + monthModePart();
+  if (rule.freq === "yearly") {
+    const base = i === 1 ? t("\u0449\u043E\u0440\u043E\u043A\u0443") : ev(en ? "years" : "\u0440.");
+    if (rule.month == null) return base;
+    return `${base} \u2014 ${monthModePart()} ${MONTHS_GEN[rule.month]}`;
+  }
+  return "";
+}
+function buildMaterializedIndex(realMap) {
+  const idx = /* @__PURE__ */ new Map();
+  for (const [date, entry] of realMap) {
+    const set = /* @__PURE__ */ new Set();
+    for (const t2 of entry.tasks) if (t2.recId) set.add(t2.recId);
+    idx.set(date, set);
+  }
+  return idx;
+}
+function addVirtuals(realMap, rules, startISO, endISO) {
+  if (!rules || !rules.length) return realMap;
+  const matIdx = buildMaterializedIndex(realMap);
+  const end = parseISO(endISO);
+  for (let d = parseISO(startISO); daysBetween(d, end) >= 0; d = addDays(d, 1)) {
+    const iso = toISO(d);
+    const matSet = matIdx.get(iso) || /* @__PURE__ */ new Set();
+    for (const rule of rules) {
+      if (matSet.has(rule.id)) continue;
+      if (rule.exceptions && rule.exceptions.includes(iso)) continue;
+      if (!occursOn(rule, d)) continue;
+      const t2 = parseTaskLine(`- [ ] ${rule.raw}`, -1);
+      if (!t2) continue;
+      t2.date = iso;
+      t2.recId = rule.id;
+      t2.raw = rule.raw;
+      t2.virtual = true;
+      if (realMap.has(iso)) realMap.get(iso).tasks.push(t2);
+      else realMap.set(iso, { file: null, tasks: [t2] });
+    }
+  }
+  return realMap;
+}
+async function materializeVirtual(app, task, done, settings) {
+  const file = await getOrCreateDateFile(app, task.date);
+  const taskLine = `- [${done ? "x" : " "}] ${task.raw} ^rc-${task.recId}`;
+  const line = await insertLineUnderHeading(app, file, taskLine, settings);
+  return { file, line };
+}
+function readFrontmatter(app, isoDate) {
+  const file = app.vault.getAbstractFileByPath(dateToPath(app, parseISO(isoDate)));
+  if (!file) return {};
+  return (app.metadataCache.getFileCache(file) || {}).frontmatter || {};
+}
+async function setHabitValue(app, isoDate, habit, value) {
+  const file = await getOrCreateDateFile(app, isoDate);
+  await app.fileManager.processFrontMatter(file, (fm) => {
+    if (value === null || value === "" || value === false) delete fm[habit.property];
+    else fm[habit.property] = value;
+  });
+}
+function countWords(content) {
+  const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "");
+  const m = body.match(/\S+/g);
+  return m ? m.length : 0;
+}
+function habitList(settings) {
+  const arr = (settings.habits || []).slice();
+  const wc = settings.wordCount;
+  if (wc && wc.enabled) {
+    arr.push({ id: "__words", name: wc.name || "\u041D\u0430\u043F\u0438\u0441\u0430\u043D\u043E \u0441\u043B\u0456\u0432", emoji: wc.emoji || "\u270D\uFE0F", color: wc.color || "", unit: "\u0441\u043B\u0456\u0432", type: "number", auto: "words", goal: wc.goal || null });
+  }
+  return arr;
+}
+async function getHabitValue(app, isoDate, habit) {
+  if (habit.auto === "words") {
+    const file = app.vault.getAbstractFileByPath(dateToPath(app, parseISO(isoDate)));
+    if (!file) return 0;
+    return countWords(await app.vault.read(file));
+  }
+  const v = readFrontmatter(app, isoDate)[habit.property];
+  if (habit.type === "bool") return v === true || v === "true" ? 1 : 0;
+  return Number(v) || 0;
+}
+function habitProgress(value, habit) {
+  if (habit.type === "bool") return value > 0 ? 1 : 0;
+  if (habit.goal > 0) return Math.max(0, Math.min(1, value / habit.goal));
+  return value > 0 ? 1 : 0;
+}
+function habitDone(value, habit) {
+  if (habit.type === "bool") return value > 0;
+  if (habit.goal > 0) return value >= habit.goal;
+  return value > 0;
+}
+function matchScenario(path) {
+  for (const sc of SCENARIOS) {
+    if (sc.mode !== "project") continue;
+    const folder = (sc.folder || "").replace(/^\/+|\/+$/g, "");
+    if (!folder || path === folder || path.startsWith(folder + "/")) return sc;
+  }
+  return null;
+}
+function getDailyNotesConfig(app) {
+  let folder = "";
+  let format = "YYYY-MM-DD";
+  let template = "";
+  try {
+    const dn = app.internalPlugins.getPluginById("daily-notes");
+    const opts = dn && dn.instance && dn.instance.options;
+    if (opts) {
+      if (opts.folder) folder = String(opts.folder).trim();
+      if (opts.format) format = String(opts.format).trim() || "YYYY-MM-DD";
+      if (opts.template) template = String(opts.template).trim();
+    }
+  } catch (e) {
+  }
+  folder = folder.replace(/^\/+|\/+$/g, "");
+  return { folder, format, template };
+}
+function applyTemplate(content, date, format) {
+  const m = obsidian2.moment(date);
+  const now = obsidian2.moment();
+  return content.replace(/{{\s*date\s*:\s*([^}]+)}}/gi, (_, f) => m.format(f.trim())).replace(/{{\s*time\s*:\s*([^}]+)}}/gi, (_, f) => now.format(f.trim())).replace(/{{\s*date\s*}}/gi, m.format(format)).replace(/{{\s*time\s*}}/gi, now.format("HH:mm")).replace(/{{\s*title\s*}}/gi, m.format(format));
+}
+async function readTemplate(app, templatePath, date, format) {
+  if (!templatePath) return null;
+  let path = templatePath.replace(/^\/+/, "");
+  let f = app.vault.getAbstractFileByPath(path);
+  if (!f && !/\.md$/i.test(path)) f = app.vault.getAbstractFileByPath(path + ".md");
+  if (!(f instanceof obsidian2.TFile)) return null;
+  const raw = await app.vault.read(f);
+  return applyTemplate(raw, date, format);
+}
+function dateToPath(app, date) {
+  const { folder, format } = getDailyNotesConfig(app);
+  const name = obsidian2.moment(date).format(format);
+  const path = folder ? `${folder}/${name}.md` : `${name}.md`;
+  return obsidian2.normalizePath(path);
+}
+function fileToDate(file, folder, format) {
+  let rel = file.path.replace(/\.md$/i, "");
+  if (folder) {
+    const prefix = folder + "/";
+    if (!rel.startsWith(prefix)) return null;
+    rel = rel.slice(prefix.length);
+  }
+  const m = obsidian2.moment(rel, format, true);
+  return m.isValid() ? m.toDate() : null;
+}
+async function ensureFolders(app, filePath) {
+  const parts = filePath.split("/");
+  parts.pop();
+  let cur = "";
+  for (const p of parts) {
+    cur = cur ? `${cur}/${p}` : p;
+    if (!app.vault.getAbstractFileByPath(cur)) {
+      try {
+        await app.vault.createFolder(cur);
+      } catch (e) {
+      }
+    }
+  }
+}
 
-// Attach a native autocomplete <datalist> to an input (suggests existing tags / groups)
+// src/gestures.js
+function attachSwipeNav(el, onPrev, onNext) {
+  let x0, y0, t0, active = false;
+  el.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1) {
+      active = false;
+      return;
+    }
+    x0 = e.touches[0].clientX;
+    y0 = e.touches[0].clientY;
+    t0 = Date.now();
+    active = true;
+  }, { passive: true });
+  el.addEventListener("touchend", (e) => {
+    if (!active) return;
+    active = false;
+    const t2 = e.changedTouches[0];
+    const dx = t2.clientX - x0, dy = t2.clientY - y0;
+    if (Date.now() - t0 > 600) return;
+    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+    (dx > 0 ? onPrev : onNext)();
+  }, { passive: true });
+}
+function attachLongPress(el, handler, ms = 500) {
+  let timer = null, x0 = 0, y0 = 0, fired = false;
+  const cancel = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  el.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1) return;
+    const t2 = e.touches[0];
+    x0 = t2.clientX;
+    y0 = t2.clientY;
+    fired = false;
+    timer = setTimeout(() => {
+      timer = null;
+      fired = true;
+      handler({ clientX: x0, clientY: y0 });
+    }, ms);
+  }, { passive: true });
+  el.addEventListener("touchmove", (e) => {
+    const t2 = e.touches[0];
+    if (Math.abs(t2.clientX - x0) > 10 || Math.abs(t2.clientY - y0) > 10) cancel();
+  }, { passive: true });
+  el.addEventListener("touchend", (e) => {
+    cancel();
+    if (fired) e.preventDefault();
+  }, { passive: false });
+  el.addEventListener("touchcancel", cancel, { passive: true });
+  el.addEventListener("contextmenu", cancel);
+}
+function attachHoldDrag(el, { accept, onStart, onMove, onEnd, holdMs = 450 }) {
+  let timer = null, armed = false, x0 = 0, y0 = 0;
+  const cancel = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  el.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1) {
+      cancel();
+      return;
+    }
+    if (accept && !accept(e)) return;
+    const t2 = e.touches[0];
+    x0 = t2.clientX;
+    y0 = t2.clientY;
+    armed = false;
+    timer = setTimeout(() => {
+      timer = null;
+      armed = true;
+      onStart(x0, y0);
+    }, holdMs);
+  }, { passive: true });
+  el.addEventListener("touchmove", (e) => {
+    const t2 = e.touches[0];
+    if (!armed) {
+      if (Math.abs(t2.clientX - x0) > 10 || Math.abs(t2.clientY - y0) > 10) cancel();
+      return;
+    }
+    e.preventDefault();
+    onMove(t2.clientX, t2.clientY);
+  }, { passive: false });
+  const end = () => {
+    cancel();
+    if (armed) {
+      armed = false;
+      onEnd();
+    }
+  };
+  el.addEventListener("touchend", end, { passive: true });
+  el.addEventListener("touchcancel", end, { passive: true });
+}
+var SWIPE_COMMIT_PX = 64;
+function attachSwipeComplete(row, onToggle) {
+  let x0 = 0, y0 = 0, dx = 0, dragging = false;
+  row.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1) return;
+    x0 = e.touches[0].clientX;
+    y0 = e.touches[0].clientY;
+    dx = 0;
+    dragging = false;
+  }, { passive: true });
+  row.addEventListener("touchmove", (e) => {
+    const t2 = e.touches[0];
+    const mx = t2.clientX - x0, my = t2.clientY - y0;
+    if (!dragging) {
+      if (Math.abs(mx) < 14 || Math.abs(mx) < Math.abs(my) * 1.5) return;
+      dragging = true;
+      row.addClass("tc-swiping");
+    }
+    dx = Math.max(0, mx);
+    row.style.transform = `translateX(${Math.min(dx, SWIPE_COMMIT_PX * 1.5)}px)`;
+    row.toggleClass("tc-swipe-commit", dx >= SWIPE_COMMIT_PX);
+  }, { passive: true });
+  const end = async () => {
+    if (!dragging) return;
+    dragging = false;
+    const commit = dx >= SWIPE_COMMIT_PX;
+    row.removeClass("tc-swiping");
+    row.removeClass("tc-swipe-commit");
+    row.style.transform = "";
+    const swallow = (ev) => {
+      ev.stopImmediatePropagation();
+      ev.preventDefault();
+    };
+    row.addEventListener("click", swallow, { capture: true, once: true });
+    setTimeout(() => row.removeEventListener("click", swallow, { capture: true }), 400);
+    if (commit) await onToggle();
+  };
+  row.addEventListener("touchend", end, { passive: true });
+  row.addEventListener("touchcancel", end, { passive: true });
+}
+
+// src/quick-create.js
+var obsidian4 = __toESM(require("obsidian"), 1);
+
+// src/forms.js
+var obsidian3 = __toESM(require("obsidian"), 1);
 function attachDatalist(inputEl, options) {
-    if (!options || !options.length) return;
-    const dl = document.createElement('datalist');
-    dl.id = 'tcdl-' + Math.random().toString(36).slice(2, 9);
-    for (const o of options) { const opt = document.createElement('option'); opt.value = o; dl.appendChild(opt); }
-    inputEl.setAttribute('list', dl.id);
-    inputEl.insertAdjacentElement('afterend', dl);
+  if (!options || !options.length) return;
+  const dl = document.createElement("datalist");
+  dl.id = "tcdl-" + Math.random().toString(36).slice(2, 9);
+  for (const o of options) {
+    const opt = document.createElement("option");
+    opt.value = o;
+    dl.appendChild(opt);
+  }
+  inputEl.setAttribute("list", dl.id);
+  inputEl.insertAdjacentElement("afterend", dl);
 }
-
-function parseTagsInput(str) {
-    return (str || '').split(/[\s,]+/).map(s => s.replace(/^#/, '').trim()).filter(Boolean);
-}
-
-// Chip editor: type + Enter adds a chip (with datalist autocomplete). Returns { get: () => string[] }.
 function buildChips(container, values, options, single, placeholder) {
-    const state = (values || []).filter(Boolean).slice();
-    const wrap = container.createEl('div', { cls: 'tc-chips' });
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'tc-chip-input';
-    input.placeholder = placeholder || '';
-
-    const draw = () => {
-        wrap.empty();
-        for (const v of state) {
-            const chip = wrap.createEl('span', { cls: 'tc-chip' });
-            chip.createSpan({ text: v });
-            chip.createEl('span', { text: '✕', cls: 'tc-chip-x' }).onclick = () => {
-                const i = state.indexOf(v); if (i >= 0) state.splice(i, 1); draw();
-            };
-        }
-        wrap.appendChild(input);
-        attachDatalist(input, options);
-        input.focus();
-    };
-
-    input.addEventListener('keydown', e => {
-        if (e.key === 'Enter') {
-            e.preventDefault();
-            const v = input.value.trim().replace(/^[#@]/, '');
-            if (v) { if (single) state.length = 0; if (!state.includes(v)) state.push(v); }
-            input.value = '';
-            draw();
-        } else if (e.key === 'Backspace' && !input.value && state.length) {
-            state.pop(); draw();
-        }
-    });
-
-    draw();
-    input.blur();   // don't steal focus on initial render
-    return { get: () => state.slice() };
+  const state = (values || []).filter(Boolean).slice();
+  const wrap = container.createEl("div", { cls: "tc-chips" });
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "tc-chip-input";
+  input.placeholder = placeholder || "";
+  const draw = () => {
+    wrap.empty();
+    for (const v of state) {
+      const chip = wrap.createEl("span", { cls: "tc-chip" });
+      chip.createSpan({ text: v });
+      chip.createEl("span", { text: "\u2715", cls: "tc-chip-x" }).onclick = () => {
+        const i = state.indexOf(v);
+        if (i >= 0) state.splice(i, 1);
+        draw();
+      };
+    }
+    wrap.appendChild(input);
+    attachDatalist(input, options);
+    input.focus();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const v = input.value.trim().replace(/^[#@]/, "");
+      if (v) {
+        if (single) state.length = 0;
+        if (!state.includes(v)) state.push(v);
+      }
+      input.value = "";
+      draw();
+    } else if (e.key === "Backspace" && !input.value && state.length) {
+      state.pop();
+      draw();
+    }
+  });
+  draw();
+  input.blur();
+  return { get: () => state.slice() };
 }
-
-function newTaskDraft() { return { text: '', date: todayISO(), tags: '', group: '' }; }
-function newRecurrenceDraft() { return { raw: '', freq: 'daily', interval: 1, weekdays: [], monthMode: 'day', monthday: '', nth: 1, weekday: 0, which: 'first', month: new Date().getMonth(), start: todayISO(), end: '' }; }
-
-// Map a recurrence draft → schedule fields of a rule (no id/raw/start/end). Shared by
-// the create flow, the settings edit modal and the live preview.
 function ruleFromRecDraft(d) {
-    const rule = { freq: d.freq, interval: Math.max(1, Number(d.interval) || 1) };
-    if (d.freq === 'weekly') rule.weekdays = (d.weekdays || []).slice();
-    if (d.freq === 'monthly' || d.freq === 'yearly') {
-        rule.monthMode = d.monthMode || 'day';
-        if (rule.monthMode === 'day') rule.monthday = Number(d.monthday) || null;
-        else if (rule.monthMode === 'weekday') { rule.nth = Number(d.nth) || 1; rule.weekday = Number(d.weekday) || 0; }
-        else if (rule.monthMode === 'workday') rule.which = d.which || 'first';
-    }
-    if (d.freq === 'yearly') rule.month = (d.month != null && d.month !== '') ? Number(d.month) : new Date().getMonth();
-    return rule;
+  const rule = { freq: d.freq, interval: Math.max(1, Number(d.interval) || 1) };
+  if (d.freq === "weekly") rule.weekdays = (d.weekdays || []).slice();
+  if (d.freq === "monthly" || d.freq === "yearly") {
+    rule.monthMode = d.monthMode || "day";
+    if (rule.monthMode === "day") rule.monthday = Number(d.monthday) || null;
+    else if (rule.monthMode === "weekday") {
+      rule.nth = Number(d.nth) || 1;
+      rule.weekday = Number(d.weekday) || 0;
+    } else if (rule.monthMode === "workday") rule.which = d.which || "first";
+  }
+  if (d.freq === "yearly") rule.month = d.month != null && d.month !== "" ? Number(d.month) : (/* @__PURE__ */ new Date()).getMonth();
+  return rule;
 }
-function newHabitDraft() { return { name: '', property: '', unit: '', type: 'number', emoji: '', color: '#9aa0a6', goal: '' }; }
-
-// Render recurrence fields into `containerEl`. `rerender` is called when the set of
-// visible fields changes (frequency / weekday toggles) so the caller can rebuild.
-// opts.hideRaw → omit the task-text field; opts.hideDates → omit start/end (create flow).
+function newHabitDraft() {
+  return { name: "", property: "", unit: "", type: "number", emoji: "", color: "#9aa0a6", goal: "" };
+}
+function buildRule(raw, start, end, d) {
+  const rule = Object.assign({ id: genId(), raw, start, end: end || null }, ruleFromRecDraft(d));
+  if ((rule.freq === "monthly" || rule.freq === "yearly") && rule.monthMode === "day" && !rule.monthday)
+    rule.monthday = parseISO(start).getDate();
+  return rule;
+}
 function buildRecurrenceFields(containerEl, d, rerender, opts) {
-    opts = opts || {};
-    if (!opts.hideRaw) {
-        new obsidian.Setting(containerEl).setName(t('Назва'))
-            .setDesc(t('Формат задачі: "14:00 Полити квіти #дім !med"'))
-            .addText(c => c.setPlaceholder(t('напр. Полити квіти #дім')).setValue(d.raw).onChange(v => d.raw = v));
+  opts = opts || {};
+  if (!opts.hideRaw) {
+    new obsidian3.Setting(containerEl).setName(t("\u041D\u0430\u0437\u0432\u0430")).setDesc(t('\u0424\u043E\u0440\u043C\u0430\u0442 \u0437\u0430\u0434\u0430\u0447\u0456: "14:00 \u041F\u043E\u043B\u0438\u0442\u0438 \u043A\u0432\u0456\u0442\u0438 #\u0434\u0456\u043C !med"')).addText((c) => c.setPlaceholder(t("\u043D\u0430\u043F\u0440. \u041F\u043E\u043B\u0438\u0442\u0438 \u043A\u0432\u0456\u0442\u0438 #\u0434\u0456\u043C")).setValue(d.raw).onChange((v) => d.raw = v));
+  }
+  new obsidian3.Setting(containerEl).setName(t("\u041F\u043E\u0432\u0442\u043E\u0440\u044E\u0432\u0430\u0442\u0438")).addDropdown((dd) => {
+    dd.addOption("daily", t("\u0429\u043E\u0434\u043D\u044F")).addOption("weekly", t("\u0429\u043E\u0442\u0438\u0436\u043D\u044F")).addOption("monthly", t("\u0429\u043E\u043C\u0456\u0441\u044F\u0446\u044F")).addOption("yearly", t("\u0429\u043E\u0440\u043E\u043A\u0443"));
+    dd.setValue(d.freq).onChange((v) => {
+      d.freq = v;
+      rerender();
+    });
+  });
+  new obsidian3.Setting(containerEl).setName(t("\u041A\u043E\u0436\u043D\u0456 N")).addText((c) => c.setValue(String(d.interval)).onChange((v) => d.interval = Math.max(1, Number(v) || 1)));
+  if (d.freq === "weekly") {
+    const s = new obsidian3.Setting(containerEl).setName(t("\u0414\u043D\u0456 \u0442\u0438\u0436\u043D\u044F"));
+    WD_UA.forEach((w, i) => s.addButton((b) => {
+      b.setButtonText(w);
+      if (d.weekdays.includes(i)) b.setCta();
+      b.onClick(() => {
+        d.weekdays = d.weekdays.includes(i) ? d.weekdays.filter((x) => x !== i) : [...d.weekdays, i];
+        rerender();
+      });
+    }));
+  }
+  if (d.freq === "yearly") {
+    new obsidian3.Setting(containerEl).setName(t("\u041C\u0456\u0441\u044F\u0446\u044C")).addDropdown((dd) => {
+      MONTHS_UA.forEach((mn, i) => dd.addOption(String(i), mn));
+      dd.setValue(String(d.month != null ? d.month : (/* @__PURE__ */ new Date()).getMonth())).onChange((v) => d.month = Number(v));
+    });
+  }
+  if (d.freq === "monthly" || d.freq === "yearly") {
+    new obsidian3.Setting(containerEl).setName(t("\u0420\u0435\u0436\u0438\u043C")).addDropdown((dd) => {
+      dd.addOption("day", t("\u0417\u0430 \u0434\u043D\u0435\u043C \u043C\u0456\u0441\u044F\u0446\u044F")).addOption("weekday", t("\u0417\u0430 \u0434\u043D\u0435\u043C \u0442\u0438\u0436\u043D\u044F")).addOption("workday", t("\u0420\u043E\u0431\u043E\u0447\u0438\u0439 \u0434\u0435\u043D\u044C"));
+      dd.setValue(d.monthMode || "day").onChange((v) => {
+        d.monthMode = v;
+        rerender();
+      });
+    });
+    const mode = d.monthMode || "day";
+    if (mode === "day") {
+      new obsidian3.Setting(containerEl).setName(t("\u0427\u0438\u0441\u043B\u043E \u043C\u0456\u0441\u044F\u0446\u044F")).addText((c) => c.setPlaceholder("1-31").setValue(String(d.monthday || "")).onChange((v) => d.monthday = Number(v) || ""));
+    } else if (mode === "weekday") {
+      new obsidian3.Setting(containerEl).setName(t("\u042F\u043A\u0438\u0439")).addDropdown((dd) => {
+        [["1", t("\u043F\u0435\u0440\u0448\u0438\u0439")], ["2", t("\u0434\u0440\u0443\u0433\u0438\u0439")], ["3", t("\u0442\u0440\u0435\u0442\u0456\u0439")], ["4", t("\u0447\u0435\u0442\u0432\u0435\u0440\u0442\u0438\u0439")], ["-1", t("\u043E\u0441\u0442\u0430\u043D\u043D\u0456\u0439")]].forEach((o) => dd.addOption(o[0], o[1]));
+        dd.setValue(String(d.nth || 1)).onChange((v) => d.nth = Number(v));
+      }).addDropdown((dd) => {
+        WD_UA.forEach((w, i) => dd.addOption(String(i), w));
+        dd.setValue(String(d.weekday || 0)).onChange((v) => d.weekday = Number(v));
+      });
+    } else {
+      new obsidian3.Setting(containerEl).setName(t("\u0420\u043E\u0431\u043E\u0447\u0438\u0439 \u0434\u0435\u043D\u044C")).addDropdown((dd) => {
+        dd.addOption("first", t("\u043F\u0435\u0440\u0448\u0438\u0439")).addOption("last", t("\u043E\u0441\u0442\u0430\u043D\u043D\u0456\u0439"));
+        dd.setValue(d.which || "first").onChange((v) => d.which = v);
+      });
     }
-
-    new obsidian.Setting(containerEl).setName(t('Повторювати'))
-        .addDropdown(dd => {
-            dd.addOption('daily', t('Щодня')).addOption('weekly', t('Щотижня'))
-              .addOption('monthly', t('Щомісяця')).addOption('yearly', t('Щороку'));
-            dd.setValue(d.freq).onChange(v => { d.freq = v; rerender(); });
-        });
-
-    new obsidian.Setting(containerEl).setName(t('Кожні N'))
-        .addText(c => c.setValue(String(d.interval)).onChange(v => d.interval = Math.max(1, Number(v) || 1)));
-
-    if (d.freq === 'weekly') {
-        const s = new obsidian.Setting(containerEl).setName(t('Дні тижня'));
-        WD_UA.forEach((w, i) => s.addButton(b => {
-            b.setButtonText(w);
-            if (d.weekdays.includes(i)) b.setCta();
-            b.onClick(() => {
-                d.weekdays = d.weekdays.includes(i) ? d.weekdays.filter(x => x !== i) : [...d.weekdays, i];
-                rerender();
-            });
-        }));
-    }
-
-    if (d.freq === 'yearly') {
-        new obsidian.Setting(containerEl).setName(t('Місяць'))
-            .addDropdown(dd => { MONTHS_UA.forEach((mn, i) => dd.addOption(String(i), mn)); dd.setValue(String(d.month != null ? d.month : new Date().getMonth())).onChange(v => d.month = Number(v)); });
-    }
-
-    if (d.freq === 'monthly' || d.freq === 'yearly') {
-        new obsidian.Setting(containerEl).setName(t('Режим'))
-            .addDropdown(dd => {
-                dd.addOption('day', t('За днем місяця')).addOption('weekday', t('За днем тижня')).addOption('workday', t('Робочий день'));
-                dd.setValue(d.monthMode || 'day').onChange(v => { d.monthMode = v; rerender(); });
-            });
-        const mode = d.monthMode || 'day';
-        if (mode === 'day') {
-            new obsidian.Setting(containerEl).setName(t('Число місяця'))
-                .addText(c => c.setPlaceholder('1-31').setValue(String(d.monthday || '')).onChange(v => d.monthday = Number(v) || ''));
-        } else if (mode === 'weekday') {
-            new obsidian.Setting(containerEl).setName(t('Який'))
-                .addDropdown(dd => { [['1', t('перший')], ['2', t('другий')], ['3', t('третій')], ['4', t('четвертий')], ['-1', t('останній')]].forEach(o => dd.addOption(o[0], o[1])); dd.setValue(String(d.nth || 1)).onChange(v => d.nth = Number(v)); })
-                .addDropdown(dd => { WD_UA.forEach((w, i) => dd.addOption(String(i), w)); dd.setValue(String(d.weekday || 0)).onChange(v => d.weekday = Number(v)); });
-        } else {
-            new obsidian.Setting(containerEl).setName(t('Робочий день'))
-                .addDropdown(dd => { dd.addOption('first', t('перший')).addOption('last', t('останній')); dd.setValue(d.which || 'first').onChange(v => d.which = v); });
-        }
-    }
-
-    if (!opts.hideDates) {
-        new obsidian.Setting(containerEl).setName(t('Початок'))
-            .addText(c => { c.inputEl.type = 'date'; c.setValue(d.start).onChange(v => d.start = v); });
-        new obsidian.Setting(containerEl).setName(t('Кінець (необов.)'))
-            .addText(c => { c.inputEl.type = 'date'; c.setValue(d.end).onChange(v => d.end = v); });
-    }
-
-    containerEl.createEl('div', { cls: 'tc-rec-preview', text: '↻ ' + describeRule(ruleFromRecDraft(d)) });
+  }
+  if (!opts.hideDates) {
+    new obsidian3.Setting(containerEl).setName(t("\u041F\u043E\u0447\u0430\u0442\u043E\u043A")).addText((c) => {
+      c.inputEl.type = "date";
+      c.setValue(d.start).onChange((v) => d.start = v);
+    });
+    new obsidian3.Setting(containerEl).setName(t("\u041A\u0456\u043D\u0435\u0446\u044C (\u043D\u0435\u043E\u0431\u043E\u0432.)")).addText((c) => {
+      c.inputEl.type = "date";
+      c.setValue(d.end).onChange((v) => d.end = v);
+    });
+  }
+  containerEl.createEl("div", { cls: "tc-rec-preview", text: "\u21BB " + describeRule(ruleFromRecDraft(d)) });
 }
-
 function validateRecurrence(d) {
-    if (!d.raw.trim()) { new obsidian.Notice(t('Введіть текст задачі')); return null; }
-    if (d.freq === 'weekly' && (d.weekdays || []).length === 0) { new obsidian.Notice(t('Оберіть хоча б один день тижня')); return null; }
-    const start = d.start || todayISO();
-    const rule = Object.assign({ id: genId(), raw: d.raw.trim(), start, end: d.end || null }, ruleFromRecDraft(d));
-    if ((rule.freq === 'monthly' || rule.freq === 'yearly') && rule.monthMode === 'day' && !rule.monthday)
-        rule.monthday = parseISO(start).getDate();
-    return rule;
+  if (!d.raw.trim()) {
+    new obsidian3.Notice(t("\u0412\u0432\u0435\u0434\u0456\u0442\u044C \u0442\u0435\u043A\u0441\u0442 \u0437\u0430\u0434\u0430\u0447\u0456"));
+    return null;
+  }
+  if (d.freq === "weekly" && (d.weekdays || []).length === 0) {
+    new obsidian3.Notice(t("\u041E\u0431\u0435\u0440\u0456\u0442\u044C \u0445\u043E\u0447\u0430 \u0431 \u043E\u0434\u0438\u043D \u0434\u0435\u043D\u044C \u0442\u0438\u0436\u043D\u044F"));
+    return null;
+  }
+  return buildRule(d.raw.trim(), d.start || todayISO(), d.end, d);
 }
-
 function buildHabitFields(containerEl, d, rerender) {
-    new obsidian.Setting(containerEl).setName(t('Назва'))
-        .addText(c => c.setPlaceholder('Читання').setValue(d.name).onChange(v => d.name = v));
-    new obsidian.Setting(containerEl).setName(t('Емодзі'))
-        .setDesc(t('Компактна іконка звички'))
-        .addText(c => { c.setPlaceholder('📖').setValue(d.emoji || ''); c.inputEl.maxLength = 4; c.inputEl.style.width = '3em'; c.onChange(v => d.emoji = v.trim()); });
-    new obsidian.Setting(containerEl).setName(t('Колір'))
-        .addColorPicker(cp => cp.setValue(d.color || '#9aa0a6').onChange(v => d.color = v));
-    new obsidian.Setting(containerEl).setName(t('Назва property'))
-        .setDesc(t('Ключ у властивостях файлу (напр. pages_read)'))
-        .addText(c => c.setPlaceholder('pages_read').setValue(d.property).onChange(v => d.property = v));
-    new obsidian.Setting(containerEl).setName(t('Тип виміру'))
-        .addDropdown(dd => {
-            dd.addOption('number', t('Кількість')).addOption('bool', t('Так / Ні'));
-            dd.setValue(d.type).onChange(v => { d.type = v; rerender(); });
-        });
-    if (d.type === 'number') {
-        new obsidian.Setting(containerEl).setName(t('Одиниці виміру'))
-            .setDesc(t('напр. сторінки, км, хвилини'))
-            .addText(c => c.setPlaceholder(t('сторінки')).setValue(d.unit).onChange(v => d.unit = v));
-        new obsidian.Setting(containerEl).setName(t('Ціль на день'))
-            .setDesc(t('Необов’язково — для кілець прогресу та %'))
-            .addText(c => { c.inputEl.type = 'number'; c.setPlaceholder('30').setValue(d.goal != null ? String(d.goal) : '').onChange(v => d.goal = v.trim() === '' ? '' : (Number(v) || '')); });
-    }
+  new obsidian3.Setting(containerEl).setName(t("\u041D\u0430\u0437\u0432\u0430")).addText((c) => c.setPlaceholder("\u0427\u0438\u0442\u0430\u043D\u043D\u044F").setValue(d.name).onChange((v) => d.name = v));
+  new obsidian3.Setting(containerEl).setName(t("\u0415\u043C\u043E\u0434\u0437\u0456")).setDesc(t("\u041A\u043E\u043C\u043F\u0430\u043A\u0442\u043D\u0430 \u0456\u043A\u043E\u043D\u043A\u0430 \u0437\u0432\u0438\u0447\u043A\u0438")).addText((c) => {
+    c.setPlaceholder("\u{1F4D6}").setValue(d.emoji || "");
+    c.inputEl.maxLength = 4;
+    c.inputEl.style.width = "3em";
+    c.onChange((v) => d.emoji = v.trim());
+  });
+  new obsidian3.Setting(containerEl).setName(t("\u041A\u043E\u043B\u0456\u0440")).addColorPicker((cp) => cp.setValue(d.color || "#9aa0a6").onChange((v) => d.color = v));
+  new obsidian3.Setting(containerEl).setName(t("\u041D\u0430\u0437\u0432\u0430 property")).setDesc(t("\u041A\u043B\u044E\u0447 \u0443 \u0432\u043B\u0430\u0441\u0442\u0438\u0432\u043E\u0441\u0442\u044F\u0445 \u0444\u0430\u0439\u043B\u0443 (\u043D\u0430\u043F\u0440. pages_read)")).addText((c) => c.setPlaceholder("pages_read").setValue(d.property).onChange((v) => d.property = v));
+  new obsidian3.Setting(containerEl).setName(t("\u0422\u0438\u043F \u0432\u0438\u043C\u0456\u0440\u0443")).addDropdown((dd) => {
+    dd.addOption("number", t("\u041A\u0456\u043B\u044C\u043A\u0456\u0441\u0442\u044C")).addOption("bool", t("\u0422\u0430\u043A / \u041D\u0456"));
+    dd.setValue(d.type).onChange((v) => {
+      d.type = v;
+      rerender();
+    });
+  });
+  if (d.type === "number") {
+    new obsidian3.Setting(containerEl).setName(t("\u041E\u0434\u0438\u043D\u0438\u0446\u0456 \u0432\u0438\u043C\u0456\u0440\u0443")).setDesc(t("\u043D\u0430\u043F\u0440. \u0441\u0442\u043E\u0440\u0456\u043D\u043A\u0438, \u043A\u043C, \u0445\u0432\u0438\u043B\u0438\u043D\u0438")).addText((c) => c.setPlaceholder(t("\u0441\u0442\u043E\u0440\u0456\u043D\u043A\u0438")).setValue(d.unit).onChange((v) => d.unit = v));
+    new obsidian3.Setting(containerEl).setName(t("\u0426\u0456\u043B\u044C \u043D\u0430 \u0434\u0435\u043D\u044C")).setDesc(t("\u041D\u0435\u043E\u0431\u043E\u0432\u2019\u044F\u0437\u043A\u043E\u0432\u043E \u2014 \u0434\u043B\u044F \u043A\u0456\u043B\u0435\u0446\u044C \u043F\u0440\u043E\u0433\u0440\u0435\u0441\u0443 \u0442\u0430 %")).addText((c) => {
+      c.inputEl.type = "number";
+      c.setPlaceholder("30").setValue(d.goal != null ? String(d.goal) : "").onChange((v) => d.goal = v.trim() === "" ? "" : Number(v) || "");
+    });
+  }
 }
-
 function validateHabit(d) {
-    const name = d.name.trim();
-    const prop = d.property.trim();
-    if (!name) { new obsidian.Notice(t('Введіть назву')); return null; }
-    if (!prop) { new obsidian.Notice(t('Введіть назву property')); return null; }
-    return { id: genId(), name, property: prop, type: d.type, unit: d.type === 'number' ? d.unit.trim() : '', emoji: (d.emoji || '').trim(), color: d.color || '', goal: d.type === 'number' ? (Number(d.goal) || null) : null };
+  const name = d.name.trim();
+  const prop = d.property.trim();
+  if (!name) {
+    new obsidian3.Notice(t("\u0412\u0432\u0435\u0434\u0456\u0442\u044C \u043D\u0430\u0437\u0432\u0443"));
+    return null;
+  }
+  if (!prop) {
+    new obsidian3.Notice(t("\u0412\u0432\u0435\u0434\u0456\u0442\u044C \u043D\u0430\u0437\u0432\u0443 property"));
+    return null;
+  }
+  return { id: genId(), name, property: prop, type: d.type, unit: d.type === "number" ? d.unit.trim() : "", emoji: (d.emoji || "").trim(), color: d.color || "", goal: d.type === "number" ? Number(d.goal) || null : null };
+}
+function newStatusDraft(status) {
+  return status ? { id: status.id, char: status.char, label: status.label, behavior: status.behavior, icon: status.icon || "" } : { id: null, char: "/", label: "", behavior: "active", icon: "" };
+}
+function buildStatusFields(containerEl, d, rerender) {
+  new obsidian3.Setting(containerEl).setName(t("\u0421\u0438\u043C\u0432\u043E\u043B")).setDesc(t('\u041E\u0434\u0438\u043D \u0441\u0438\u043C\u0432\u043E\u043B, \u0449\u043E \u0437\u0430\u043F\u0438\u0441\u0443\u0454\u0442\u044C\u0441\u044F \u044F\u043A "- [X] \u0442\u0435\u043A\u0441\u0442 \u0437\u0430\u0434\u0430\u0447\u0456"')).addText((c) => {
+    c.inputEl.maxLength = 1;
+    c.inputEl.style.width = "3em";
+    c.setValue(d.char).onChange((v) => {
+      d.char = (v.trim() || v).slice(0, 1) || " ";
+      rerender();
+    });
+  });
+  new obsidian3.Setting(containerEl).setName(t("\u041D\u0430\u0437\u0432\u0430")).addText((c) => c.setPlaceholder(t("\u041D\u043E\u0432\u0430")).setValue(d.label).onChange((v) => d.label = v));
+  new obsidian3.Setting(containerEl).setName(t("\u041F\u043E\u0432\u0435\u0434\u0456\u043D\u043A\u0430")).setDesc(t("\u042F\u043A \u0441\u0442\u0430\u0442\u0443\u0441 \u0432\u0440\u0430\u0445\u043E\u0432\u0443\u0454\u0442\u044C\u0441\u044F: \u044F\u043A \u0432\u0456\u0434\u043A\u0440\u0438\u0442\u0430 \u0437\u0430\u0434\u0430\u0447\u0430, \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u0430 \u0447\u0438 \u0441\u043A\u0430\u0441\u043E\u0432\u0430\u043D\u0430")).addDropdown((dd) => {
+    dd.addOption("active", t("\u0410\u043A\u0442\u0438\u0432\u043D\u0430")).addOption("done", t("\u0412\u0438\u043A\u043E\u043D\u0430\u043D\u043E")).addOption("cancelled", t("\u0421\u043A\u0430\u0441\u043E\u0432\u0430\u043D\u043E"));
+    dd.setValue(d.behavior).onChange((v) => d.behavior = v);
+  });
+  const isCustomIcon = !!(d.icon && !CHECKBOX_ICON_CHOICES.includes(d.icon));
+  const iconSetting = new obsidian3.Setting(containerEl).setName(t("\u0406\u043A\u043E\u043D\u043A\u0430")).setDesc(t("\u041F\u043E\u043A\u0430\u0437\u0443\u0454\u0442\u044C\u0441\u044F \u0443 \u0441\u043F\u0438\u0441\u043A\u0430\u0445/\u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u0456 Markday \u0437\u0430\u043C\u0456\u0441\u0442\u044C \u0441\u0438\u043C\u0432\u043E\u043B\u0443 (\u043F\u0440\u0430\u0446\u044E\u0454 \u0431\u0435\u0437 \u0441\u0442\u043E\u0440\u043E\u043D\u043D\u0456\u0445 \u0442\u0435\u043C \u0447\u0438 \u043F\u043B\u0430\u0433\u0456\u043D\u0456\u0432)"));
+  iconSetting.addDropdown((dd) => {
+    dd.addOption("", t("\u0411\u0435\u0437 \u0456\u043A\u043E\u043D\u043A\u0438 (\u043B\u0438\u0448\u0435 \u0441\u0438\u043C\u0432\u043E\u043B)"));
+    CHECKBOX_ICON_CHOICES.forEach((name) => dd.addOption(name, name));
+    dd.addOption("__custom", t("\u0406\u043D\u0448\u0430\u2026"));
+    dd.setValue(isCustomIcon ? "__custom" : d.icon || "");
+    dd.onChange((v) => {
+      d.icon = v === "__custom" ? d.icon || "circle" : v;
+      rerender();
+    });
+  });
+  if (isCustomIcon) {
+    iconSetting.addText((c) => c.setPlaceholder("lucide-name").setValue(d.icon || "").onChange((v) => {
+      d.icon = v.trim();
+    }));
+  }
+  const preview = iconSetting.controlEl.createSpan({ cls: "tc-icon-preview" });
+  if (d.icon) obsidian3.setIcon(preview, d.icon);
+  else preview.setText(d.char.trim() ? d.char : "\xB7");
+}
+function validateStatus(d) {
+  const char = (d.char || " ").slice(0, 1);
+  const label = (d.label || "").trim();
+  if (!label) {
+    new obsidian3.Notice(t("\u0412\u0432\u0435\u0434\u0456\u0442\u044C \u043D\u0430\u0437\u0432\u0443"));
+    return null;
+  }
+  return { id: d.id || genId(), char, label, behavior: d.behavior || "active", icon: (d.icon || "").trim() };
 }
 
-// ─── Task Editor Modal (4-layer card; saves live, no Save/Cancel buttons) ──────
-
-class TaskEditorModal extends obsidian.Modal {
-    constructor(app, task, onClose) {
-        super(app);
-        this.file = task.file;
-        this.line = task.line;       // stays valid within a file for the modal's lifetime
-        this.date = task.date;       // current day (for the date picker + cross-day move)
-        this.task = task;
-        this.onCloseCb = onClose;
-        this.deleted = false;
-        this._lineSave = obsidian.debounce(() => this.applyLine(), 400, false);
-        this._descSave = obsidian.debounce(() => this.saveDescription(), 500, false);
-    }
-
-    get plugin() {
-        return (this.app.plugins && this.app.plugins.plugins && this.app.plugins.plugins['markday'])
-            || { settings: DEFAULT_SETTINGS };
-    }
-
-    async reload() {
-        const content = await this.app.vault.read(this.file);
-        const found = parseTasks(content).find(t => t.line === this.line);
-        this.task = found ? { ...found, file: this.file, date: this.date } : null;
-    }
-
-    onOpen() {
-        // close only via Esc: hide the × button and ignore clicks on the dimmed backdrop
-        this.modalEl.addClass('tc-noclose');
-        const container = this.modalEl.closest('.modal-container');
-        if (container) for (const ev of ['mousedown', 'click']) container.addEventListener(ev, e => { if (!this.modalEl.contains(e.target)) e.stopImmediatePropagation(); }, true);
-        this.renderAll();
-    }
-
-    // ── live persistence ─────────────────────────────────────────────────────
-    async applyLine() { if (!this.deleted && this.task) await rewriteTaskLine(this.app, this.file, this.line, this.task); }
-    async saveDescription() { if (!this.deleted && this.task && this.descInput) await setDescription(this.app, this.file, this.task, this.descInput.value, this.plugin.settings); }
-    async setStatus(status) {
-        this.task.done = status === 'done';
-        this.task.cancelled = status === 'cancelled';
-        await this.applyLine();
-        this.renderAll();
-    }
-
-    dateLabel() {
-        const time = this.task.start ? ' · ' + (this.task.end ? `${this.task.start}–${this.task.end}` : this.task.start) : '';
-        return (this.date ? humanDate(this.date) : t('Без дати')) + time;
-    }
-
-    openDatePicker() {
-        const draft = { date: this.date, start: this.task.start, end: this.task.end };
-        const apply = async () => {
-            if (draft.date && draft.date !== this.date) {
-                const loc = await moveTaskToDay(this.app, this.task, draft.date, draft.start || null, draft.end || null, this.plugin.settings);
-                this.file = loc.file; this.line = loc.line; this.date = draft.date;
-            } else {
-                this.task.start = draft.start || null;
-                this.task.end = (this.task.start && draft.end) ? draft.end : null;
-                await this.applyLine();
-            }
-            this.renderAll();
-        };
-        new DatePickerModal(this.app, draft, apply).open();
-    }
-
-    async renderAll() {
-        await this.reload();
-        if (!this.task) { this.close(); return; }
-        const tags = collectTags(this.app);
-        const groups = await collectGroups(this.app, this.plugin.settings);
-        this._groups = groups;
-
-        const { contentEl } = this;
-        contentEl.empty();
-        contentEl.addClass('tc-editor', 'tc-task-edit');
-
-        // ── Layer 1: status checkbox · date/time · priority ──────────────────
-        const l1 = contentEl.createEl('div', { cls: 'tc-te-l1' });
-        const cb = makeStatusCheckbox(l1, this.task, checked => this.setStatus(checked ? 'done' : 'todo'), 'tc-te-check');
-        cb.addEventListener('contextmenu', e => {
-            e.preventDefault();
-            const menu = new obsidian.Menu();
-            menu.addItem(it => it.setTitle(this.task.done ? t('Не виконано') : t('Виконано')).onClick(() => this.setStatus(this.task.done ? 'todo' : 'done')));
-            menu.addItem(it => it.setTitle(t('Не буде виконано')).setChecked(!!this.task.cancelled).onClick(() => this.setStatus(this.task.cancelled ? 'todo' : 'cancelled')));
-            menu.showAtMouseEvent(e);
-        });
-
-        const dateBtn = l1.createEl('button', { cls: 'tc-te-date' });
-        const dic = dateBtn.createEl('span', { cls: 'tc-te-date-ic' }); obsidian.setIcon(dic, 'calendar');
-        dateBtn.createEl('span', { cls: 'tc-te-date-txt', text: this.dateLabel() });
-        dateBtn.onclick = () => this.openDatePicker();
-
-        const prio = l1.createEl('button', { cls: 'tc-te-prio clickable-icon' });
-        obsidian.setIcon(prio, 'alert-circle');
-        prio.setAttribute('aria-label', t('Пріоритет'));
-        if (this.task.priority) { prio.addClass('is-set'); prio.style.color = prioColor(this.task.priority); }
-        prio.onclick = e => {
-            const menu = new obsidian.Menu();
-            menu.addItem(it => it.setTitle('—').setChecked(!this.task.priority).onClick(async () => { this.task.priority = null; await this.applyLine(); this.renderAll(); }));
-            priorityKeys.forEach(k => menu.addItem(it => it.setTitle(k).setChecked(this.task.priority === k).onClick(async () => { this.task.priority = k; await this.applyLine(); this.renderAll(); })));
-            menu.showAtMouseEvent(e);
-        };
-
-        // ── Layer 2: editable title ──────────────────────────────────────────
-        const titleInput = contentEl.createEl('input', { cls: 'tc-title-input tc-te-title' });
-        titleInput.placeholder = t('Назва задачі');
-        titleInput.value = this.task.text || '';
-        titleInput.addEventListener('input', () => { this.task.text = titleInput.value; this._lineSave(); });
-        titleInput.addEventListener('blur', () => { this.task.text = titleInput.value.trim(); this.applyLine(); });
-
-        // ── Layer 3: description (smart #/@) · subtasks · tag chips ───────────
-        const l3 = contentEl.createEl('div', { cls: 'tc-te-l3' });
-        const ta = l3.createEl('textarea', { cls: 'tc-editor-desc' });
-        ta.rows = 4;
-        ta.placeholder = t('Опис, теги #, групи @…');
-        ta.value = this.task.desc || '';
-        this.descInput = ta;
-        ta.addEventListener('input', () => this._descSave());
-        ta.addEventListener('blur', () => this.saveDescription());
-        attachInlineTagAutocomplete(ta, tags, groups, (sig, val) => {
-            if (sig === '#') { if (!this.task.tags.includes(val)) this.task.tags.push(val); this.drawTagChips(); }
-            else { this.task.group = val; this.renderGroupBadge(); }
-            this.applyLine();
-        });
-
-        this.subWrap = l3.createEl('div', { cls: 'tc-te-subs' });
-        this.renderSubtasks();
-
-        this.tagChipsEl = l3.createEl('div', { cls: 'tc-chips tc-te-tags' });
-        this.drawTagChips();
-
-        // ── Layer 4: group badge · more menu ─────────────────────────────────
-        const l4 = contentEl.createEl('div', { cls: 'tc-te-l4' });
-        this.groupSlot = l4.createEl('div', { cls: 'tc-te-groupslot' });
-        this.renderGroupBadge();
-        const more = l4.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(more, 'more-horizontal');
-        more.setAttribute('aria-label', t('Ще'));
-        more.onclick = e => this.moreMenu(e);
-    }
-
-    drawTagChips() {
-        this.tagChipsEl.empty();
-        for (const tg of (this.task.tags || [])) {
-            const chip = this.tagChipsEl.createEl('span', { cls: 'tc-chip' });
-            chip.createSpan({ text: '#' + tg });
-            const col = COLORS.tags[tg]; if (col) tintBadge(chip, col);
-            chip.createEl('span', { text: '✕', cls: 'tc-chip-x' }).onclick = () => { this.task.tags = this.task.tags.filter(x => x !== tg); this.applyLine(); this.drawTagChips(); };
-        }
-        const add = this.tagChipsEl.createEl('span', { cls: 'tc-chip tc-chip-add', text: '+' });
-        add.setAttribute('aria-label', t('Додати тег у опис'));
-        add.onclick = () => { this.descInput.focus(); };
-    }
-
-    renderGroupBadge() {
-        this.groupSlot.empty();
-        const badge = this.groupSlot.createEl('button', { cls: this.task.group ? 'tc-te-group' : 'tc-te-group tc-te-nogroup' });
-        badge.setText(this.task.group ? '@' + this.task.group : t('без групи'));
-        if (this.task.group) tintBadge(badge, COLORS.groups[this.task.group] || autoColor(this.task.group));
-        badge.onclick = e => {
-            const menu = new obsidian.Menu();
-            menu.addItem(it => it.setTitle(t('без групи')).setChecked(!this.task.group).onClick(async () => { this.task.group = null; await this.applyLine(); this.renderGroupBadge(); }));
-            for (const g of (this._groups || [])) menu.addItem(it => it.setTitle('@' + g).setChecked(this.task.group === g).onClick(async () => { this.task.group = g; await this.applyLine(); this.renderGroupBadge(); }));
-            menu.showAtMouseEvent(e);
-        };
-    }
-
-    moreMenu(e) {
-        const menu = new obsidian.Menu();
-        menu.addItem(it => it.setTitle(t('Відкрити нотатку')).setIcon('file-text').onClick(() => { openDay(this.app, this.date); this.close(); }));
-        if (this.task.recId) {
-            menu.addItem(it => it.setTitle(t('Редагувати регулярну задачу')).setIcon('repeat').onClick(() => {
-                const rule = (this.plugin.settings.recurrences || []).find(r => r.id === this.task.recId);
-                if (rule) new RecurrenceEditModal(this.app, this.plugin, rule, () => this.plugin.refreshViews && this.plugin.refreshViews()).open();
-            }));
-        } else {
-            menu.addItem(it => it.setTitle(t('Зробити регулярною')).setIcon('repeat').onClick(() => this.convertToRecurring()));
-        }
-        menu.addSeparator();
-        menu.addItem(it => it.setTitle(t('Видалити')).setIcon('trash').onClick(async () => {
-            await removeTaskBlock(this.app, this.file, this.task);
-            this.deleted = true;
-            this.close();
-        }));
-        menu.showAtMouseEvent(e);
-    }
-
-    convertToRecurring() {
-        const rec = { freq: 'daily', interval: 1, weekdays: [], monthMode: 'day', monthday: '', nth: 1, weekday: 0, which: 'first', month: new Date().getMonth() };
-        new RecurrenceCustomModal(this.app, rec, async () => {
-            const start = this.date || todayISO();
-            const rule = Object.assign({ id: genId(), raw: serializeTaskBody(this.task), start, end: null }, ruleFromRecDraft(rec));
-            if ((rule.freq === 'monthly' || rule.freq === 'yearly') && rule.monthMode === 'day' && !rule.monthday) rule.monthday = parseISO(start).getDate();
-            this.plugin.settings.recurrences.push(rule);
-            await this.plugin.saveSettings();
-            await removeTaskBlock(this.app, this.file, this.task);   // one-off line removed; now shows as a virtual recurrence
-            this.deleted = true;
-            if (this.plugin.refreshViews) this.plugin.refreshViews();
-            this.close();
-        }).open();
-    }
-
-    renderSubtasks() {
-        this.subWrap.empty();
-        for (const s of this.task.subtasks) {
-            const r = this.subWrap.createEl('div', { cls: 'tc-subrow' });
-            makeCheckbox(r, s.done, async checked => {
-                await toggleSubtask(this.app, this.file, this.line, s.line, checked);
-                await this.reload(); this.renderSubtasks();
-            });
-            r.createEl('span', { text: s.text || '(порожня)', cls: s.done ? 'tc-label tc-done' : 'tc-label' });
-            r.createEl('span', { text: '✕', cls: 'tc-del' }).onclick = async () => {
-                await removeSubtask(this.app, this.file, this.line, s.line);
-                await this.reload(); this.renderSubtasks();
-            };
-        }
-        const add = this.subWrap.createEl('div', { cls: 'tc-add-row' });
-        const inp = add.createEl('input', { cls: 'tc-input' });
-        inp.type = 'text';
-        inp.placeholder = t('+ підзадача');
-        inp.addEventListener('keydown', async e => {
-            if (e.key !== 'Enter') return;
-            const v = inp.value.trim();
-            if (!v) return;
-            await addChild(this.app, this.file, this.task, `- [ ] ${v}`);
-            await this.reload(); this.renderSubtasks();
-        });
-    }
-
-    onClose() {
-        const text = this.descInput ? this.descInput.value : null;
-        this.contentEl.empty();
-        (async () => {
-            if (!this.deleted && this.task) {
-                await this.applyLine();
-                if (text != null) await setDescription(this.app, this.file, this.task, text, this.plugin.settings);
-            }
-            if (this.onCloseCb) this.onCloseCb();
-        })();
-    }
-}
-
-// ─── Task / Habit creation (modals, inline composer, FAB) ─────────────────────
-
+// src/quick-create.js
 function newComposerDraft(date) {
-    return { text: '', date: date || todayISO(), start: null, end: null, priority: null, tags: [], group: null,
-             status: 'todo', descText: '',
-             rec: { freq: 'none', interval: 1, weekdays: [], monthMode: 'day', monthday: '', nth: 1, weekday: 0, which: 'first', month: new Date().getMonth() },
-             _tagChips: null, _groupChips: null };
+  return {
+    text: "",
+    date: date || todayISO(),
+    start: null,
+    end: null,
+    priority: null,
+    tags: [],
+    group: null,
+    status: "todo",
+    descText: "",
+    rec: { freq: "none", interval: 1, weekdays: [], monthMode: "day", monthday: "", nth: 1, weekday: 0, which: "first", month: (/* @__PURE__ */ new Date()).getMonth() },
+    _tagChips: null,
+    _groupChips: null
+  };
 }
-
-function nextMonday() { const d = new Date(); return addDays(d, 7 - ((d.getDay() + 6) % 7)); }
-
-function composeTaskRaw(d) {
-    const parts = [];
-    if (d.start) parts.push(d.end ? `${d.start}-${d.end}` : d.start);
-    if (d.text) parts.push(d.text);
-    for (const t of (d.tags || [])) parts.push(`#${t}`);
-    if (d.priority) parts.push(`!${d.priority}`);
-    if (d.group) parts.push(`@${d.group}`);
-    return parts.join(' ');
+function nextMonday() {
+  const d = /* @__PURE__ */ new Date();
+  return addDays(d, 7 - mondayIdx(d));
 }
-
 function syncDraftChips(d) {
-    if (d._tagChips) d.tags = d._tagChips.get();
-    if (d._groupChips) d.group = d._groupChips.get()[0] || null;
+  if (d._tagChips) d.tags = d._tagChips.get();
+  if (d._groupChips) d.group = d._groupChips.get()[0] || null;
 }
-
 async function createFromDraft(app, plugin, d) {
-    syncDraftChips(d);
-    // sweep any #tag / @group tokens typed straight into the description into chips
-    if (d.descText) {
-        d.descText = d.descText.replace(/(^|\s)([#@])([^\s#@]+)/g, (m, pre, sig, val) => {
-            if (sig === '#') { if (!d.tags.includes(val)) d.tags.push(val); }
-            else { d.group = val; }
-            return pre;
-        }).replace(/[ \t]{2,}/g, ' ').trim();
+  syncDraftChips(d);
+  if (d.descText) {
+    d.descText = d.descText.replace(/(^|\s)([#@])([^\s#@]+)/g, (m, pre, sig, val) => {
+      if (sig === "#") {
+        if (!d.tags.includes(val)) d.tags.push(val);
+      } else {
+        d.group = val;
+      }
+      return pre;
+    }).replace(/[ \t]{2,}/g, " ").trim();
+  }
+  const raw = serializeTaskBody(d);
+  if (!raw.trim()) return;
+  if (d.rec && d.rec.freq && d.rec.freq !== "none") {
+    plugin.settings.recurrences.push(buildRule(raw, d.date || todayISO(), null, d.rec));
+    await plugin.saveSettings();
+  } else {
+    const file = await getOrCreateDateFile(app, d.date || todayISO());
+    const mark = charForStatusId(d.status || "todo");
+    const lineNum = await insertLineUnderHeading(app, file, `- [${mark}] ${applyDefaults(raw, plugin.settings)}`, plugin.settings);
+    if (d.descText && d.descText.trim() && lineNum != null) {
+      await setDescription(app, file, { line: lineNum, text: d.text, descId: null }, d.descText, plugin.settings);
     }
-    const raw = composeTaskRaw(d);
-    if (!raw.trim()) return;
-    if (d.rec && d.rec.freq && d.rec.freq !== 'none') {
-        const start = d.date || todayISO();
-        const rule = Object.assign({ id: genId(), raw, start, end: null }, ruleFromRecDraft(d.rec));
-        if ((rule.freq === 'monthly' || rule.freq === 'yearly') && rule.monthMode === 'day' && !rule.monthday)
-            rule.monthday = parseISO(start).getDate();
-        plugin.settings.recurrences.push(rule);
-        await plugin.saveSettings();
-    } else {
-        const file = await getOrCreateDateFile(app, d.date || todayISO());
-        const mark = statusMark(d.status || 'todo');
-        const lineNum = await insertLineUnderHeading(app, file, `- [${mark}] ${applyDefaults(raw, plugin.settings)}`, plugin.settings);
-        if (d.descText && d.descText.trim() && lineNum != null) {
-            await setDescription(app, file, { line: lineNum, text: d.text, descId: null }, d.descText, plugin.settings);
-        }
-    }
+  }
 }
-
-// date + time + recurrence options
 function buildScheduleFields(container, d, rerender) {
-    new obsidian.Setting(container).setName(t('Дата'))
-        .addText(c => { c.inputEl.type = 'date'; c.setValue(d.date || todayISO()).onChange(v => d.date = v); });
-    new obsidian.Setting(container).setName(t('Час'))
-        .addText(c => c.setPlaceholder('09:00').setValue(d.start || '').onChange(v => d.start = v.trim() || null))
-        .addText(c => c.setPlaceholder('10:30').setValue(d.end || '').onChange(v => d.end = v.trim() || null));
-    new obsidian.Setting(container).setName(t('Повторювати'))
-        .addDropdown(dd => {
-            dd.addOption('none', t('Без повтору')).addOption('daily', t('Щодня')).addOption('weekly', t('Щотижня')).addOption('monthly', t('Щомісяця'));
-            dd.setValue(d.rec.freq).onChange(v => { d.rec.freq = v; rerender(); });
-        });
-    if (d.rec.freq !== 'none') {
-        new obsidian.Setting(container).setName(t('Кожні N')).addText(c => c.setValue(String(d.rec.interval)).onChange(v => d.rec.interval = Math.max(1, Number(v) || 1)));
-    }
-    if (d.rec.freq === 'weekly') {
-        const s = new obsidian.Setting(container).setName(t('Дні тижня'));
-        WD_UA.forEach((w, i) => s.addButton(b => {
-            b.setButtonText(w);
-            if (d.rec.weekdays.includes(i)) b.setCta();
-            b.onClick(() => { d.rec.weekdays = d.rec.weekdays.includes(i) ? d.rec.weekdays.filter(x => x !== i) : [...d.rec.weekdays, i]; rerender(); });
-        }));
-    }
+  new obsidian4.Setting(container).setName(t("\u0414\u0430\u0442\u0430")).addText((c) => {
+    c.inputEl.type = "date";
+    c.setValue(d.date || todayISO()).onChange((v) => d.date = v);
+  });
+  new obsidian4.Setting(container).setName(t("\u0427\u0430\u0441")).addText((c) => c.setPlaceholder("09:00").setValue(d.start || "").onChange((v) => d.start = v.trim() || null)).addText((c) => c.setPlaceholder("10:30").setValue(d.end || "").onChange((v) => d.end = v.trim() || null));
+  new obsidian4.Setting(container).setName(t("\u041F\u043E\u0432\u0442\u043E\u0440\u044E\u0432\u0430\u0442\u0438")).addDropdown((dd) => {
+    dd.addOption("none", t("\u0411\u0435\u0437 \u043F\u043E\u0432\u0442\u043E\u0440\u0443")).addOption("daily", t("\u0429\u043E\u0434\u043D\u044F")).addOption("weekly", t("\u0429\u043E\u0442\u0438\u0436\u043D\u044F")).addOption("monthly", t("\u0429\u043E\u043C\u0456\u0441\u044F\u0446\u044F"));
+    dd.setValue(d.rec.freq).onChange((v) => {
+      d.rec.freq = v;
+      rerender();
+    });
+  });
+  if (d.rec.freq !== "none") {
+    new obsidian4.Setting(container).setName(t("\u041A\u043E\u0436\u043D\u0456 N")).addText((c) => c.setValue(String(d.rec.interval)).onChange((v) => d.rec.interval = Math.max(1, Number(v) || 1)));
+  }
+  if (d.rec.freq === "weekly") {
+    const s = new obsidian4.Setting(container).setName(t("\u0414\u043D\u0456 \u0442\u0438\u0436\u043D\u044F"));
+    WD_UA.forEach((w, i) => s.addButton((b) => {
+      b.setButtonText(w);
+      if (d.rec.weekdays.includes(i)) b.setCta();
+      b.onClick(() => {
+        d.rec.weekdays = d.rec.weekdays.includes(i) ? d.rec.weekdays.filter((x) => x !== i) : [...d.rec.weekdays, i];
+        rerender();
+      });
+    }));
+  }
 }
-
-// priority + tags + group
 function buildAttrFields(container, d, tags, groups) {
-    new obsidian.Setting(container).setName(t('Пріоритет'))
-        .addDropdown(dd => { dd.addOption('', '—'); priorityKeys.forEach(k => dd.addOption(k, k)); dd.setValue(d.priority || '').onChange(v => d.priority = v || null); });
-    new obsidian.Setting(container).setName(t('Група')).setDesc(t('Enter — додати'))
-        .then(s => { d._groupChips = buildChips(s.controlEl, d.group ? [d.group] : [], groups, true, t('група')); });
-    new obsidian.Setting(container).setName(t('Теги')).setDesc(t('Enter — додати'))
-        .then(s => { d._tagChips = buildChips(s.controlEl, d.tags, tags, false, t('+ тег')); });
+  new obsidian4.Setting(container).setName(t("\u041F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442")).addDropdown((dd) => {
+    dd.addOption("", "\u2014");
+    priorityKeys.forEach((k) => dd.addOption(k, k));
+    dd.setValue(d.priority || "").onChange((v) => d.priority = v || null);
+  });
+  new obsidian4.Setting(container).setName(t("\u0413\u0440\u0443\u043F\u0430")).setDesc(t("Enter \u2014 \u0434\u043E\u0434\u0430\u0442\u0438")).then((s) => {
+    d._groupChips = buildChips(s.controlEl, d.group ? [d.group] : [], groups, true, t("\u0433\u0440\u0443\u043F\u0430"));
+  });
+  new obsidian4.Setting(container).setName(t("\u0422\u0435\u0433\u0438")).setDesc(t("Enter \u2014 \u0434\u043E\u0434\u0430\u0442\u0438")).then((s) => {
+    d._tagChips = buildChips(s.controlEl, d.tags, tags, false, t("+ \u0442\u0435\u0433"));
+  });
 }
-
-// Floating popover anchored to an element; closes on outside click / Esc
 function openPopover(anchorEl, build) {
-    const pop = document.body.createEl('div', { cls: 'tc-popover' });
-    const close = () => {
-        document.removeEventListener('mousedown', onDoc, true);
-        document.removeEventListener('keydown', onKey, true);
-        pop.remove();
-    };
-    const onDoc = e => { if (!pop.contains(e.target) && !anchorEl.contains(e.target)) close(); };
-    const onKey = e => { if (e.key === 'Escape') close(); };
-    build(pop, close);
-    const a = anchorEl.getBoundingClientRect();
-    const pr = pop.getBoundingClientRect();
-    let left = Math.max(8, Math.min(a.right - pr.width, window.innerWidth - pr.width - 8));
-    let top = a.bottom + 4;
-    if (top + pr.height > window.innerHeight - 8) top = Math.max(8, a.top - pr.height - 4);
-    pop.style.left = `${left}px`;
-    pop.style.top = `${top}px`;
-    setTimeout(() => {
-        document.addEventListener('mousedown', onDoc, true);
-        document.addEventListener('keydown', onKey, true);
-    }, 0);
-    return close;
+  const pop = document.body.createEl("div", { cls: "tc-popover" });
+  const close = () => {
+    document.removeEventListener("mousedown", onDoc, true);
+    document.removeEventListener("keydown", onKey, true);
+    pop.remove();
+  };
+  const onDoc = (e) => {
+    if (!pop.contains(e.target) && !anchorEl.contains(e.target)) close();
+  };
+  const onKey = (e) => {
+    if (e.key === "Escape") close();
+  };
+  build(pop, close);
+  const a = anchorEl.getBoundingClientRect();
+  const pr = pop.getBoundingClientRect();
+  let left = Math.max(8, Math.min(a.right - pr.width, window.innerWidth - pr.width - 8));
+  let top = a.bottom + 4;
+  if (top + pr.height > window.innerHeight - 8) top = Math.max(8, a.top - pr.height - 4);
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+  setTimeout(() => {
+    document.addEventListener("mousedown", onDoc, true);
+    document.addEventListener("keydown", onKey, true);
+  }, 0);
+  return close;
 }
-
-// Inline composer: text field with two icons inside it; options open in popovers
-function renderTaskComposer(app, plugin, container, date, onCreate) {
-    const d = newComposerDraft(date);
-    const field = container.createEl('div', { cls: 'tc-composer-field' });
-    const input = field.createEl('input', { cls: 'tc-input tc-composer-input' });
-    input.type = 'text';
-    input.placeholder = t('Нова задача…');
-
-    const create = async () => {
-        d.text = input.value.trim();
-        if (!d.text) return;
-        await createFromDraft(app, plugin, d);
-        onCreate();
-    };
-    input.addEventListener('keydown', e => { if (e.key === 'Enter') create(); });
-
-    let tags = [], groups = [], loaded = false;
-    const ensure = async () => { if (!loaded) { tags = collectTags(app); groups = await collectGroups(app, plugin.settings); loaded = true; } };
-    const footer = (pop, close) => new obsidian.Setting(pop).addButton(b => b.setButtonText(t('Готово')).setCta().onClick(() => { syncDraftChips(d); close(); }));
-
-    const icons = field.createEl('div', { cls: 'tc-composer-icons' });
-    const cal = icons.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(cal, 'calendar-clock');
-    cal.setAttribute('aria-label', 'Дата / час / повтор');
-    cal.onclick = async () => { await ensure(); openPopover(cal, (pop, close) => { const r = () => { pop.empty(); buildScheduleFields(pop, d, r); footer(pop, close); }; r(); }); };
-    const more = icons.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(more, 'sliders-horizontal');
-    more.setAttribute('aria-label', 'Теги / пріоритет / група');
-    more.onclick = async () => { await ensure(); syncDraftChips(d); openPopover(more, (pop, close) => { buildAttrFields(pop, d, tags, groups); footer(pop, close); }); };
-
-    return field;
+function renderTaskComposer(app, plugin, container, date, onCreate, defaults) {
+  const d = newComposerDraft(date);
+  if (defaults) {
+    if (defaults.group) d.group = defaults.group;
+    if (defaults.tags) d.tags = defaults.tags.slice();
+  }
+  const field = container.createEl("div", { cls: "tc-composer-field" });
+  const input = field.createEl("input", { cls: "tc-input tc-composer-input" });
+  input.type = "text";
+  input.placeholder = t("\u041D\u043E\u0432\u0430 \u0437\u0430\u0434\u0430\u0447\u0430\u2026");
+  const create = async () => {
+    d.text = input.value.trim();
+    if (!d.text) return;
+    await createFromDraft(app, plugin, d);
+    onCreate();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") create();
+  });
+  let tags = [], groups = [], loaded = false;
+  const ensure = async () => {
+    if (!loaded) {
+      tags = collectTags(app);
+      groups = await collectGroups(app, plugin.settings);
+      loaded = true;
+    }
+  };
+  const footer = (pop, close) => new obsidian4.Setting(pop).addButton((b) => b.setButtonText(t("\u0413\u043E\u0442\u043E\u0432\u043E")).setCta().onClick(() => {
+    syncDraftChips(d);
+    close();
+  }));
+  const icons = field.createEl("div", { cls: "tc-composer-icons" });
+  const cal = icons.createEl("button", { cls: "clickable-icon" });
+  obsidian4.setIcon(cal, "calendar-clock");
+  cal.setAttribute("aria-label", t("\u0414\u0430\u0442\u0430 / \u0447\u0430\u0441 / \u043F\u043E\u0432\u0442\u043E\u0440"));
+  cal.onclick = async () => {
+    await ensure();
+    openPopover(cal, (pop, close) => {
+      const r = () => {
+        pop.empty();
+        buildScheduleFields(pop, d, r);
+        footer(pop, close);
+      };
+      r();
+    });
+  };
+  const more = icons.createEl("button", { cls: "clickable-icon" });
+  obsidian4.setIcon(more, "sliders-horizontal");
+  more.setAttribute("aria-label", t("\u0422\u0435\u0433\u0438 / \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442 / \u0433\u0440\u0443\u043F\u0430"));
+  more.onclick = async () => {
+    await ensure();
+    syncDraftChips(d);
+    openPopover(more, (pop, close) => {
+      buildAttrFields(pop, d, tags, groups);
+      footer(pop, close);
+    });
+  };
+  return field;
 }
-
-// Floating "+" button (mobile) that opens the full create modal
-function renderFab(app, plugin, container, date) {
-    const fab = container.createEl('button', { cls: 'tc-fab' });
-    obsidian.setIcon(fab, 'plus');
-    fab.setAttribute('aria-label', 'Нова задача');
-    fab.onclick = () => new TaskCreateModal(app, plugin, date).open();
-}
-
-// Inline #tag / @group autocomplete on a textarea. Calls onPick(sig, value) when a token
-// is committed (the token text is first stripped from the textarea). Shared by the create
-// modal's smart description and the task editor.
 function attachInlineTagAutocomplete(ta, tags, groups, onPick) {
-    let sug = null, items = [], active = -1, token = null;
-    const close = () => { if (sug) sug.remove(); sug = null; items = []; active = -1; token = null; };
-    const commit = val => {
-        if (!token || !val) { close(); return; }
-        const sig = token.sig;
-        ta.value = (ta.value.slice(0, token.start) + ta.value.slice(token.end)).replace(/[ \t]{2,}/g, ' ');
-        ta.selectionStart = ta.selectionEnd = token.start;
-        close();
-        onPick(sig, val);
-        ta.focus();
-    };
-    const render = () => {
-        if (sug) sug.remove();
-        sug = document.body.createEl('div', { cls: 'tc-suggest' });
-        items.forEach((it, i) => {
-            const row = sug.createEl('div', { cls: i === active ? 'tc-suggest-item is-active' : 'tc-suggest-item' });
-            row.setText(token.sig + it);
-            row.onmousedown = e => { e.preventDefault(); commit(it); };
-        });
-        const r = ta.getBoundingClientRect();
-        sug.style.left = `${r.left}px`; sug.style.top = `${r.bottom + 2}px`; sug.style.minWidth = `${Math.min(r.width, 280)}px`;
-    };
-    const update = () => {
-        const m = ta.value.slice(0, ta.selectionStart).match(/([#@])([^\s#@]*)$/);
-        if (!m) { close(); return; }
-        token = { sig: m[1], start: ta.selectionStart - m[0].length, end: ta.selectionStart };
-        items = (m[1] === '#' ? tags : groups).filter(x => x.toLowerCase().includes(m[2].toLowerCase())).slice(0, 8);
-        active = items.length ? 0 : -1;
-        if (items.length) render(); else close();
-    };
-    ta.addEventListener('input', update);
-    ta.addEventListener('keydown', e => {
-        if (sug && items.length) {
-            if (e.key === 'ArrowDown') { e.preventDefault(); active = (active + 1) % items.length; render(); return; }
-            if (e.key === 'ArrowUp') { e.preventDefault(); active = (active - 1 + items.length) % items.length; render(); return; }
-            if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); commit(items[active]); return; }
-            if (e.key === 'Escape') { close(); return; }
-        }
-        if (e.key === ' ' && token) { const frag = ta.value.slice(token.start + 1, ta.selectionStart); if (frag) { e.preventDefault(); commit(frag); } }
-    });
-    ta.addEventListener('blur', () => setTimeout(close, 150));
-}
-
-// Description textarea with inline #tag / @group autocomplete; picks become chips below.
-function buildSmartDescription(container, d, tags, groups) {
-    const wrap = container.createEl('div', { cls: 'tc-smartdesc' });
-    const ta = wrap.createEl('textarea', { cls: 'tc-editor-desc tc-smartdesc-input' });
-    ta.rows = 4;
-    ta.placeholder = t('Опис, теги #, групи @…');
-    ta.value = d.descText || '';
-
-    const chipsWrap = wrap.createEl('div', { cls: 'tc-chips tc-smartdesc-chips' });
-    const drawChips = () => {
-        chipsWrap.empty();
-        const make = (val, kind) => {
-            const chip = chipsWrap.createEl('span', { cls: kind === 'group' ? 'tc-chip tc-chip-group' : 'tc-chip' });
-            chip.createSpan({ text: (kind === 'group' ? '@' : '#') + val });
-            chip.createEl('span', { text: '✕', cls: 'tc-chip-x' }).onclick = () => {
-                if (kind === 'group') d.group = null; else d.tags = d.tags.filter(x => x !== val);
-                drawChips();
-            };
-        };
-        d.tags.forEach(tg => make(tg, 'tag'));
-        if (d.group) make(d.group, 'group');
-        chipsWrap.toggleClass('tc-empty', !d.tags.length && !d.group);
-    };
-    drawChips();
-    ta.addEventListener('input', () => d.descText = ta.value);
-    attachInlineTagAutocomplete(ta, tags, groups, (sig, val) => {
-        if (sig === '#') { if (!d.tags.includes(val)) d.tags.push(val); } else d.group = val;
-        d.descText = ta.value; drawChips();
-    });
-}
-
-// Date / time picker with quick buttons (Today / Tomorrow / Next Monday)
-class DatePickerModal extends obsidian.Modal {
-    constructor(app, d, onDone) { super(app); this.d = d; this.onDone = onDone; }
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.addClass('tc-editor');
-        contentEl.createEl('h3', { text: t('Дата та час') });
-        new obsidian.Setting(contentEl).setName(t('Дата'))
-            .addText(c => { c.inputEl.type = 'date'; c.setValue(this.d.date || todayISO()).onChange(v => this.d.date = v); });
-        new obsidian.Setting(contentEl).setName(t('Час'))
-            .addText(c => c.setPlaceholder('09:00').setValue(this.d.start || '').onChange(v => this.d.start = v.trim() || null))
-            .addText(c => c.setPlaceholder('10:30').setValue(this.d.end || '').onChange(v => this.d.end = v.trim() || null));
-        const done = () => { this.close(); if (this.onDone) this.onDone(); };
-        const quick = contentEl.createEl('div', { cls: 'tc-quick-dates' });
-        const pick = iso => { this.d.date = iso; done(); };
-        quick.createEl('button', { text: t('Сьогодні') }).onclick = () => pick(todayISO());
-        quick.createEl('button', { text: t('Завтра') }).onclick = () => pick(toISO(addDays(new Date(), 1)));
-        quick.createEl('button', { text: t('Наступного понеділка') }).onclick = () => pick(toISO(nextMonday()));
-        const footer = contentEl.createEl('div', { cls: 'tc-modal-btns' });
-        footer.createEl('button', { text: t('Очистити') }).onclick = () => { this.d.start = null; this.d.end = null; done(); };
-        footer.createEl('button', { text: t('Готово'), cls: 'mod-cta' }).onclick = done;
+  let sug = null, items = [], active = -1, token = null;
+  const close = () => {
+    if (sug) sug.remove();
+    sug = null;
+    items = [];
+    active = -1;
+    token = null;
+  };
+  const commit = (val) => {
+    if (!token || !val) {
+      close();
+      return;
     }
-    onClose() { this.contentEl.empty(); }
-}
-
-// Custom recurrence builder (wraps the shared schedule form, no raw/dates)
-class RecurrenceCustomModal extends obsidian.Modal {
-    constructor(app, rec, onDone) { super(app); this.rec = rec; this.onDone = onDone; if (this.rec.freq === 'none') this.rec.freq = 'daily'; }
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.addClass('tc-editor');
-        contentEl.createEl('h3', { text: t('Кастомне повторення') });
-        const form = contentEl.createEl('div');
-        const r = () => { form.empty(); buildRecurrenceFields(form, this.rec, r, { hideRaw: true, hideDates: true }); };
-        r();
-        const footer = contentEl.createEl('div', { cls: 'tc-modal-btns' });
-        footer.createEl('button', { text: t('Скасувати') }).onclick = () => this.close();
-        footer.createEl('button', { text: t('Готово'), cls: 'mod-cta' }).onclick = () => { this.close(); if (this.onDone) this.onDone(); };
-    }
-    onClose() { this.contentEl.empty(); }
-}
-
-// Full create modal (Ctrl+P "Створити задачу" + mobile FAB) — title, smart description, quick-param row
-class TaskCreateModal extends obsidian.Modal {
-    constructor(app, plugin, date) { super(app); this.plugin = plugin; this.d = newComposerDraft(date || todayISO()); }
-    async onOpen() {
-        this.tags = collectTags(this.app);
-        this.groups = await collectGroups(this.app, this.plugin.settings);
-        this.render();
-    }
-    render() {
-        const { contentEl } = this;
-        contentEl.empty();
-        contentEl.addClass('tc-editor', 'tc-create');
-
-        const name = contentEl.createEl('input', { cls: 'tc-title-input' });
-        name.placeholder = t('Назва задачі');
-        name.value = this.d.text;
-        name.addEventListener('input', () => this.d.text = name.value);
-        name.addEventListener('keydown', e => { if (e.key === 'Enter') this.submit(); });
-        setTimeout(() => name.focus(), 0);
-
-        buildSmartDescription(contentEl, this.d, this.tags, this.groups);
-
-        const row = contentEl.createEl('div', { cls: 'tc-quick-row' });
-        const summary = contentEl.createEl('div', { cls: 'tc-quick-summary' });
-        let statusBtn, prioBtn;
-        const updateLabels = () => {
-            const parts = [];
-            if (this.d.date) parts.push('📅 ' + humanDate(this.d.date) + (this.d.start ? ' ' + this.d.start : ''));
-            if (this.d.rec && this.d.rec.freq && this.d.rec.freq !== 'none') parts.push('↻ ' + describeRule(ruleFromRecDraft(this.d.rec)));
-            summary.setText(parts.join('   ·   '));
-            // status icon reflects todo / done / cancelled
-            obsidian.setIcon(statusBtn, this.d.status === 'done' ? 'check-circle' : this.d.status === 'cancelled' ? 'x-circle' : 'circle');
-            statusBtn.style.color = this.d.status === 'done' ? 'var(--color-green)' : this.d.status === 'cancelled' ? 'var(--color-red)' : '';
-            statusBtn.toggleClass('is-set', this.d.status !== 'todo');
-            // priority icon reflects the selected priority colour
-            prioBtn.style.color = this.d.priority ? prioColor(this.d.priority) : '';
-            prioBtn.toggleClass('is-set', !!this.d.priority);
-        };
-        const iconBtn = (icon, label, handler) => {
-            const b = row.createEl('button', { cls: 'clickable-icon' });
-            obsidian.setIcon(b, icon);
-            b.setAttribute('aria-label', label);
-            b.onclick = handler;
-            return b;
-        };
-
-        statusBtn = iconBtn('circle', t('Статус'), e => {
-            const menu = new obsidian.Menu();
-            [['todo', t('Не виконана')], ['done', t('Виконана')], ['cancelled', t('Відмінена')]].forEach(o =>
-                menu.addItem(it => it.setTitle(o[1]).setChecked(this.d.status === o[0]).onClick(() => { this.d.status = o[0]; updateLabels(); })));
-            menu.showAtMouseEvent(e);
-        });
-        prioBtn = iconBtn('alert-circle', t('Пріоритет'), e => {
-            const menu = new obsidian.Menu();
-            menu.addItem(it => it.setTitle('—').setChecked(!this.d.priority).onClick(() => { this.d.priority = null; updateLabels(); }));
-            priorityKeys.forEach(k => menu.addItem(it => it.setTitle(k).setChecked(this.d.priority === k).onClick(() => { this.d.priority = k; updateLabels(); })));
-            menu.showAtMouseEvent(e);
-        });
-        iconBtn('calendar', t('Дата виконання'), () => new DatePickerModal(this.app, this.d, updateLabels).open());
-        iconBtn('repeat', t('Повторення'), e => {
-            const menu = new obsidian.Menu();
-            const base = parseISO(this.d.date || todayISO());
-            const setRec = rec => { Object.assign(this.d.rec, rec); updateLabels(); };
-            menu.addItem(it => it.setTitle(t('Без повтору')).onClick(() => setRec({ freq: 'none' })));
-            menu.addItem(it => it.setTitle(t('Щоденно')).onClick(() => setRec({ freq: 'daily', interval: 1 })));
-            menu.addItem(it => it.setTitle(t('Щотижнево (поточний день)')).onClick(() => setRec({ freq: 'weekly', interval: 1, weekdays: [(base.getDay() + 6) % 7] })));
-            menu.addItem(it => it.setTitle(t('Щотижнево у робочі дні (Пн–Пт)')).onClick(() => setRec({ freq: 'weekly', interval: 1, weekdays: [0, 1, 2, 3, 4] })));
-            menu.addItem(it => it.setTitle(t('Щомісячно (поточне число)')).onClick(() => setRec({ freq: 'monthly', interval: 1, monthMode: 'day', monthday: base.getDate() })));
-            menu.addItem(it => it.setTitle(t('Щорічно (поточний день)')).onClick(() => setRec({ freq: 'yearly', interval: 1, month: base.getMonth(), monthMode: 'day', monthday: base.getDate() })));
-            menu.addSeparator();
-            menu.addItem(it => it.setTitle(t('Кастомне налаштування…')).onClick(() => new RecurrenceCustomModal(this.app, this.d.rec, updateLabels).open()));
-            menu.showAtMouseEvent(e);
-        });
-
-        updateLabels();
-
-        const footer = contentEl.createEl('div', { cls: 'tc-modal-btns' });
-        footer.createEl('button', { text: t('Скасувати') }).onclick = () => this.close();
-        footer.createEl('button', { text: t('Зберегти'), cls: 'mod-cta' }).onclick = () => this.submit();
-    }
-    async submit() {
-        this.d.text = (this.contentEl.querySelector('.tc-title-input').value || '').trim();
-        if (!this.d.text) { new obsidian.Notice(t('Введіть назву задачі')); return; }
-        await createFromDraft(this.app, this.plugin, this.d);
-        this.plugin.refreshViews();
-        this.close();
-    }
-    onClose() { this.contentEl.empty(); }
-}
-
-// Habit create modal (Ctrl+P "Створити звичку")
-class HabitCreateModal extends obsidian.Modal {
-    constructor(app, plugin) { super(app); this.plugin = plugin; this.d = newHabitDraft(); }
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.addClass('tc-editor');
-        contentEl.createEl('h3', { text: t('Нова звичка') });
-        const form = contentEl.createEl('div');
-        const r = () => { form.empty(); buildHabitFields(form, this.d, r); };
-        r();
-        const footer = contentEl.createEl('div', { cls: 'tc-modal-btns' });
-        footer.createEl('button', { text: t('Скасувати') }).onclick = () => this.close();
-        footer.createEl('button', { text: t('Створити'), cls: 'mod-cta' }).onclick = async () => {
-            const h = validateHabit(this.d);
-            if (!h) return;
-            this.plugin.settings.habits.push(h);
-            await this.plugin.saveSettings();
-            this.close();
-        };
-    }
-    onClose() { this.contentEl.empty(); }
-}
-
-// ─── Edit modals for recurrences & habits (creation lives in quick-create) ─────
-
-class RecurrenceEditModal extends obsidian.Modal {
-    constructor(app, plugin, rule, onSave) {
-        super(app);
-        this.plugin = plugin;
-        this.rule = rule;
-        this.onSave = onSave;
-        this.draft = {
-            raw: rule.raw, freq: rule.freq, interval: rule.interval || 1,
-            weekdays: (rule.weekdays || []).slice(), monthday: rule.monthday || '',
-            start: rule.start, end: rule.end || ''
-        };
-    }
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.addClass('tc-editor');
-        contentEl.createEl('h3', { text: t('Редагувати регулярну задачу') });
-        const form = contentEl.createEl('div');
-        const r = () => { form.empty(); buildRecurrenceFields(form, this.draft, r); };
-        r();
-        const footer = contentEl.createEl('div', { cls: 'tc-modal-btns' });
-        footer.createEl('button', { text: t('Скасувати') }).onclick = () => this.close();
-        footer.createEl('button', { text: t('Зберегти'), cls: 'mod-cta' }).onclick = async () => {
-            const updated = validateRecurrence(this.draft);
-            if (!updated) return;
-            updated.id = this.rule.id;
-            const arr = this.plugin.settings.recurrences;
-            const i = arr.findIndex(x => x.id === this.rule.id);
-            if (i >= 0) arr[i] = updated;
-            await this.plugin.saveSettings();
-            this.close();
-            if (this.onSave) this.onSave();
-        };
-    }
-    onClose() { this.contentEl.empty(); }
-}
-
-class HabitEditModal extends obsidian.Modal {
-    constructor(app, plugin, habit, onSave) {
-        super(app);
-        this.plugin = plugin;
-        this.habit = habit;
-        this.onSave = onSave;
-        this.draft = { name: habit.name, property: habit.property, unit: habit.unit || '', type: habit.type, emoji: habit.emoji || '', color: habit.color || '#9aa0a6', goal: habit.goal || '' };
-    }
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.addClass('tc-editor');
-        contentEl.createEl('h3', { text: t('Редагувати звичку') });
-        const form = contentEl.createEl('div');
-        const r = () => { form.empty(); buildHabitFields(form, this.draft, r); };
-        r();
-        const footer = contentEl.createEl('div', { cls: 'tc-modal-btns' });
-        footer.createEl('button', { text: t('Скасувати') }).onclick = () => this.close();
-        footer.createEl('button', { text: t('Зберегти'), cls: 'mod-cta' }).onclick = async () => {
-            const updated = validateHabit(this.draft);
-            if (!updated) return;
-            updated.id = this.habit.id;
-            const arr = this.plugin.settings.habits;
-            const i = arr.findIndex(x => x.id === this.habit.id);
-            if (i >= 0) arr[i] = updated;
-            await this.plugin.saveSettings();
-            this.close();
-            if (this.onSave) this.onSave();
-        };
-    }
-    onClose() { this.contentEl.empty(); }
-}
-
-// ─── Shared rendering ────────────────────────────────────────────────────────
-
-// Plain standard checkbox
-function makeCheckbox(parent, checked, onChange, cls) {
-    const input = parent.createEl('input', cls ? { cls } : {});
-    input.type = 'checkbox';
-    input.checked = checked;
-    input.addEventListener('change', () => { if (onChange) onChange(input.checked); });
-    return input;
-}
-
-// Checkbox that renders an ✕ for cancelled tasks ([-]) instead of a check/dash
-function makeStatusCheckbox(parent, task, onChange, cls) {
-    if (task.cancelled) {
-        const box = parent.createEl('span', { cls: cls ? `tc-xbox ${cls}` : 'tc-xbox', text: '✕' });
-        box.addEventListener('click', e => { e.stopPropagation(); onChange(true); });
-        return box;
-    }
-    return makeCheckbox(parent, task.done, onChange, cls);
-}
-
-function tintBadge(el, color) {
-    if (!color) return;
-    el.style.background = color;
-    el.style.color = '#fff';
-}
-
-// Tint a calendar card (month bar / timeline event) per colorBy + optional priority dot
-function applyCardColor(el, task, colorBy, priorityDot) {
-    const base = cardColor(task, colorBy);
-    if (base) {
-        el.style.background = `color-mix(in srgb, ${base} 32%, var(--background-primary))`;
-        el.style.borderLeftColor = base;
-    }
-    if (priorityDot && colorBy !== 'priority' && task.priority) {
-        el.createEl('span', { cls: 'tc-prio-dot' }).style.background = prioColor(task.priority);
-    }
-}
-
-function renderBadges(container, task, s) {
-    s = s || {};
-    if (task.priority && s.showPriority !== false) {
-        const b = container.createEl('span', { text: task.priority, cls: 'tc-badge' });
-        tintBadge(b, prioColor(task.priority));
-    }
-    if (task.group && s.showGroups !== false) {
-        const b = container.createEl('span', { text: `@${task.group}`, cls: 'tc-badge tc-group' });
-        tintBadge(b, COLORS.groups[task.group]);
-    }
-    if (s.showTags !== false) {
-        for (const tag of task.tags) {
-            const b = container.createEl('span', { text: `#${tag}`, cls: 'tc-badge tc-tag' });
-            tintBadge(b, COLORS.tags[tag]);
-        }
-    }
-}
-
-// A flat task row. The whole card opens the editor; no inline expand (subtasks/comments live in the editor).
-function renderTaskRow(app, container, task, refresh, opts = {}) {
-    const s = opts.settings || {};
-    const wrapper = container.createEl('div', { cls: 'tc-item' });
-    const row = wrapper.createEl('div', { cls: 'tc-row' });
-    if (task.priority) row.style.borderLeftColor = prioColor(task.priority);
-    if (task.start) row.addClass('tc-event');
-    if (task.virtual) row.addClass('tc-virtual');
-    if (task.done) row.addClass('tc-row-done');
-    if (task.cancelled) row.addClass('tc-cancelled');
-
-    const subs = task.subtasks || [];
-
-    const cb = makeStatusCheckbox(row, task, async checked => {
-        if (task.virtual) await materializeVirtual(app, task, checked, s);
-        else if (subs.length) await toggleTaskCascade(app, task.file, task, checked);
-        else await toggleTask(app, task.file, task.line, checked);
-        await refresh();
-    }, 'tc-cb');
-    cb.onclick = e => e.stopPropagation();
-
-    // right-click → set status (real tasks only)
-    if (!task.virtual && task.file) {
-        row.addEventListener('contextmenu', e => {
-            e.preventDefault();
-            const menu = new obsidian.Menu();
-            menu.addItem(i => i.setTitle(t('Виконано')).setChecked(!!task.done)
-                .onClick(async () => { await setTaskStatus(app, task.file, task.line, 'done'); await refresh(); }));
-            menu.addItem(i => i.setTitle(t('Скасовано')).setChecked(!!task.cancelled)
-                .onClick(async () => { await setTaskStatus(app, task.file, task.line, 'cancelled'); await refresh(); }));
-            menu.addItem(i => i.setTitle(t('Не виконано')).setChecked(!task.done && !task.cancelled)
-                .onClick(async () => { await setTaskStatus(app, task.file, task.line, 'todo'); await refresh(); }));
-            menu.showAtMouseEvent(e);
-        });
-    }
-
-    const main = row.createEl('div', { cls: 'tc-row-main' });
-    const top = main.createEl('div', { cls: 'tc-row-top' });
-    if (task.recId) top.createEl('span', { text: '🔁', cls: 'tc-rec' });
-    top.createEl('span', { text: task.text || '(порожня задача)', cls: 'tc-label' });
-
-    if (subs.length) {
-        const done = subs.filter(x => x.done).length;
-        const prog = top.createEl('span', { cls: 'tc-progress' });
-        prog.createEl('span', { text: `${done}/${subs.length}`, cls: 'tc-progress-num' });
-        prog.createEl('span', { cls: 'tc-progress-bar' })
-            .createEl('span', { cls: 'tc-progress-fill' }).style.width = `${Math.round(done / subs.length * 100)}%`;
-    }
-    if (opts.overdue && task.date) {
-        // overdue rows: show the (red) date at the right instead of the time
-        const d = parseISO(task.date);
-        top.createEl('span', { text: `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`, cls: 'tc-date-chip tc-overdue-date' });
-    } else {
-        if (opts.showDate && task.date) top.createEl('span', { text: task.date, cls: 'tc-date-chip' });
-        if (task.start) top.createEl('span', { text: task.end ? `${task.start}–${task.end}` : task.start, cls: 'tc-time' });
-    }
-
-    renderBadges(main.createEl('div', { cls: 'tc-badges' }), task, s);
-
-    if (opts.showDetails && task.desc) main.createEl('div', { text: task.desc, cls: 'tc-desc-preview' });
-
-    // whole card → editor (real tasks); virtual → materialize first
-    row.addClass('tc-clickable');
-    if (!task.virtual && task.file) {
-        row.onclick = () => new TaskEditorModal(app, task, refresh).open();
-    } else if (task.virtual) {
-        row.onclick = async () => { await materializeVirtual(app, task, false, s); await refresh(); };
-    }
-
-    return wrapper;
-}
-
-// Horizontal strip of incomplete habits as emoji chips (tap → completion modal). Returns true if rendered.
-function renderHabitStrip(app, container, habits, vals, iso, onDone) {
-    const incomplete = habits.filter(h => !h.auto && vals[h.id] <= 0);
-    if (!incomplete.length) return false;
-    const strip = container.createEl('div', { cls: 'tc-smart-habits' });
-    for (const h of incomplete) {
-        const b = strip.createEl('button', { cls: 'tc-habit-chip' });
-        if (h.color) { b.style.borderColor = h.color; b.style.color = h.color; }
-        b.createSpan({ text: h.emoji || '•', cls: 'tc-habit-chip-emoji' });
-        b.createSpan({ text: h.name, cls: 'tc-habit-chip-name' });
-        b.onclick = () => new HabitCompleteModal(app, h, iso, onDone).open();
-    }
-    return true;
-}
-
-function quickAdd(app, container, dateStr, refresh, placeholder, settings) {
-    const wrap = container.createEl('div', { cls: 'tc-add-row' });
-    const input = wrap.createEl('input', { cls: 'tc-input' });
-    input.type = 'text';
-    input.placeholder = placeholder || 'Нова задача...';
-
-    const doAdd = async () => {
-        const text = input.value.trim();
-        if (!text) return;
-        const file = await getOrCreateDateFile(app, dateStr);
-        await addTask(app, file, text, settings);
-        await refresh();
-    };
-    input.addEventListener('keydown', e => { if (e.key === 'Enter') doAdd(); });
-    return wrap;
-}
-
-// ─── List View ───────────────────────────────────────────────────────────────
-
-class ListView extends obsidian.ItemView {
-    constructor(leaf, plugin) {
-        super(leaf);
-        this.plugin = plugin;
-        this.groupBy = 'date';
-        this.sortBy = 'priority';
-        this.hideDone = false;
-        this.range = 'all';        // all | today | 7 | 30
-        this.overdue = true;       // show overdue (past, undone) tasks
-        this.showDetails = false;  // show a faded description preview per task
-        this.showHabits = true;    // show today's habits at the top
-        this.expanded = new Set();
-    }
-
-    getViewType() { return LIST_VIEW; }
-    getDisplayText() { return t('Список задач'); }
-    getIcon() { return 'list-checks'; }
-
-    async onOpen() { await this.refresh(); }
-    onResize() { const c = compactMode(this); if (c !== this._lastCompact) this.refresh(); }
-
-    async refresh() {
-        // 1. load data first (async) — no DOM cleared yet, so the pane never flashes empty
-        const settings = this.plugin.settings;
-        const map = await loadAllTasks(this.app);
-        addVirtuals(map, settings.recurrences, todayISO(), toISO(addDays(new Date(), LIST_HORIZON_DAYS)));
-
-        const todayStr = todayISO();
-        const rangeEnd = this.range === 'all' ? null
-            : toISO(addDays(new Date(), (this.range === 'today' ? 1 : Number(this.range)) - 1));
-
-        let tasks = [];
-        for (const { tasks: ts } of map.values()) tasks = tasks.concat(ts);
-        tasks = tasks.filter(t => {
-            const overdue = t.date < todayStr && !t.done && !t.cancelled;
-            if (overdue) return this.overdue;                 // overdue shown only when enabled
-            if (t.date < todayStr) return this.range === 'all'; // past, done → only in "all"
-            return !rangeEnd || t.date <= rangeEnd;             // today / future within range
-        });
-        if (this.hideDone) tasks = tasks.filter(t => !t.done && !t.cancelled);
-
-        // today's habit values (word-count needs async)
-        const habits = this.showHabits ? habitList(settings) : [];
-        const habitVals = {};
-        for (const h of habits) habitVals[h.id] = await getHabitValue(this.app, todayStr, h);
-
-        // 2. rebuild DOM synchronously (single repaint)
-        const mobile = compactMode(this);
-        this._lastCompact = mobile;
-        const root = this.containerEl.children[1];
-        root.empty();
-        root.addClass('tc-pane', 'tc-listview');
-
-        this.buildToolbar(root, mobile);
-        if (habits.length) renderHabitStrip(this.app, root, habits, habitVals, todayStr, () => this.refresh());
-        if (mobile) renderFab(this.app, this.plugin, root, todayStr);
-
-        if (tasks.length === 0) {
-            root.createEl('p', { text: t('Задач не знайдено.'), cls: 'tc-empty' });
-            return;
-        }
-
-        const sortFn = this.makeSortFn();
-        const refresh = () => this.refresh();
-
-        // overdue tasks always form their own group (regardless of grouping)
-        const isOverdue = t => t.date < todayStr && !t.done && !t.cancelled;
-        const overdueTasks = tasks.filter(isOverdue);
-        const rest = overdueTasks.length ? tasks.filter(t => !isOverdue(t)) : tasks;
-
-        if (overdueTasks.length) {
-            const sec = root.createEl('div', { cls: 'tc-group tc-overdue-group' });
-            const head = sec.createEl('div', { cls: 'tc-group-head' });
-            head.createEl('span', { text: t('Протерміновані'), cls: 'tc-group-title' });
-            head.createEl('span', { text: String(overdueTasks.length), cls: 'tc-group-count' });
-            const list = sec.createEl('div', { cls: 'tc-list' });
-            overdueTasks.sort((a, b) => (a.date || '').localeCompare(b.date || '') || dayOrder(a, b))
-                .forEach(t => renderTaskRow(this.app, list, t, refresh, { overdue: true, showDetails: this.showDetails, settings }));
-        }
-
-        if (this.groupBy === 'none') {
-            const list = root.createEl('div', { cls: 'tc-list' });
-            rest.sort(sortFn).forEach(t => renderTaskRow(this.app, list, t, refresh, { showDate: true, showDetails: this.showDetails, settings }));
-            return;
-        }
-
-        const groups = this.buildGroups(rest);
-        for (const [key, items] of groups) {
-            const sec = root.createEl('div', { cls: 'tc-group' });
-            const head = sec.createEl('div', { cls: 'tc-group-head' });
-            head.createEl('span', { text: this.groupBy === 'date' ? humanDate(key) : t(key), cls: 'tc-group-title' });
-            head.createEl('span', { text: String(items.length), cls: 'tc-group-count' });
-            const list = sec.createEl('div', { cls: 'tc-list' });
-            items.sort(sortFn).forEach(t =>
-                renderTaskRow(this.app, list, t, refresh, { showDate: this.groupBy !== 'date', showDetails: this.showDetails, settings }));
-        }
-    }
-
-    buildToolbar(root, mobile) {
-        const bar = root.createEl('div', { cls: 'tc-toolbar' });
-        this.iconBtn(bar, 'calendar', 'Період', e => this.rangeMenu(e));
-        if (!mobile) renderTaskComposer(this.app, this.plugin, bar, todayISO(), () => this.refresh());
-        else bar.createEl('div', { cls: 'tc-toolbar-spacer' });
-        this.iconBtn(bar, 'arrow-down-up', 'Сортування та групування', e => this.sortMenu(e));
-        this.iconBtn(bar, 'more-horizontal', 'Більше', e => this.moreMenu(e));
-    }
-
-    iconBtn(parent, icon, tip, onClick) {
-        const b = parent.createEl('button', { cls: 'clickable-icon' });
-        obsidian.setIcon(b, icon);
-        b.setAttribute('aria-label', tip);
-        b.onclick = onClick;
-        return b;
-    }
-
-    rangeMenu(e) {
-        const m = new obsidian.Menu();
-        for (const [v, l] of [['all', 'Усі'], ['today', 'Сьогодні'], ['7', 'Наступні 7 днів'], ['30', 'Наступні 30 днів']]) {
-            m.addItem(it => it.setTitle(t(l)).setChecked(this.range === v).onClick(() => { this.range = v; this.refresh(); }));
-        }
-        m.showAtMouseEvent(e);
-    }
-
-    sortMenu(e) {
-        const m = new obsidian.Menu();
-        m.addItem(it => it.setTitle(t('Групування')).setDisabled(true));
-        for (const [v, l] of [['none', 'Без груп'], ['date', 'За датою'], ['tag', 'За тегом'], ['group', 'За групою'], ['priority', 'За пріоритетом']]) {
-            m.addItem(it => it.setTitle(t(l)).setChecked(this.groupBy === v).onClick(() => { this.groupBy = v; this.refresh(); }));
-        }
-        m.addSeparator();
-        m.addItem(it => it.setTitle(t('Сортування')).setDisabled(true));
-        for (const [v, l] of [['priority', 'Пріоритет'], ['date', 'Дата'], ['time', 'Час'], ['text', 'Назва']]) {
-            m.addItem(it => it.setTitle(t(l)).setChecked(this.sortBy === v).onClick(() => { this.sortBy = v; this.refresh(); }));
-        }
-        m.showAtMouseEvent(e);
-    }
-
-    moreMenu(e) {
-        const m = new obsidian.Menu();
-        m.addItem(it => it.setTitle(t('Протерміновані')).setChecked(this.overdue).onClick(() => { this.overdue = !this.overdue; this.refresh(); }));
-        m.addItem(it => it.setTitle(t('Сховати виконані')).setChecked(this.hideDone).onClick(() => { this.hideDone = !this.hideDone; this.refresh(); }));
-        m.addItem(it => it.setTitle(t('Показувати деталі')).setChecked(this.showDetails).onClick(() => { this.showDetails = !this.showDetails; this.refresh(); }));
-        m.addItem(it => it.setTitle(t('Звички сьогодні')).setChecked(this.showHabits).onClick(() => { this.showHabits = !this.showHabits; this.refresh(); }));
-        m.showAtMouseEvent(e);
-    }
-
-    makeSortFn() {
-        if (this.sortBy === 'priority') {
-            return (a, b) => (priorityRank[b.priority] || 0) - (priorityRank[a.priority] || 0)
-                || a.text.localeCompare(b.text);
-        }
-        if (this.sortBy === 'date') {
-            return (a, b) => (a.date || '').localeCompare(b.date || '');
-        }
-        if (this.sortBy === 'time') {
-            return (a, b) => (a.date || '').localeCompare(b.date || '') || dayOrder(a, b);
-        }
-        return (a, b) => a.text.localeCompare(b.text);
-    }
-
-    buildGroups(tasks) {
-        const groups = new Map();
-        const push = (key, t) => {
-            if (!groups.has(key)) groups.set(key, []);
-            groups.get(key).push(t);
-        };
-
-        for (const t of tasks) {
-            if (this.groupBy === 'date') push(t.date, t);
-            else if (this.groupBy === 'group') push(t.group ? `@${t.group}` : 'Без групи', t);
-            else if (this.groupBy === 'priority') push(t.priority ? t.priority : 'Без пріоритету', t);
-            else if (this.groupBy === 'tag') {
-                if (t.tags.length === 0) push('Без тегів', t);
-                else t.tags.forEach(tag => push(`#${tag}`, t));
-            }
-        }
-
-        const placeholder = ['Без групи', 'Без тегів', 'Без пріоритету'];
-        const keys = [...groups.keys()].sort((a, b) => {
-            const pa = placeholder.includes(a), pb = placeholder.includes(b);
-            if (pa !== pb) return pa ? 1 : -1;
-            if (this.groupBy === 'priority') {
-                return (priorityRank[b] || 0) - (priorityRank[a] || 0);
-            }
-            return a.localeCompare(b);
-        });
-        return keys.map(k => [k, groups.get(k)]);
-    }
-}
-
-// ─── Timeline grid (week / 3-day) with drag-move, resize & cross-day move ──────
-
-const HOUR_PX = 50;                                   // pixels per hour
-let _tlDragTask = null;                               // untimed task being dragged from the all-day row
-
-function minToHHMM(min) { return `${pad(Math.floor(min / 60))}:${pad(min % 60)}`; }
-function snapStep(min, step) { return Math.round(min / step) * step; }
-function clampMin(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
-
-function renderTimeline(view, root, n) {
-    const app = view.app;
-    const settings = view.plugin.settings;
-    const refresh = () => view.refresh();
-    const map = view._map;
-    const workStart = settings.workStart ?? 8;
-    const workEnd = settings.workEnd ?? 20;
-    const step = settings.snapMinutes || 15;
-    const start = view.rangeStartDate();
-    const todayStr = todayISO();
-
-    const days = [];
-    let minStart = Infinity, maxEnd = -Infinity;
-    for (let i = 0; i < n; i++) {
-        const day = addDays(start, i);
-        const iso = toISO(day);
-        const entry = map.get(iso);
-        const tasks = entry ? entry.tasks.slice() : [];
-        for (const t of tasks) {
-            if (!t.start) continue;
-            const s = timeMin(t.start);
-            const e = t.end ? timeMin(t.end) : s + 60;
-            if (s < minStart) minStart = s;
-            if (e > maxEnd) maxEnd = e;
-        }
-        days.push({ day, iso, tasks });
-    }
-
-    // start from working hours, auto-FIT to tasks that fall outside, then honour manual expand
-    let rangeStart = workStart;
-    let rangeEnd = workEnd;
-    if (minStart !== Infinity && minStart < rangeStart * 60) rangeStart = Math.floor(minStart / 60);
-    if (maxEnd !== -Infinity && maxEnd > rangeEnd * 60) rangeEnd = Math.ceil(maxEnd / 60);
-    if (view.showEarly) rangeStart = 0;
-    if (view.showLate) rangeEnd = 24;
-    rangeStart = Math.max(0, Math.min(rangeStart, workStart));
-    rangeEnd = Math.min(24, Math.max(rangeEnd, workEnd));
-    if (rangeStart >= rangeEnd) { rangeStart = 0; rangeEnd = 24; }
-    const rangeStartMin = rangeStart * 60;
-    const rangeEndMin = rangeEnd * 60;
-    const gridH = (rangeEnd - rangeStart) * HOUR_PX;
-    const ctx = { rangeStartMin, rangeEndMin, step, refresh, colorBy: settings.colorBy, priorityDot: settings.priorityDot };
-
-    const wrap = root.createEl('div', { cls: 'tc-tl' });
-    wrap.style.setProperty('--tc-col-count', String(n));
-
-    const header = wrap.createEl('div', { cls: 'tc-tl-header' });
-    header.createEl('div', { cls: 'tc-tl-corner' });
-    for (const d of days) {
-        const h = header.createEl('div', { cls: 'tc-tl-dayhead' });
-        if (d.iso === todayStr) h.addClass('tc-col-today');
-        h.createEl('span', { text: WD_UA[(d.day.getDay() + 6) % 7], cls: 'tc-col-wd' });
-        h.createEl('span', { text: `${pad(d.day.getDate())}.${pad(d.day.getMonth() + 1)}`, cls: 'tc-col-date' });
-    }
-
-    // all-day row (untimed tasks) — add button on top, then draggable task chips
-    const allday = wrap.createEl('div', { cls: 'tc-tl-allday' });
-    allday.createEl('div', { cls: 'tc-tl-axislabel', text: t('весь день') });
-    for (const d of days) {
-        const cell = allday.createEl('div', { cls: 'tc-tl-alldaycell' });
-        quickAdd(app, cell, d.iso, refresh, t('+ задача'), settings);
-        d.tasks.filter(t => !t.start).sort(dayOrder).forEach(t => {
-            const w = renderTaskRow(app, cell, t, refresh, { settings });
-            if (!t.virtual && t.file) {
-                w.setAttribute('draggable', 'true');
-                w.addEventListener('dragstart', e => { _tlDragTask = t; e.dataTransfer.effectAllowed = 'move'; });
-                w.addEventListener('dragend', () => { _tlDragTask = null; });
-            }
-        });
-    }
-
-    if (rangeStart > 0) {
-        const s = wrap.createEl('div', { cls: 'tc-tl-strip' });
-        s.createEl('span', { text: `▾ 00:00 – ${pad(rangeStart)}:00` });
-        s.onclick = () => { view.showEarly = true; refresh(); };
-    }
-
-    const grid = wrap.createEl('div', { cls: 'tc-tl-grid' });
-    grid.style.height = `${gridH}px`;
-
-    const axis = grid.createEl('div', { cls: 'tc-tl-axis' });
-    for (let h = rangeStart; h < rangeEnd; h++) {
-        const hr = axis.createEl('div', { cls: 'tc-tl-hour' });
-        hr.style.height = `${HOUR_PX}px`;
-        hr.createEl('span', { text: `${pad(h)}:00` });
-    }
-
-    view._tlCols = [];
-    for (const d of days) {
-        const col = grid.createEl('div', { cls: 'tc-tl-col' });
-        if (d.iso === todayStr) col.addClass('tc-col-today');
-        view._tlCols.push({ iso: d.iso, el: col });
-
-        for (let h = rangeStart; h < rangeEnd; h++) {
-            col.createEl('div', { cls: 'tc-tl-hourline' }).style.height = `${HOUR_PX}px`;
-        }
-
-        const dIso = d.iso;
-        bindGridCreate(col, dIso, ctx, view);
-        // drop target for untimed tasks dragged from the all-day row
-        col.addEventListener('dragover', e => { if (_tlDragTask) { e.preventDefault(); col.addClass('tc-tl-col-drop'); } });
-        col.addEventListener('dragleave', () => col.removeClass('tc-tl-col-drop'));
-        col.addEventListener('drop', async e => {
-            e.preventDefault();
-            col.removeClass('tc-tl-col-drop');
-            const t = _tlDragTask;
-            _tlDragTask = null;
-            if (!t) return;
-            const y = e.clientY - col.getBoundingClientRect().top;
-            const min = clampMin(snapStep(rangeStartMin + y / HOUR_PX * 60, step), rangeStartMin, rangeEndMin - step);
-            if (t.date === dIso) {
-                t.start = minToHHMM(min); t.end = null;
-                await rewriteTaskLine(app, t.file, t.line, t);
-            } else {
-                await moveTaskToDay(app, t, dIso, minToHHMM(min), null, settings);
-            }
-            refresh();
-        });
-
-        const evs = d.tasks.filter(t => t.start).map(t => ({
-            t, sm: timeMin(t.start), em: t.end ? timeMin(t.end) : timeMin(t.start) + 60
-        }));
-        assignColumns(evs);
-        for (const ev of evs) renderEventCard(view, col, ev.t, ctx, ev);
-    }
-
-    if (rangeEnd < 24) {
-        const s = wrap.createEl('div', { cls: 'tc-tl-strip' });
-        s.createEl('span', { text: `▴ ${pad(rangeEnd)}:00 – 24:00` });
-        s.onclick = () => { view.showLate = true; refresh(); };
-    }
-
-    // current-time line — only when today is one of the shown days
-    if (view._nowTimer) { clearInterval(view._nowTimer); view._nowTimer = null; }
-    if (days.some(d => d.iso === todayStr)) {
-        const nowLine = grid.createEl('div', { cls: 'tc-tl-now' });
-        const place = () => {
-            const m = new Date();
-            const mm = m.getHours() * 60 + m.getMinutes();
-            if (mm < rangeStartMin || mm > rangeEndMin) { nowLine.style.display = 'none'; return; }
-            nowLine.style.display = '';
-            nowLine.style.top = `${(mm - rangeStartMin) / 60 * HOUR_PX}px`;
-        };
-        place();
-        view._nowTimer = window.setInterval(() => {
-            if (!nowLine.isConnected) { clearInterval(view._nowTimer); view._nowTimer = null; return; }
-            place();
-        }, 60000);
-    }
-}
-
-// Lay out time-overlapping events into side-by-side columns (mutates items: .col/.cols)
-function assignColumns(items) {
-    items.sort((a, b) => a.sm - b.sm || a.em - b.em);
-    let i = 0;
-    while (i < items.length) {
-        let j = i + 1;
-        let clusterEnd = items[i].em;
-        const cluster = [items[i]];
-        while (j < items.length && items[j].sm < clusterEnd) {
-            cluster.push(items[j]);
-            clusterEnd = Math.max(clusterEnd, items[j].em);
-            j++;
-        }
-        const colEnds = [];
-        for (const ev of cluster) {
-            let placed = false;
-            for (let c = 0; c < colEnds.length; c++) {
-                if (ev.sm >= colEnds[c]) { ev.col = c; colEnds[c] = ev.em; placed = true; break; }
-            }
-            if (!placed) { ev.col = colEnds.length; colEnds.push(ev.em); }
-        }
-        for (const ev of cluster) ev.cols = colEnds.length;
-        i = j;
-    }
-}
-
-// Click empty grid → create at that time; click-drag → create with a time range. Opens editor after.
-function bindGridCreate(col, dIso, ctx, view) {
-    col.addEventListener('pointerdown', e => {
-        if (e.button !== 0) return;
-        if (e.target !== col && !e.target.classList.contains('tc-tl-hourline')) return;
+    const sig = token.sig;
+    ta.value = (ta.value.slice(0, token.start) + ta.value.slice(token.end)).replace(/[ \t]{2,}/g, " ");
+    ta.selectionStart = ta.selectionEnd = token.start;
+    close();
+    onPick(sig, val);
+    ta.focus();
+  };
+  const render = () => {
+    if (sug) sug.remove();
+    sug = document.body.createEl("div", { cls: "tc-suggest" });
+    items.forEach((it, i) => {
+      const row = sug.createEl("div", { cls: i === active ? "tc-suggest-item is-active" : "tc-suggest-item" });
+      row.setText(token.sig + it);
+      row.onmousedown = (e) => {
         e.preventDefault();
-        const rect = col.getBoundingClientRect();
-        const startMin0 = ctx.rangeStartMin + (e.clientY - rect.top) / HOUR_PX * 60;
-        const preview = col.createEl('div', { cls: 'tc-tl-event tc-tl-preview' });
-        let moved = false, a = startMin0, b = startMin0;
-        const paint = () => {
-            const lo = Math.min(a, b), hi = Math.max(a, b);
-            preview.style.top = `${(lo - ctx.rangeStartMin) / 60 * HOUR_PX}px`;
-            preview.style.height = `${Math.max((hi - lo) / 60 * HOUR_PX, 6)}px`;
-        };
-        paint();
-        const onMove = ev => {
-            b = ctx.rangeStartMin + (ev.clientY - rect.top) / HOUR_PX * 60;
-            if (Math.abs(b - startMin0) > 4) moved = true;
-            paint();
-        };
-        const onUp = async () => {
-            window.removeEventListener('pointermove', onMove);
-            window.removeEventListener('pointerup', onUp);
-            preview.remove();
-            let lo = clampMin(snapStep(Math.min(a, b), ctx.step), ctx.rangeStartMin, ctx.rangeEndMin - ctx.step);
-            let hi = moved ? clampMin(snapStep(Math.max(a, b), ctx.step), lo + ctx.step, ctx.rangeEndMin) : lo + 60;
-            hi = clampMin(hi, lo + ctx.step, ctx.rangeEndMin);
-            const evName = t('Нова подія');
-            const file = await getOrCreateDateFile(view.app, dIso);
-            await addTask(view.app, file, `${minToHHMM(lo)}-${minToHHMM(hi)} ${evName}`, view.plugin.settings);
-            const entry = (await loadAllTasks(view.app)).get(dIso);
-            const created = entry && entry.tasks.find(x => x.start === minToHHMM(lo) && x.text === evName);
-            if (created) new TaskEditorModal(view.app, created, () => view.refresh()).open();
-            else view.refresh();
-        };
-        window.addEventListener('pointermove', onMove);
-        window.addEventListener('pointerup', onUp);
+        commit(it);
+      };
     });
-}
-
-function renderEventCard(view, col, task, ctx, layout) {
-    const app = view.app;
-    const sm = timeMin(task.start);
-    const em = task.end ? timeMin(task.end) : sm + 60;
-    const pxPerMin = HOUR_PX / 60;
-
-    const card = col.createEl('div', { cls: 'tc-tl-event' });
-    card.style.top = `${(sm - ctx.rangeStartMin) * pxPerMin}px`;
-    card.style.height = `${Math.max((em - sm) * pxPerMin, 30)}px`;
-    if (layout && layout.cols > 1) {
-        card.style.left = `calc(${(layout.col / layout.cols * 100).toFixed(4)}% + 1px)`;
-        card.style.width = `calc(${(100 / layout.cols).toFixed(4)}% - 2px)`;
-        card.style.right = 'auto';
+    const r = ta.getBoundingClientRect();
+    sug.style.left = `${r.left}px`;
+    sug.style.top = `${r.bottom + 2}px`;
+    sug.style.minWidth = `${Math.min(r.width, 280)}px`;
+  };
+  const update = () => {
+    const m = ta.value.slice(0, ta.selectionStart).match(/([#@])([^\s#@]*)$/);
+    if (!m) {
+      close();
+      return;
     }
-    applyCardColor(card, task, ctx.colorBy, ctx.priorityDot);
-    if (task.virtual) card.addClass('tc-virtual');   // dashed only for not-yet-materialized recurrences
-    if (task.done) card.addClass('tc-tl-done');
-    if (task.cancelled) card.addClass('tc-cancelled');
-
-    // checkbox (timed tasks)
-    const cb = makeStatusCheckbox(card, task, async checked => {
-        if (task.virtual) await materializeVirtual(app, task, checked, view.plugin.settings);
-        else await toggleTask(app, task.file, task.line, checked);
-        ctx.refresh();
-    }, 'tc-tl-cb');
-    cb.addEventListener('pointerdown', e => e.stopPropagation());
-    cb.addEventListener('click', e => e.stopPropagation());
-
-    const body = card.createEl('div', { cls: 'tc-tl-event-body' });
-    body.createEl('div', { cls: 'tc-tl-event-title', text: task.text || '(без назви)' });
-    card._timeEl = body.createEl('div', {
-        cls: 'tc-tl-event-time',
-        text: task.end ? `${task.start}–${task.end}` : task.start
-    });
-
-    if (task.virtual || !task.file) {
-        card.addClass('tc-tl-event-virtual');
-        card.onclick = async () => { await materializeVirtual(app, task, false, view.plugin.settings); ctx.refresh(); };
+    token = { sig: m[1], start: ta.selectionStart - m[0].length, end: ta.selectionStart };
+    items = (m[1] === "#" ? tags : groups).filter((x) => x.toLowerCase().includes(m[2].toLowerCase())).slice(0, 8);
+    active = items.length ? 0 : -1;
+    if (items.length) render();
+    else close();
+  };
+  ta.addEventListener("input", update);
+  ta.addEventListener("keydown", (e) => {
+    if (sug && items.length) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        active = (active + 1) % items.length;
+        render();
         return;
-    }
-
-    const topH = card.createEl('div', { cls: 'tc-tl-handle tc-tl-handle-top' });
-    const botH = card.createEl('div', { cls: 'tc-tl-handle tc-tl-handle-bottom' });
-    bindTimelineDrag(card, card, task, view, ctx, 'move');
-    bindTimelineDrag(topH, card, task, view, ctx, 'resize-top');
-    bindTimelineDrag(botH, card, task, view, ctx, 'resize-bottom');
-}
-
-function bindTimelineDrag(handleEl, card, task, view, ctx, mode) {
-    const pxPerMin = HOUR_PX / 60;
-    handleEl.addEventListener('pointerdown', e => {
+      }
+      if (e.key === "ArrowUp") {
         e.preventDefault();
-        e.stopPropagation();
-        const startY = e.clientY;
-        const origStart = timeMin(task.start);
-        const origEnd = task.end ? timeMin(task.end) : origStart + 60;
-        const hadEnd = task.end != null;
-        const dur = origEnd - origStart;
-        let moved = false;
-        let ns = origStart, ne = origEnd;
-        let targetIso = task.date;
-
-        const paint = () => {
-            card.style.top = `${(ns - ctx.rangeStartMin) * pxPerMin}px`;
-            card.style.height = `${Math.max((ne - ns) * pxPerMin, 30)}px`;
-            if (card._timeEl) {
-                const showEnd = mode !== 'move' || hadEnd;
-                card._timeEl.textContent = showEnd ? `${minToHHMM(ns)}–${minToHHMM(ne)}` : minToHHMM(ns);
-            }
-        };
-
-        const onMove = ev => {
-            if (Math.abs(ev.clientY - startY) > 3) moved = true;
-            const d = snapStep((ev.clientY - startY) / pxPerMin, ctx.step);
-            if (mode === 'move') { ns = clampMin(origStart + d, ctx.rangeStartMin, ctx.rangeEndMin - dur); ne = ns + dur; }
-            else if (mode === 'resize-top') { ns = clampMin(origStart + d, ctx.rangeStartMin, origEnd - ctx.step); ne = origEnd; }
-            else { ne = clampMin(origEnd + d, origStart + ctx.step, ctx.rangeEndMin); ns = origStart; }
-
-            // horizontal: move across day columns (move mode only)
-            if (mode === 'move' && view._tlCols) {
-                for (const c of view._tlCols) {
-                    const r = c.el.getBoundingClientRect();
-                    if (ev.clientX >= r.left && ev.clientX < r.right) {
-                        if (c.iso !== targetIso) { targetIso = c.iso; c.el.appendChild(card); moved = true; }
-                        break;
-                    }
-                }
-            }
-            paint();
-        };
-
-        const onUp = async () => {
-            window.removeEventListener('pointermove', onMove);
-            window.removeEventListener('pointerup', onUp);
-            if (!moved) {
-                if (mode === 'move') new TaskEditorModal(view.app, task, () => view.refresh()).open();
-                return;
-            }
-            const start = minToHHMM(ns);
-            const end = (mode === 'move') ? (hadEnd ? minToHHMM(ne) : null) : minToHHMM(ne);
-            if (mode === 'move' && targetIso !== task.date) {
-                await moveTaskToDay(view.app, task, targetIso, start, end, view.plugin.settings);
-            } else {
-                task.start = start; task.end = end;
-                await rewriteTaskLine(view.app, task.file, task.line, task);
-            }
-            view.refresh();
-        };
-
-        window.addEventListener('pointermove', onMove);
-        window.addEventListener('pointerup', onUp);
+        active = (active - 1 + items.length) % items.length;
+        render();
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        commit(items[active]);
+        return;
+      }
+      if (e.key === "Escape") {
+        close();
+        return;
+      }
+    }
+    if (e.key === " " && token) {
+      const frag = ta.value.slice(token.start + 1, ta.selectionStart);
+      if (frag) {
+        e.preventDefault();
+        commit(frag);
+      }
+    }
+  });
+  ta.addEventListener("blur", () => setTimeout(close, 150));
+}
+function buildSmartDescription(container, d, tags, groups) {
+  const wrap = container.createEl("div", { cls: "tc-smartdesc" });
+  const ta = wrap.createEl("textarea", { cls: "tc-editor-desc tc-smartdesc-input" });
+  ta.rows = 4;
+  ta.placeholder = t("\u041E\u043F\u0438\u0441, \u0442\u0435\u0433\u0438 #, \u0433\u0440\u0443\u043F\u0438 @\u2026");
+  ta.value = d.descText || "";
+  const chipsWrap = wrap.createEl("div", { cls: "tc-chips tc-smartdesc-chips" });
+  const drawChips = () => {
+    chipsWrap.empty();
+    const make = (val, kind) => {
+      const chip = chipsWrap.createEl("span", { cls: kind === "group" ? "tc-chip tc-chip-group" : "tc-chip" });
+      chip.createSpan({ text: (kind === "group" ? "@" : "#") + val });
+      chip.createEl("span", { text: "\u2715", cls: "tc-chip-x" }).onclick = () => {
+        if (kind === "group") d.group = null;
+        else d.tags = d.tags.filter((x) => x !== val);
+        drawChips();
+      };
+    };
+    d.tags.forEach((tg) => make(tg, "tag"));
+    if (d.group) make(d.group, "group");
+    chipsWrap.toggleClass("tc-empty", !d.tags.length && !d.group);
+  };
+  drawChips();
+  ta.addEventListener("input", () => d.descText = ta.value);
+  attachInlineTagAutocomplete(ta, tags, groups, (sig, val) => {
+    if (sig === "#") {
+      if (!d.tags.includes(val)) d.tags.push(val);
+    } else d.group = val;
+    d.descText = ta.value;
+    drawChips();
+  });
+}
+var DatePickerModal = class extends obsidian4.Modal {
+  constructor(app, d, onDone) {
+    super(app);
+    this.d = d;
+    this.onDone = onDone;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("tc-editor");
+    contentEl.createEl("h3", { text: t("\u0414\u0430\u0442\u0430 \u0442\u0430 \u0447\u0430\u0441") });
+    new obsidian4.Setting(contentEl).setName(t("\u0414\u0430\u0442\u0430")).addText((c) => {
+      c.inputEl.type = "date";
+      c.setValue(this.d.date || todayISO()).onChange((v) => this.d.date = v);
     });
-}
-
-// ─── Calendar View ───────────────────────────────────────────────────────────
-
-const CAL_MODES = [['month', 'Місяць'], ['agenda', 'Перелік'], ['week', 'Тиждень'], ['workweek', 'Робочий тиждень'], ['3day', '3 дні']];
-const COLOR_OPTS = [['priority', 'Колір: пріоритет'], ['tag', 'Колір: тег'], ['group', 'Колір: група'], ['none', 'Без кольору']];
-
-class CalendarView extends obsidian.ItemView {
-    constructor(leaf, plugin) {
-        super(leaf);
-        this.plugin = plugin;
-        this.mode = 'month';        // month | agenda | week | workweek | 3day
-        this.anchor = new Date();
-        this.expanded = new Set();
-        this.selectedDate = todayISO();
-        this.showEarly = false;
-        this.showLate = false;
-        this.filter = null;
+    new obsidian4.Setting(contentEl).setName(t("\u0427\u0430\u0441")).addText((c) => c.setPlaceholder("09:00").setValue(this.d.start || "").onChange((v) => this.d.start = v.trim() || null)).addText((c) => c.setPlaceholder("10:30").setValue(this.d.end || "").onChange((v) => this.d.end = v.trim() || null));
+    const done = () => {
+      this.close();
+      if (this.onDone) this.onDone();
+    };
+    const quick = contentEl.createEl("div", { cls: "tc-quick-dates" });
+    const pick = (iso) => {
+      this.d.date = iso;
+      done();
+    };
+    quick.createEl("button", { text: t("\u0421\u044C\u043E\u0433\u043E\u0434\u043D\u0456") }).onclick = () => pick(todayISO());
+    quick.createEl("button", { text: t("\u0417\u0430\u0432\u0442\u0440\u0430") }).onclick = () => pick(toISO(addDays(/* @__PURE__ */ new Date(), 1)));
+    quick.createEl("button", { text: t("\u041D\u0430\u0441\u0442\u0443\u043F\u043D\u043E\u0433\u043E \u043F\u043E\u043D\u0435\u0434\u0456\u043B\u043A\u0430") }).onclick = () => pick(toISO(nextMonday()));
+    const footer = contentEl.createEl("div", { cls: "tc-modal-btns" });
+    footer.createEl("button", { text: t("\u041E\u0447\u0438\u0441\u0442\u0438\u0442\u0438") }).onclick = () => {
+      this.d.start = null;
+      this.d.end = null;
+      done();
+    };
+    footer.createEl("button", { text: t("\u0413\u043E\u0442\u043E\u0432\u043E"), cls: "mod-cta" }).onclick = done;
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var RecurrenceCustomModal = class extends obsidian4.Modal {
+  constructor(app, rec, onDone) {
+    super(app);
+    this.rec = rec;
+    this.onDone = onDone;
+    if (this.rec.freq === "none") this.rec.freq = "daily";
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("tc-editor");
+    contentEl.createEl("h3", { text: t("\u041A\u0430\u0441\u0442\u043E\u043C\u043D\u0435 \u043F\u043E\u0432\u0442\u043E\u0440\u0435\u043D\u043D\u044F") });
+    const form = contentEl.createEl("div");
+    const r = () => {
+      form.empty();
+      buildRecurrenceFields(form, this.rec, r, { hideRaw: true, hideDates: true });
+    };
+    r();
+    const footer = contentEl.createEl("div", { cls: "tc-modal-btns" });
+    footer.createEl("button", { text: t("\u0421\u043A\u0430\u0441\u0443\u0432\u0430\u0442\u0438") }).onclick = () => this.close();
+    footer.createEl("button", { text: t("\u0413\u043E\u0442\u043E\u0432\u043E"), cls: "mod-cta" }).onclick = () => {
+      this.close();
+      if (this.onDone) this.onDone();
+    };
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var TaskCreateModal = class extends obsidian4.Modal {
+  constructor(app, plugin, date) {
+    super(app);
+    this.plugin = plugin;
+    this.d = newComposerDraft(date || todayISO());
+  }
+  async onOpen() {
+    this.tags = collectTags(this.app);
+    this.groups = await collectGroups(this.app, this.plugin.settings);
+    this.render();
+  }
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("tc-editor", "tc-create");
+    const name = contentEl.createEl("input", { cls: "tc-title-input" });
+    name.placeholder = t("\u041D\u0430\u0437\u0432\u0430 \u0437\u0430\u0434\u0430\u0447\u0456");
+    name.value = this.d.text;
+    name.addEventListener("input", () => this.d.text = name.value);
+    name.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") this.submit();
+    });
+    setTimeout(() => name.focus(), 0);
+    buildSmartDescription(contentEl, this.d, this.tags, this.groups);
+    const row = contentEl.createEl("div", { cls: "tc-quick-row" });
+    const summary = contentEl.createEl("div", { cls: "tc-quick-summary" });
+    let statusBtn, prioBtn;
+    const updateLabels = () => {
+      const parts = [];
+      if (this.d.date) parts.push("\u{1F4C5} " + humanDate(this.d.date) + (this.d.start ? " " + this.d.start : ""));
+      if (this.d.rec && this.d.rec.freq && this.d.rec.freq !== "none") parts.push("\u21BB " + describeRule(ruleFromRecDraft(this.d.rec)));
+      summary.setText(parts.join("   \xB7   "));
+      obsidian4.setIcon(statusBtn, this.d.status === "done" ? "check-circle" : this.d.status === "cancelled" ? "x-circle" : "circle");
+      statusBtn.style.color = this.d.status === "done" ? "var(--color-green)" : this.d.status === "cancelled" ? "var(--color-red)" : "";
+      statusBtn.toggleClass("is-set", this.d.status !== "todo");
+      prioBtn.style.color = this.d.priority ? prioColor(this.d.priority) : "";
+      prioBtn.toggleClass("is-set", !!this.d.priority);
+    };
+    const iconBtn = (icon, label, handler) => {
+      const b = row.createEl("button", { cls: "clickable-icon" });
+      obsidian4.setIcon(b, icon);
+      b.setAttribute("aria-label", label);
+      b.onclick = handler;
+      return b;
+    };
+    statusBtn = iconBtn("circle", t("\u0421\u0442\u0430\u0442\u0443\u0441"), (e) => {
+      const menu = new obsidian4.Menu();
+      [["todo", t("\u041D\u0435 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u0430")], ["done", t("\u0412\u0438\u043A\u043E\u043D\u0430\u043D\u0430")], ["cancelled", t("\u0412\u0456\u0434\u043C\u0456\u043D\u0435\u043D\u0430")]].forEach((o) => menu.addItem((it) => it.setTitle(o[1]).setChecked(this.d.status === o[0]).onClick(() => {
+        this.d.status = o[0];
+        updateLabels();
+      })));
+      menu.showAtMouseEvent(e);
+    });
+    prioBtn = iconBtn("alert-circle", t("\u041F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442"), (e) => {
+      const menu = new obsidian4.Menu();
+      menu.addItem((it) => it.setTitle("\u2014").setChecked(!this.d.priority).onClick(() => {
+        this.d.priority = null;
+        updateLabels();
+      }));
+      priorityKeys.forEach((k) => menu.addItem((it) => it.setTitle(k).setChecked(this.d.priority === k).onClick(() => {
+        this.d.priority = k;
+        updateLabels();
+      })));
+      menu.showAtMouseEvent(e);
+    });
+    iconBtn("calendar", t("\u0414\u0430\u0442\u0430 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u043D\u044F"), () => new DatePickerModal(this.app, this.d, updateLabels).open());
+    iconBtn("repeat", t("\u041F\u043E\u0432\u0442\u043E\u0440\u0435\u043D\u043D\u044F"), (e) => {
+      const menu = new obsidian4.Menu();
+      const base = parseISO(this.d.date || todayISO());
+      const setRec = (rec) => {
+        Object.assign(this.d.rec, rec);
+        updateLabels();
+      };
+      menu.addItem((it) => it.setTitle(t("\u0411\u0435\u0437 \u043F\u043E\u0432\u0442\u043E\u0440\u0443")).onClick(() => setRec({ freq: "none" })));
+      menu.addItem((it) => it.setTitle(t("\u0429\u043E\u0434\u0435\u043D\u043D\u043E")).onClick(() => setRec({ freq: "daily", interval: 1 })));
+      menu.addItem((it) => it.setTitle(t("\u0429\u043E\u0442\u0438\u0436\u043D\u0435\u0432\u043E (\u043F\u043E\u0442\u043E\u0447\u043D\u0438\u0439 \u0434\u0435\u043D\u044C)")).onClick(() => setRec({ freq: "weekly", interval: 1, weekdays: [mondayIdx(base)] })));
+      menu.addItem((it) => it.setTitle(t("\u0429\u043E\u0442\u0438\u0436\u043D\u0435\u0432\u043E \u0443 \u0440\u043E\u0431\u043E\u0447\u0456 \u0434\u043D\u0456 (\u041F\u043D\u2013\u041F\u0442)")).onClick(() => setRec({ freq: "weekly", interval: 1, weekdays: [0, 1, 2, 3, 4] })));
+      menu.addItem((it) => it.setTitle(t("\u0429\u043E\u043C\u0456\u0441\u044F\u0447\u043D\u043E (\u043F\u043E\u0442\u043E\u0447\u043D\u0435 \u0447\u0438\u0441\u043B\u043E)")).onClick(() => setRec({ freq: "monthly", interval: 1, monthMode: "day", monthday: base.getDate() })));
+      menu.addItem((it) => it.setTitle(t("\u0429\u043E\u0440\u0456\u0447\u043D\u043E (\u043F\u043E\u0442\u043E\u0447\u043D\u0438\u0439 \u0434\u0435\u043D\u044C)")).onClick(() => setRec({ freq: "yearly", interval: 1, month: base.getMonth(), monthMode: "day", monthday: base.getDate() })));
+      menu.addSeparator();
+      menu.addItem((it) => it.setTitle(t("\u041A\u0430\u0441\u0442\u043E\u043C\u043D\u0435 \u043D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u043D\u043D\u044F\u2026")).onClick(() => new RecurrenceCustomModal(this.app, this.d.rec, updateLabels).open()));
+      menu.showAtMouseEvent(e);
+    });
+    updateLabels();
+    const footer = contentEl.createEl("div", { cls: "tc-modal-btns" });
+    footer.createEl("button", { text: t("\u0421\u043A\u0430\u0441\u0443\u0432\u0430\u0442\u0438") }).onclick = () => this.close();
+    footer.createEl("button", { text: t("\u0417\u0431\u0435\u0440\u0435\u0433\u0442\u0438"), cls: "mod-cta" }).onclick = () => this.submit();
+  }
+  async submit() {
+    this.d.text = (this.contentEl.querySelector(".tc-title-input").value || "").trim();
+    if (!this.d.text) {
+      new obsidian4.Notice(t("\u0412\u0432\u0435\u0434\u0456\u0442\u044C \u043D\u0430\u0437\u0432\u0443 \u0437\u0430\u0434\u0430\u0447\u0456"));
+      return;
     }
-
-    getViewType() { return CAL_VIEW; }
-    getDisplayText() { return t('Календар'); }
-    getIcon() { return 'calendar'; }
-
-    async onOpen() { await this.refresh(); }
-
-    isMonthish() { return this.mode === 'month' || this.mode === 'agenda'; }
-    resetOffHours() { this.showEarly = false; this.showLate = false; }
-    dayCount() { return this.mode === 'week' ? 7 : this.mode === 'workweek' ? 5 : 3; }
-    rangeStartDate() { return this.mode === 'workweek' ? startOfWorkWeek(this.anchor) : this.mode === 'week' ? startOfWeek(this.anchor) : this.anchor; }
-
-    shift(dir) {
-        if (this.isMonthish()) {
-            this.anchor = new Date(this.anchor.getFullYear(), this.anchor.getMonth() + dir, 1);
-        } else {
-            this.anchor = addDays(this.anchor, dir * (this.mode === '3day' ? 3 : 7));
-        }
-        this.resetOffHours();
-        this.refresh();
-    }
-
-    setMode(m) { this.mode = m; this.resetOffHours(); this.refresh(); }
-    goToday() { this.anchor = new Date(); this.selectedDate = todayISO(); this.resetOffHours(); this.refresh(); }
-
-    visibleRange() {
-        if (this.isMonthish()) {
-            const start = startOfWeek(new Date(this.anchor.getFullYear(), this.anchor.getMonth(), 1));
-            return [toISO(start), toISO(addDays(start, 41))];
-        }
-        const start = this.rangeStartDate();
-        return [toISO(start), toISO(addDays(start, this.dayCount() - 1))];
-    }
-
-    matchFilter(t) {
-        const f = this.filter;
-        if (!f) return true;
-        if (f.kind === 'tag') return (t.tags || []).includes(f.value);
-        if (f.kind === 'group') return t.group === f.value;
-        return t.priority === f.value;
-    }
-
-    onResize() {
-        const c = compactMode(this);
-        if (c !== this._lastCompact) { this.refresh(); return; }
-        // height-only resize (e.g. window made shorter): re-render the month so the
-        // "+N" overflow trimming is recomputed for the new (smaller) cell heights
-        if (this.mode === 'month') {
-            clearTimeout(this._resizeTimer);
-            this._resizeTimer = setTimeout(() => this.refresh(), 120);
-        }
-    }
-
-    async refresh() {
-        const mobile = compactMode(this);
-        this._lastCompact = mobile;
-        const map = await loadAllTasks(this.app);
-        const [s, e] = this.visibleRange();
-        addVirtuals(map, this.plugin.settings.recurrences, s, e);
-
-        this._filterOpts = { tags: new Set(), groups: new Set(), priorities: new Set() };
-        for (const { tasks } of map.values()) for (const t of tasks) {
-            (t.tags || []).forEach(x => this._filterOpts.tags.add(x));
-            if (t.group) this._filterOpts.groups.add(t.group);
-            if (t.priority) this._filterOpts.priorities.add(t.priority);
-        }
-        if (this.filter) for (const entry of map.values()) entry.tasks = entry.tasks.filter(t => this.matchFilter(t));
-
-        const root = this.containerEl.children[1];
-        root.empty();
-        root.addClass('tc-pane', 'tc-cal-pane');
-        root.toggleClass('tc-cal-fill', this.mode === 'month' && !mobile);
-
-        this.renderHeader(root, mobile);
-        if (this.mode === 'month') this.renderMonth(root, map, mobile);
-        else if (this.mode === 'agenda') this.renderAgenda(root, map);
-        else { this._map = map; renderTimeline(this, root, this.dayCount()); }
-    }
-
-    renderHeader(root, mobile) {
-        const s = this.plugin.settings;
-        const bar = root.createEl('div', { cls: 'tc-cal-header' });
-
-        if (mobile) {
-            const modeBtn = bar.createEl('button', { cls: 'clickable-icon' });
-            obsidian.setIcon(modeBtn, 'layout-grid');
-            modeBtn.setAttribute('aria-label', 'Режим');
-            modeBtn.onclick = e => this.modeMenu(e);
-
-            const title = bar.createEl('div', { text: this.titleText(), cls: 'tc-cal-title' });
-            title.onclick = () => this.goToday();
-
-            const right = bar.createEl('div', { cls: 'tc-cal-controls' });
-            const prev = right.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(prev, 'chevron-left'); prev.onclick = () => this.shift(-1);
-            const next = right.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(next, 'chevron-right'); next.onclick = () => this.shift(1);
-            const more = right.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(more, 'more-horizontal');
-            if (this.filter) more.addClass('is-active');
-            more.onclick = e => this.mobileMenu(e);
-            return;
-        }
-
-        bar.createEl('div', { text: this.titleText(), cls: 'tc-cal-title' });
-        const right = bar.createEl('div', { cls: 'tc-cal-controls' });
-
-        const colorSel = right.createEl('select', { cls: 'dropdown' });
-        for (const [v, l] of COLOR_OPTS) { const o = colorSel.createEl('option', { text: t(l) }); o.value = v; if (s.colorBy === v) o.selected = true; }
-        colorSel.onchange = async () => { s.colorBy = colorSel.value; await this.plugin.saveSettings(); };
-
-        const modeSel = right.createEl('select', { cls: 'dropdown' });
-        for (const [v, l] of CAL_MODES) { const o = modeSel.createEl('option', { text: t(l) }); o.value = v; if (this.mode === v) o.selected = true; }
-        modeSel.onchange = () => this.setMode(modeSel.value);
-
-        const filterBtn = right.createEl('button', { cls: 'clickable-icon' });
-        obsidian.setIcon(filterBtn, 'filter');
-        filterBtn.setAttribute('aria-label', 'Фільтр');
-        if (this.filter) filterBtn.addClass('is-active');
-        filterBtn.onclick = e => this.filterMenu(e);
-
-        const dispBtn = right.createEl('button', { cls: 'clickable-icon' });
-        obsidian.setIcon(dispBtn, 'more-horizontal');
-        dispBtn.setAttribute('aria-label', 'Відображення');
-        dispBtn.onclick = e => this.displayMenu(e);
-
-        const nav = right.createEl('div', { cls: 'tc-nav-group' });
-        const prev = nav.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(prev, 'chevron-left'); prev.onclick = () => this.shift(-1);
-        nav.createEl('button', { text: t('Сьогодні') }).onclick = () => this.goToday();
-        const next = nav.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(next, 'chevron-right'); next.onclick = () => this.shift(1);
-    }
-
-    modeMenu(e) {
-        const m = new obsidian.Menu();
-        for (const [v, l] of CAL_MODES) m.addItem(it => it.setTitle(t(l)).setChecked(this.mode === v).onClick(() => this.setMode(v)));
-        m.showAtMouseEvent(e);
-    }
-
-    // mobile: colour + filter + display in one menu
-    mobileMenu(e) {
-        const s = this.plugin.settings;
-        const m = new obsidian.Menu();
-        m.addItem(it => it.setTitle(t('Колір')).setDisabled(true));
-        for (const [v, l] of COLOR_OPTS) m.addItem(it => it.setTitle(t(l)).setChecked(s.colorBy === v).onClick(async () => { s.colorBy = v; await this.plugin.saveSettings(); }));
-        m.addSeparator();
-        m.addItem(it => it.setTitle(t('Показувати теги')).setChecked(s.showTags).onClick(async () => { s.showTags = !s.showTags; await this.plugin.saveSettings(); }));
-        m.addItem(it => it.setTitle(t('Показувати групи')).setChecked(s.showGroups).onClick(async () => { s.showGroups = !s.showGroups; await this.plugin.saveSettings(); }));
-        m.addItem(it => it.setTitle(t('Показувати пріоритети')).setChecked(s.showPriority).onClick(async () => { s.showPriority = !s.showPriority; await this.plugin.saveSettings(); }));
-        m.addItem(it => it.setTitle(t('Крапка пріоритету')).setChecked(s.priorityDot).onClick(async () => { s.priorityDot = !s.priorityDot; await this.plugin.saveSettings(); }));
-        m.addSeparator();
-        m.addItem(it => it.setTitle(this.filter ? t('Фільтр: змінити/зняти') : t('Фільтр…')).onClick(() => setTimeout(() => this.filterMenu(e), 0)));
-        m.showAtMouseEvent(e);
-    }
-
-    filterMenu(e) {
-        const m = new obsidian.Menu();
-        m.addItem(it => it.setTitle(t('Без фільтра')).setChecked(!this.filter).onClick(() => { this.filter = null; this.refresh(); }));
-        const sect = (title, kind, values) => {
-            const arr = [...values].sort();
-            if (!arr.length) return;
-            m.addSeparator();
-            m.addItem(it => it.setTitle(title).setDisabled(true));
-            for (const v of arr) {
-                const active = this.filter && this.filter.kind === kind && this.filter.value === v;
-                const label = kind === 'tag' ? `#${v}` : kind === 'group' ? `@${v}` : v;
-                m.addItem(it => it.setTitle(label).setChecked(active).onClick(() => { this.filter = { kind, value: v }; this.refresh(); }));
-            }
-        };
-        sect(t('Теги'), 'tag', this._filterOpts.tags);
-        sect(t('Групи'), 'group', this._filterOpts.groups);
-        sect(t('Пріоритети'), 'priority', this._filterOpts.priorities);
-        m.showAtMouseEvent(e);
-    }
-
-    displayMenu(e) {
-        const s = this.plugin.settings;
-        const m = new obsidian.Menu();
-        const toggle = (title, key) => m.addItem(it => it.setTitle(title).setChecked(s[key]).onClick(async () => { s[key] = !s[key]; await this.plugin.saveSettings(); }));
-        toggle('Показувати теги', 'showTags');
-        toggle('Показувати групи', 'showGroups');
-        toggle('Показувати пріоритети', 'showPriority');
-        m.addSeparator();
-        toggle('Крапка пріоритету', 'priorityDot');
-        m.showAtMouseEvent(e);
-    }
-
-    titleText() {
-        if (this.isMonthish()) return `${MONTHS_UA[this.anchor.getMonth()]} ${this.anchor.getFullYear()}`;
-        const start = this.rangeStartDate();
-        return `${toISO(start)} → ${toISO(addDays(start, this.dayCount() - 1))}`;
-    }
-
-    monthDays() {
-        const start = startOfWeek(new Date(this.anchor.getFullYear(), this.anchor.getMonth(), 1));
-        return Array.from({ length: 42 }, (_, i) => addDays(start, i));
-    }
-
-    renderMonth(root, map, mobile) {
-        const s = this.plugin.settings;
-        const refresh = () => this.refresh();
-        const grid = root.createEl('div', { cls: 'tc-month-grid' });
-        for (const wd of weekdayHeaders()) grid.createEl('div', { text: wd, cls: 'tc-wd' });
-
-        const days = this.monthDays();
-        const todayStr = todayISO();
-
-        for (let w = 0; w < 6; w++) {
-            let weekHasSelected = false;
-            for (let i = 0; i < 7; i++) {
-                const day = days[w * 7 + i];
-                const iso = toISO(day);
-                if (iso === this.selectedDate) weekHasSelected = true;
-                const cell = grid.createEl('div', { cls: 'tc-day-cell' });
-                if (day.getMonth() !== this.anchor.getMonth()) cell.addClass('tc-outside');
-                if (iso === todayStr) cell.addClass('tc-today');
-                if (mobile && iso === this.selectedDate) cell.addClass('tc-selected');
-
-                const head = cell.createEl('div', { cls: 'tc-day-head' });
-                const num = head.createEl('span', { text: String(day.getDate()) });
-                if (!mobile) num.onclick = ev => { ev.stopPropagation(); openDay(this.app, iso); };
-
-                const entry = map.get(iso);
-                if (entry && entry.tasks.length) {
-                    const items = cell.createEl('div', { cls: 'tc-day-items' });
-                    items.dataset.date = iso;
-                    entry.tasks.slice().sort(dayOrder).forEach(t => {
-                        const bar = items.createEl('div', { cls: 'tc-bar' });
-                        if (t.done) bar.addClass('tc-bar-done');
-                        if (t.cancelled) bar.addClass('tc-bar-cancelled');
-                        if (t.virtual) bar.addClass('tc-virtual');
-                        applyCardColor(bar, t, s.colorBy, s.priorityDot);
-                        if (!mobile) {
-                            const cbx = makeStatusCheckbox(bar, t, async checked => {
-                                if (t.virtual) await materializeVirtual(this.app, t, checked, s);
-                                else if (t.subtasks && t.subtasks.length) await toggleTaskCascade(this.app, t.file, t, checked);
-                                else await toggleTask(this.app, t.file, t.line, checked);
-                                refresh();
-                            }, 'tc-bar-cbx');
-                            cbx.onclick = ev => ev.stopPropagation();
-                        }
-                        bar.createEl('span', { text: t.text || '(без назви)', cls: 'tc-bar-text' });
-                        if (t.start) bar.createEl('span', { text: t.start, cls: 'tc-bar-time' });
-                        if (!mobile && !t.virtual && t.file) {
-                            bar.onclick = ev => { ev.stopPropagation(); new TaskEditorModal(this.app, t, refresh).open(); };
-                        }
-                    });
-                }
-
-                if (mobile) cell.onclick = () => { this.selectedDate = (this.selectedDate === iso ? null : iso); this.refresh(); };
-            }
-            // mobile: inline expansion under the week row holding the selected day
-            if (mobile && weekHasSelected && this.selectedDate) this.renderMonthExpand(grid, map, this.selectedDate);
-        }
-
-        this.trimMonthOverflow(root, mobile);
-    }
-
-    // after layout: in each day cell keep as many task bars as fit, replace the rest with "+N"
-    trimMonthOverflow(root, mobile) {
-        let attempts = 0;
-        const run = () => {
-            // wait until the grid actually has a height (flex/grid layout settled);
-            // otherwise clientHeight is 0 and trimming would be silently skipped
-            const probe = root.querySelector('.tc-day-items');
-            if (probe && probe.clientHeight === 0 && attempts++ < 10) {
-                requestAnimationFrame(run);
-                return;
-            }
-            root.querySelectorAll('.tc-day-items').forEach(items => {
-                const bars = Array.from(items.children)
-                    .filter(c => c.classList.contains('tc-bar') && !c.classList.contains('tc-bar-more'));
-                if (bars.length < 2) return;
-                const cs = getComputedStyle(items);
-                const gap = parseFloat(cs.rowGap || cs.gap) || 2;
-                const barH = bars[0].getBoundingClientRect().height + gap;
-                const avail = items.clientHeight;
-                if (!barH || !avail) return;
-                const fit = Math.floor((avail + gap) / barH);
-                if (bars.length <= fit) return;
-                const keep = Math.max(1, fit - 1);
-                for (let i = keep; i < bars.length; i++) bars[i].remove();
-                const more = items.createEl('div', { cls: 'tc-bar tc-bar-more', text: `+${bars.length - keep}` });
-                more.onclick = ev => {
-                    if (mobile) { this.selectedDate = items.dataset.date; this.refresh(); }
-                    else { ev.stopPropagation(); openDay(this.app, items.dataset.date); }
-                };
-            });
-        };
-        requestAnimationFrame(run);
-    }
-
-    renderMonthExpand(grid, map, iso) {
-        const settings = this.plugin.settings;
-        const refresh = () => this.refresh();
-        const panel = grid.createEl('div', { cls: 'tc-month-expand' });
-        const head = panel.createEl('div', { cls: 'tc-day-detail-head' });
-        head.createEl('span', { text: humanDate(iso), cls: 'tc-day-detail-date' });
-        head.createEl('button', { text: t('Нотатка') }).onclick = () => openDay(this.app, iso);
-        const entry = map.get(iso);
-        const tasks = entry ? entry.tasks.slice().sort(dayOrder) : [];
-        if (tasks.length) {
-            const list = panel.createEl('div', { cls: 'tc-list' });
-            tasks.forEach(t => renderTaskRow(this.app, list, t, refresh, { settings }));
-        } else {
-            panel.createEl('div', { text: t('Задач немає'), cls: 'tc-col-empty' });
-        }
-        quickAdd(this.app, panel, iso, refresh, t('+ задача'), settings);
-    }
-
-    // "Перелік": compact month with done/undone dots + selected-day task list
-    renderAgenda(root, map) {
-        const s = this.plugin.settings;
-        const grid = root.createEl('div', { cls: 'tc-month-grid tc-dots-grid' });
-        for (const wd of weekdayHeaders()) grid.createEl('div', { text: wd, cls: 'tc-wd' });
-        const todayStr = todayISO();
-
-        for (const day of this.monthDays()) {
-            const iso = toISO(day);
-            const cell = grid.createEl('div', { cls: 'tc-day-cell tc-dots-cell' });
-            if (day.getMonth() !== this.anchor.getMonth()) cell.addClass('tc-outside');
-            if (iso === todayStr) cell.addClass('tc-today');
-            if (iso === this.selectedDate) cell.addClass('tc-selected');
-            cell.createEl('div', { text: String(day.getDate()), cls: 'tc-dots-num' });
-
-            const entry = map.get(iso);
-            if (entry && entry.tasks.length) {
-                const dots = cell.createEl('div', { cls: 'tc-dots' });
-                entry.tasks.slice(0, 10).forEach(t => {
-                    const d = dots.createEl('span', { cls: 'tc-dot' });
-                    const c = cardColor(t, s.colorBy) || 'var(--interactive-accent)';
-                    if (t.done) { d.addClass('tc-dot-hollow'); d.style.borderColor = c; }
-                    else d.style.background = c;
-                });
-            }
-            cell.onclick = () => { this.selectedDate = iso; this.refresh(); };
-        }
-
-        this.renderDayDetail(root, map, this.selectedDate);
-    }
-
-    renderDayDetail(root, map, iso) {
-        const settings = this.plugin.settings;
-        const refresh = () => this.refresh();
-        const panel = root.createEl('div', { cls: 'tc-day-detail' });
-        const head = panel.createEl('div', { cls: 'tc-day-detail-head' });
-        head.createEl('span', { text: humanDate(iso), cls: 'tc-day-detail-date' });
-        head.createEl('button', { text: t('Відкрити нотатку') }).onclick = () => openDay(this.app, iso);
-
-        const entry = map.get(iso);
-        const tasks = entry ? entry.tasks.slice().sort(dayOrder) : [];
-        if (tasks.length) {
-            const list = panel.createEl('div', { cls: 'tc-list' });
-            tasks.forEach(t => renderTaskRow(this.app, list, t, refresh, { settings }));
-        } else {
-            panel.createEl('div', { text: t('Задач немає'), cls: 'tc-col-empty' });
-        }
-        quickAdd(this.app, panel, iso, refresh, t('+ задача'), settings);
-    }
-}
-
-// ─── Mini Calendar View (sidebar) ────────────────────────────────────────────
-
-class MiniCalendarView extends obsidian.ItemView {
-    constructor(leaf, plugin) {
-        super(leaf);
-        this.plugin = plugin;
-        this.anchor = new Date();
-    }
-
-    getViewType() { return MINI_VIEW; }
-    getDisplayText() { return t('Міні-календар'); }
-    getIcon() { return 'calendar-days'; }
-
-    async onOpen() {
-        await this.refresh();
-        // keep dots/cards in sync when day files change (debounced to coalesce bursts)
-        const bump = obsidian.debounce(() => this.refresh(), 250, true);
-        this.registerEvent(this.app.vault.on('modify', bump));
-        this.registerEvent(this.app.vault.on('create', bump));
-        this.registerEvent(this.app.vault.on('delete', bump));
-        this.registerEvent(this.app.vault.on('rename', bump));
-    }
-
-    shift(dir) {
-        this.anchor = new Date(this.anchor.getFullYear(), this.anchor.getMonth() + dir, 1);
-        this.refresh();
-    }
-
-    async refresh() {
-        const map = await loadAllTasks(this.app);   // load before clearing DOM
-
-        const root = this.containerEl.children[1];
-        root.empty();
-        root.addClass('tc-pane', 'tcm-pane');
-
-        const bar = root.createEl('div', { cls: 'tcm-header' });
-        bar.createEl('button', { text: '‹', cls: 'tcm-nav' }).onclick = () => this.shift(-1);
-        const title = bar.createEl('div', { text: `${MONTHS_UA[this.anchor.getMonth()]} ${this.anchor.getFullYear()}`, cls: 'tcm-title' });
-        title.onclick = () => { this.anchor = new Date(); this.refresh(); };
-        bar.createEl('button', { text: '›', cls: 'tcm-nav' }).onclick = () => this.shift(1);
-
-        const grid = root.createEl('div', { cls: 'tcm-grid' });
-        for (const wd of weekdayHeaders()) grid.createEl('div', { text: wd, cls: 'tcm-wd' });
-
-        const first = new Date(this.anchor.getFullYear(), this.anchor.getMonth(), 1);
-        const start = startOfWeek(first);
-        const todayStr = todayISO();
-
-        for (let i = 0; i < 42; i++) {
-            const day = addDays(start, i);
-            const iso = toISO(day);
-            const cell = grid.createEl('div', { cls: 'tcm-cell' });
-            if (day.getMonth() !== this.anchor.getMonth()) cell.addClass('tcm-outside');
-            if (iso === todayStr) cell.addClass('tcm-today');
-
-            const entry = map.get(iso);
-            if (entry) cell.addClass('tcm-has-file');   // file exists → distinct card
-
-            cell.createEl('div', { text: String(day.getDate()), cls: 'tcm-num' });
-
-            const dots = cell.createEl('div', { cls: 'tcm-dots' });
-            if (entry && entry.tasks.length) {
-                const total = entry.tasks.length;
-                const done = entry.tasks.filter(t => t.done).length;
-                if (done === 0) miniDot(dots, false);
-                else if (done === total) miniDot(dots, true);
-                else { miniDot(dots, true); miniDot(dots, false); }
-            }
-
-            cell.onclick = () => openDay(this.app, iso);
-            cell.oncontextmenu = evt => this.showDayMenu(evt, iso);
-        }
-    }
-
-    showDayMenu(evt, iso) {
-        evt.preventDefault();
-        const file = this.app.vault.getAbstractFileByPath(dateToPath(this.app, parseISO(iso)));
-        const menu = new obsidian.Menu();
-        if (file) {
-            // populate with Obsidian's standard file-context items (open, rename, delete, move, …)
-            this.app.workspace.trigger('file-menu', menu, file, 'mini-calendar');
-        } else {
-            menu.addItem(item => item
-                .setTitle('Створити нотатку')
-                .setIcon('file-plus')
-                .onClick(async () => {
-                    const f = await getOrCreateDateFile(this.app, iso);
-                    this.app.workspace.getLeaf().openFile(f);
-                }));
-        }
-        menu.showAtMouseEvent(evt);
-    }
-}
-
-function miniDot(container, filled) {
-    container.createEl('span', { cls: filled ? 'tcm-dot tcm-dot-filled' : 'tcm-dot tcm-dot-hollow' });
-}
-
-// ─── Smart List View (mobile-first agenda) ────────────────────────────────────
-
-class HabitCompleteModal extends obsidian.Modal {
-    constructor(app, habit, iso, onDone) {
-        super(app);
-        this.habit = habit;
-        this.iso = iso;
-        this.onDone = onDone;
-    }
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.addClass('tc-editor');
-        contentEl.createEl('h3', { text: `${this.habit.emoji ? this.habit.emoji + ' ' : ''}${this.habit.name}` });
-
-        const done = () => { this.close(); if (this.onDone) this.onDone(); };
-
-        if (this.habit.type === 'bool') {
-            const btns = contentEl.createEl('div', { cls: 'tc-modal-btns' });
-            btns.createEl('button', { text: t('Скасувати') }).onclick = () => this.close();
-            btns.createEl('button', { text: t('Виконано'), cls: 'mod-cta' }).onclick = async () => {
-                await setHabitValue(this.app, this.iso, this.habit, true); done();
-            };
-            return;
-        }
-
-        let input;
-        const cur = readFrontmatter(this.app, this.iso)[this.habit.property];
-        const save = async () => {
-            const n = Number(input.getValue());
-            await setHabitValue(this.app, this.iso, this.habit, (isNaN(n) || n <= 0) ? null : n);
-            done();
-        };
-        new obsidian.Setting(contentEl).setName(`${t('Скільки')}${this.habit.unit ? ' (' + this.habit.unit + ')' : ''}`)
-            .addText(c => {
-                input = c; c.inputEl.type = 'number'; c.inputEl.style.width = '8em';
-                if (cur) c.setValue(String(cur));
-                c.inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') save(); });
-                setTimeout(() => c.inputEl.focus(), 0);
-            });
-        const btns = contentEl.createEl('div', { cls: 'tc-modal-btns' });
-        btns.createEl('button', { text: t('Скасувати') }).onclick = () => this.close();
-        btns.createEl('button', { text: t('Зберегти'), cls: 'mod-cta' }).onclick = save;
-    }
-    onClose() { this.contentEl.empty(); }
-}
-
-class SmartView extends obsidian.ItemView {
-    constructor(leaf, plugin) {
-        super(leaf);
-        this.plugin = plugin;
-    }
-
-    getViewType() { return SMART_VIEW; }
-    getDisplayText() { return t('Розумний список'); }
-    getIcon() { return 'list-todo'; }
-
-    async onOpen() { await this.refresh(); }
-    onResize() { const c = compactMode(this); if (c !== this._lastCompact) this.refresh(); }
-
-    async refresh() {
-        const settings = this.plugin.settings;
-        const today = todayISO();
-        const map = await loadAllTasks(this.app);
-        addVirtuals(map, settings.recurrences, today, toISO(addDays(new Date(), 7)));
-
-        // today's habit values (exclude auto/word-count — it's automatic)
-        const habits = habitList(settings).filter(h => !h.auto);
-        const hv = {};
-        for (const h of habits) hv[h.id] = await getHabitValue(this.app, today, h);
-
-        const mobile = compactMode(this);
-        this._lastCompact = mobile;
-        const root = this.containerEl.children[1];
-        root.empty();
-        root.addClass('tc-pane', 'tc-listview');
-        const wrap = root.createEl('div', { cls: 'tc-smart' });
-        const refresh = () => this.refresh();
-        const dayTasks = iso => { const e = map.get(iso); return e ? e.tasks.slice() : []; };
-
-        // 1 — new task: inline composer on desktop, floating + button on mobile
-        if (!mobile) renderTaskComposer(this.app, this.plugin, wrap, today, refresh);
-        else renderFab(this.app, this.plugin, root, today);
-
-        // 2 — incomplete habits (horizontal emoji chips)
-        renderHabitStrip(this.app, wrap, habits, hv, today, refresh);
-
-        // 3 + 4 — today (timed sorted, then untimed under a divider)
-        const tToday = dayTasks(today);
-        const timedToday = tToday.filter(t => t.start).sort(dayOrder);
-        const untimedToday = tToday.filter(t => !t.start);
-        const todaySec = wrap.createEl('div', { cls: 'tc-smart-sec' });
-        todaySec.createEl('div', { text: t('Сьогодні'), cls: 'tc-smart-h' });
-        const todayList = todaySec.createEl('div', { cls: 'tc-list' });
-        timedToday.forEach(t => renderTaskRow(this.app, todayList, t, refresh, { settings }));
-        if (untimedToday.length) {
-            if (timedToday.length) todayList.createEl('div', { cls: 'tc-smart-divider' });
-            untimedToday.forEach(t => renderTaskRow(this.app, todayList, t, refresh, { settings }));
-        }
-        if (!timedToday.length && !untimedToday.length) todaySec.createEl('div', { text: t('Немає задач на сьогодні'), cls: 'tc-col-empty' });
-
-        // 5 — next 7 days agenda (timed per day) + unscheduled at the end
-        const agenda = wrap.createEl('div', { cls: 'tc-smart-sec' });
-        agenda.createEl('div', { text: t('Наступні 7 днів'), cls: 'tc-smart-h' });
-        const unscheduled = [];
-        let any = false;
-        for (let i = 1; i <= 7; i++) {
-            const d = addDays(new Date(), i);
-            const iso = toISO(d);
-            const ts = dayTasks(iso);
-            unscheduled.push(...ts.filter(t => !t.start));
-            const timed = ts.filter(t => t.start).sort(dayOrder);
-            if (!timed.length) continue;
-            any = true;
-            const block = agenda.createEl('div', { cls: 'tc-agenda-day' });
-            block.createEl('div', { text: `${WD_UA[(d.getDay() + 6) % 7]}, ${pad(d.getDate())}.${pad(d.getMonth() + 1)}`, cls: 'tc-agenda-date' });
-            const l = block.createEl('div', { cls: 'tc-list' });
-            timed.forEach(t => renderTaskRow(this.app, l, t, refresh, { settings }));
-        }
-        if (!any) agenda.createEl('div', { text: t('Немає запланованих задач'), cls: 'tc-col-empty' });
-
-        if (unscheduled.length) {
-            const u = wrap.createEl('div', { cls: 'tc-smart-sec' });
-            u.createEl('div', { text: t('Без часу (найближче)'), cls: 'tc-smart-h' });
-            const l = u.createEl('div', { cls: 'tc-list' });
-            unscheduled.forEach(t => renderTaskRow(this.app, l, t, refresh, { settings, showDate: true }));
-        }
-    }
-}
-
-// ─── Habits View (two-pane dashboard: list + selected-habit detail) ───────────
-
-// Pane width (px) below which the two-pane dashboard collapses to a single column
-// (left list, tap a habit → detail screen). Raise it to hide the detail pane sooner.
-const HABITS_2PANE_MIN = 860;
-
+    await createFromDraft(this.app, this.plugin, this.d);
+    this.plugin.refreshViews();
+    this.close();
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var HabitCreateModal = class extends obsidian4.Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.d = newHabitDraft();
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("tc-editor");
+    contentEl.createEl("h3", { text: t("\u041D\u043E\u0432\u0430 \u0437\u0432\u0438\u0447\u043A\u0430") });
+    const form = contentEl.createEl("div");
+    const r = () => {
+      form.empty();
+      buildHabitFields(form, this.d, r);
+    };
+    r();
+    const footer = contentEl.createEl("div", { cls: "tc-modal-btns" });
+    footer.createEl("button", { text: t("\u0421\u043A\u0430\u0441\u0443\u0432\u0430\u0442\u0438") }).onclick = () => this.close();
+    footer.createEl("button", { text: t("\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438"), cls: "mod-cta" }).onclick = async () => {
+      const h = validateHabit(this.d);
+      if (!h) return;
+      this.plugin.settings.habits.push(h);
+      await this.plugin.saveSettings();
+      this.close();
+    };
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
+// src/render.js
+var obsidian8 = __toESM(require("obsidian"), 1);
+
+// src/habits-view.js
+var obsidian6 = __toESM(require("obsidian"), 1);
+
+// src/edit-modals.js
+var obsidian5 = __toESM(require("obsidian"), 1);
+var ListManagerModal = class extends obsidian5.Modal {
+  constructor(app, opts) {
+    super(app);
+    this.title = opts.title;
+    this.desc = opts.desc;
+    this.render = opts.render;
+    this.onDone = opts.onDone;
+  }
+  onOpen() {
+    this.modalEl.addClass("tc-list-modal");
+    const { contentEl } = this;
+    contentEl.addClass("tc-editor");
+    contentEl.createEl("h3", { text: this.title });
+    if (this.desc) contentEl.createEl("p", { text: this.desc, cls: "setting-item-description" });
+    const body = contentEl.createEl("div", { cls: "tc-list-modal-body" });
+    const rerender = () => {
+      body.empty();
+      this.render(body, rerender);
+    };
+    rerender();
+    const footer = contentEl.createEl("div", { cls: "tc-modal-btns" });
+    footer.createEl("button", { text: t("\u0413\u043E\u0442\u043E\u0432\u043E"), cls: "mod-cta" }).onclick = () => this.close();
+  }
+  onClose() {
+    this.contentEl.empty();
+    if (this.onDone) this.onDone();
+  }
+};
+var RecurrenceEditModal = class extends obsidian5.Modal {
+  constructor(app, plugin, rule, onSave) {
+    super(app);
+    this.plugin = plugin;
+    this.rule = rule;
+    this.onSave = onSave;
+    this.draft = {
+      raw: rule.raw,
+      freq: rule.freq,
+      interval: rule.interval || 1,
+      weekdays: (rule.weekdays || []).slice(),
+      monthMode: rule.monthMode || "day",
+      monthday: rule.monthday || "",
+      nth: rule.nth || 1,
+      weekday: rule.weekday || 0,
+      which: rule.which || "first",
+      month: rule.month != null ? rule.month : (/* @__PURE__ */ new Date()).getMonth(),
+      start: rule.start,
+      end: rule.end || ""
+    };
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("tc-editor");
+    contentEl.createEl("h3", { text: t("\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438 \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0443 \u0437\u0430\u0434\u0430\u0447\u0443") });
+    const form = contentEl.createEl("div");
+    const r = () => {
+      form.empty();
+      buildRecurrenceFields(form, this.draft, r);
+    };
+    r();
+    const footer = contentEl.createEl("div", { cls: "tc-modal-btns" });
+    footer.createEl("button", { text: t("\u0421\u043A\u0430\u0441\u0443\u0432\u0430\u0442\u0438") }).onclick = () => this.close();
+    footer.createEl("button", { text: t("\u0417\u0431\u0435\u0440\u0435\u0433\u0442\u0438"), cls: "mod-cta" }).onclick = async () => {
+      const updated = validateRecurrence(this.draft);
+      if (!updated) return;
+      updated.id = this.rule.id;
+      const arr = this.plugin.settings.recurrences;
+      const i = arr.findIndex((x) => x.id === this.rule.id);
+      if (i >= 0) arr[i] = updated;
+      await this.plugin.saveSettings();
+      this.close();
+      if (this.onSave) this.onSave();
+    };
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var StatusEditModal = class extends obsidian5.Modal {
+  constructor(app, plugin, status, onSave) {
+    super(app);
+    this.plugin = plugin;
+    this.status = status;
+    this.onSave = onSave;
+    this.draft = newStatusDraft(status);
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("tc-editor");
+    contentEl.createEl("h3", { text: this.status ? t("\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438 \u0441\u0442\u0430\u0442\u0443\u0441") : t("\u041D\u043E\u0432\u0438\u0439 \u0441\u0442\u0430\u0442\u0443\u0441") });
+    const form = contentEl.createEl("div");
+    const r = () => {
+      form.empty();
+      buildStatusFields(form, this.draft, r);
+    };
+    r();
+    const footer = contentEl.createEl("div", { cls: "tc-modal-btns" });
+    footer.createEl("button", { text: t("\u0421\u043A\u0430\u0441\u0443\u0432\u0430\u0442\u0438") }).onclick = () => this.close();
+    footer.createEl("button", { text: t("\u0417\u0431\u0435\u0440\u0435\u0433\u0442\u0438"), cls: "mod-cta" }).onclick = async () => {
+      const updated = validateStatus(this.draft);
+      if (!updated) return;
+      const arr = this.plugin.settings.checkboxStatuses;
+      if (this.status) {
+        const i = arr.findIndex((x) => x.id === this.status.id);
+        if (i >= 0) arr[i] = updated;
+      } else {
+        arr.push(updated);
+      }
+      await this.plugin.saveSettings();
+      this.close();
+      if (this.onSave) this.onSave();
+    };
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var HabitEditModal = class extends obsidian5.Modal {
+  constructor(app, plugin, habit, onSave) {
+    super(app);
+    this.plugin = plugin;
+    this.habit = habit;
+    this.onSave = onSave;
+    this.draft = { name: habit.name, property: habit.property, unit: habit.unit || "", type: habit.type, emoji: habit.emoji || "", color: habit.color || "#9aa0a6", goal: habit.goal || "" };
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("tc-editor");
+    contentEl.createEl("h3", { text: t("\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438 \u0437\u0432\u0438\u0447\u043A\u0443") });
+    const form = contentEl.createEl("div");
+    const r = () => {
+      form.empty();
+      buildHabitFields(form, this.draft, r);
+    };
+    r();
+    const footer = contentEl.createEl("div", { cls: "tc-modal-btns" });
+    footer.createEl("button", { text: t("\u0421\u043A\u0430\u0441\u0443\u0432\u0430\u0442\u0438") }).onclick = () => this.close();
+    footer.createEl("button", { text: t("\u0417\u0431\u0435\u0440\u0435\u0433\u0442\u0438"), cls: "mod-cta" }).onclick = async () => {
+      const updated = validateHabit(this.draft);
+      if (!updated) return;
+      updated.id = this.habit.id;
+      const arr = this.plugin.settings.habits;
+      const i = arr.findIndex((x) => x.id === this.habit.id);
+      if (i >= 0) arr[i] = updated;
+      await this.plugin.saveSettings();
+      this.close();
+      if (this.onSave) this.onSave();
+    };
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
+// src/habits-view.js
+var HABITS_2PANE_MIN = 860;
 function heatLevel(value, max) {
-    if (value <= 0 || max <= 0) return 0;
-    return Math.min(4, Math.ceil(value / max * 4));
+  if (value <= 0 || max <= 0) return 0;
+  return Math.min(4, Math.ceil(value / max * 4));
 }
 function heatColor(base, lvl) {
-    if (lvl === 0) return 'var(--background-modifier-border)';
-    return `color-mix(in srgb, ${base} ${6 + lvl * 22}%, var(--background-secondary))`;
+  if (lvl === 0) return "var(--background-modifier-border)";
+  return `color-mix(in srgb, ${base} ${6 + lvl * 22}%, var(--background-secondary))`;
 }
-
-// Read a habit's value out of a (cached) frontmatter object — fully synchronous.
 function fmHabitValue(fm, habit) {
-    const v = fm ? fm[habit.property] : undefined;
-    if (habit.type === 'bool') return (v === true || v === 'true') ? 1 : 0;
-    return Number(v) || 0;
+  const v = fm ? fm[habit.property] : void 0;
+  if (habit.type === "bool") return v === true || v === "true" ? 1 : 0;
+  return Number(v) || 0;
 }
-
-// SVG progress ring with an optional centered label. Returns the wrapper element.
 function makeRing(parent, frac, color, opts) {
-    opts = opts || {};
-    const size = opts.size || 28, sw = opts.stroke || 3;
-    const r = (size - sw) / 2, circ = 2 * Math.PI * r, ns = 'http://www.w3.org/2000/svg';
-    const wrap = parent.createEl('div', { cls: 'tc-ring-wrap' });
-    wrap.style.width = wrap.style.height = size + 'px';
-    const svg = document.createElementNS(ns, 'svg');
-    svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
-    svg.classList.add('tc-ring');
-    const circle = (stroke, dashFrac) => {
-        const ci = document.createElementNS(ns, 'circle');
-        ci.setAttribute('cx', size / 2); ci.setAttribute('cy', size / 2); ci.setAttribute('r', r);
-        ci.setAttribute('fill', 'none'); ci.setAttribute('stroke', stroke); ci.setAttribute('stroke-width', sw);
-        if (dashFrac != null) {
-            ci.setAttribute('stroke-dasharray', circ);
-            ci.setAttribute('stroke-dashoffset', circ * (1 - dashFrac));
-            ci.setAttribute('stroke-linecap', 'round');
-            ci.setAttribute('transform', `rotate(-90 ${size / 2} ${size / 2})`);
-        }
-        svg.appendChild(ci);
+  opts = opts || {};
+  const size = opts.size || 28, sw = opts.stroke || 3;
+  const r = (size - sw) / 2, circ = 2 * Math.PI * r, ns = "http://www.w3.org/2000/svg";
+  const wrap = parent.createEl("div", { cls: "tc-ring-wrap" });
+  wrap.style.width = wrap.style.height = size + "px";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+  svg.classList.add("tc-ring");
+  const circle = (stroke, dashFrac) => {
+    const ci = document.createElementNS(ns, "circle");
+    ci.setAttribute("cx", size / 2);
+    ci.setAttribute("cy", size / 2);
+    ci.setAttribute("r", r);
+    ci.setAttribute("fill", "none");
+    ci.setAttribute("stroke", stroke);
+    ci.setAttribute("stroke-width", sw);
+    if (dashFrac != null) {
+      ci.setAttribute("stroke-dasharray", circ);
+      ci.setAttribute("stroke-dashoffset", circ * (1 - dashFrac));
+      ci.setAttribute("stroke-linecap", "round");
+      ci.setAttribute("transform", `rotate(-90 ${size / 2} ${size / 2})`);
+    }
+    svg.appendChild(ci);
+  };
+  circle("var(--background-modifier-border)");
+  if (frac > 0) circle(color || "var(--interactive-accent)", Math.min(1, frac));
+  wrap.appendChild(svg);
+  if (opts.center != null) wrap.createEl("span", { cls: "tc-ring-center", text: String(opts.center) });
+  if (frac >= 1) wrap.addClass("tc-ring-full");
+  return wrap;
+}
+var HabitsView = class extends obsidian6.ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.anchor = /* @__PURE__ */ new Date();
+    this.selectedHabit = null;
+    this.mobileDetail = false;
+  }
+  getViewType() {
+    return HABITS_VIEW;
+  }
+  getDisplayText() {
+    return t("\u0417\u0432\u0438\u0447\u043A\u0438");
+  }
+  getIcon() {
+    return "check-circle";
+  }
+  async onOpen() {
+    this._scheduleRefresh = obsidian6.debounce(() => this.refresh(), 200, true);
+    const isDaily = (file) => {
+      const c = getDailyNotesConfig(this.app);
+      return !!(file && fileToDate(file, c.folder, c.format));
     };
-    circle('var(--background-modifier-border)');
-    if (frac > 0) circle(color || 'var(--interactive-accent)', Math.min(1, frac));
-    wrap.appendChild(svg);
-    if (opts.center != null) wrap.createEl('span', { cls: 'tc-ring-center', text: String(opts.center) });
-    if (frac >= 1) wrap.addClass('tc-ring-full');
-    return wrap;
-}
-
-class HabitsView extends obsidian.ItemView {
-    constructor(leaf, plugin) {
-        super(leaf);
-        this.plugin = plugin;
-        this.anchor = new Date();          // single focus date driving week / month / year
-        this.selectedHabit = null;
-        this.mobileDetail = false;         // narrow: list (false) vs detail screen (true)
+    this.registerEvent(this.app.metadataCache.on("changed", (file) => {
+      if (isDaily(file)) this._scheduleRefresh();
+    }));
+    this.registerEvent(this.app.vault.on("create", () => this._scheduleRefresh()));
+    this.registerEvent(this.app.vault.on("delete", () => this._scheduleRefresh()));
+    this.registerEvent(this.app.vault.on("rename", () => this._scheduleRefresh()));
+    await this.refresh();
+  }
+  isNarrow() {
+    const w = this.containerEl.children[1] && this.containerEl.children[1].clientWidth || 0;
+    return obsidian6.Platform.isMobile || w < HABITS_2PANE_MIN;
+  }
+  onResize() {
+    const n = this.isNarrow();
+    if (n !== this._narrow) this.refresh();
+  }
+  // value lookup backed by the per-refresh caches (synchronous)
+  val(iso, habit) {
+    return habit.auto === "words" ? this._words.get(iso) || 0 : fmHabitValue(this._fm.get(iso), habit);
+  }
+  // ── synchronized period navigation (all driven by this.anchor) ───────────
+  weekStep(dir) {
+    this.anchor = addDays(this.anchor, dir * 7);
+    this.refresh();
+  }
+  monthStep(dir) {
+    const a = this.anchor, nm = new Date(a.getFullYear(), a.getMonth() + dir, 1);
+    this.anchor = new Date(nm.getFullYear(), nm.getMonth(), Math.min(a.getDate(), lastDayOfMonth(nm.getFullYear(), nm.getMonth())));
+    this.refresh();
+  }
+  yearStep(dir) {
+    const ty = this.anchor.getFullYear() + dir, cy = (/* @__PURE__ */ new Date()).getFullYear();
+    if (ty < cy) this.anchor = new Date(ty, 11, 31);
+    else if (ty === cy) this.anchor = /* @__PURE__ */ new Date();
+    else this.anchor = new Date(ty, 0, 1);
+    this.refresh();
+  }
+  // ◀ [label → today] ▶  — identical control reused for week / month / year
+  navGroup(container, label, stepFn) {
+    const g = container.createEl("div", { cls: "tc-nav-group" });
+    const pv = g.createEl("button", { cls: "clickable-icon" });
+    obsidian6.setIcon(pv, "chevron-left");
+    pv.onclick = () => stepFn(-1);
+    const lbl = g.createEl("button", { cls: "tc-nav-label", text: label });
+    lbl.setAttribute("aria-label", t("\u0414\u043E \u043F\u043E\u0442\u043E\u0447\u043D\u043E\u0433\u043E"));
+    lbl.onclick = () => {
+      this.anchor = /* @__PURE__ */ new Date();
+      this.refresh();
+    };
+    const nx = g.createEl("button", { cls: "clickable-icon" });
+    obsidian6.setIcon(nx, "chevron-right");
+    nx.onclick = () => stepFn(1);
+    return g;
+  }
+  async refresh() {
+    this._narrow = this.isNarrow();
+    const root = this.containerEl.children[1];
+    const habits = habitList(this.plugin.settings);
+    if (!habits.length) {
+      root.empty();
+      root.addClass("tc-pane");
+      const bar = root.createEl("div", { cls: "tc-cal-header" });
+      bar.createEl("div", { text: t("\u0417\u0432\u0438\u0447\u043A\u0438"), cls: "tc-cal-title" });
+      const add = bar.createEl("button", { cls: "clickable-icon" });
+      obsidian6.setIcon(add, "plus");
+      add.onclick = () => this.openCreate();
+      root.createEl("p", { text: t("\u0417\u0432\u0438\u0447\u043E\u043A \u0449\u0435 \u043D\u0435\u043C\u0430\u0454. \u0421\u0442\u0432\u043E\u0440\u0456\u0442\u044C \u0457\u0445 \u0447\u0435\u0440\u0435\u0437 Ctrl+P \u2192 \u0417\u0432\u0438\u0447\u043A\u0430."), cls: "tc-empty" });
+      return;
     }
-
-    getViewType() { return HABITS_VIEW; }
-    getDisplayText() { return t('Звички'); }
-    getIcon() { return 'check-circle'; }
-
-    async onOpen() {
-        // Re-render when habit values change. Writes (setHabitValue) update metadataCache
-        // ASYNCHRONOUSLY, so we refresh on its 'changed' event (not right after the write)
-        // to avoid reading stale frontmatter. Debounced to collapse bursts and avoid flicker.
-        this._scheduleRefresh = obsidian.debounce(() => this.refresh(), 200, true);
-        const isDaily = file => { const c = getDailyNotesConfig(this.app); return !!(file && fileToDate(file, c.folder, c.format)); };
-        this.registerEvent(this.app.metadataCache.on('changed', file => { if (isDaily(file)) this._scheduleRefresh(); }));
-        this.registerEvent(this.app.vault.on('create', () => this._scheduleRefresh()));
-        this.registerEvent(this.app.vault.on('delete', () => this._scheduleRefresh()));
-        this.registerEvent(this.app.vault.on('rename', () => this._scheduleRefresh()));
-        await this.refresh();
+    if (!this.selectedHabit || !habits.find((h) => h.id === this.selectedHabit)) this.selectedHabit = habits[0].id;
+    this._files = getDateFiles(this.app);
+    this._fm = /* @__PURE__ */ new Map();
+    for (const { file, date } of this._files) {
+      const fc = this.app.metadataCache.getFileCache(file);
+      this._fm.set(date, fc && fc.frontmatter || {});
     }
-    isNarrow() {
-        const w = (this.containerEl.children[1] && this.containerEl.children[1].clientWidth) || 0;
-        return obsidian.Platform.isMobile || w < HABITS_2PANE_MIN;
+    this._words = /* @__PURE__ */ new Map();
+    if (habits.some((h) => h.auto === "words")) {
+      for (const { file, date } of this._files) this._words.set(date, countWords(await this.app.vault.read(file)));
     }
-    onResize() { const n = this.isNarrow(); if (n !== this._narrow) this.refresh(); }
-
-    // value lookup backed by the per-refresh caches (synchronous)
-    val(iso, habit) { return habit.auto === 'words' ? (this._words.get(iso) || 0) : fmHabitValue(this._fm.get(iso), habit); }
-
-    // ── synchronized period navigation (all driven by this.anchor) ───────────
-    weekStep(dir) { this.anchor = addDays(this.anchor, dir * 7); this.refresh(); }
-    monthStep(dir) {
-        const a = this.anchor, nm = new Date(a.getFullYear(), a.getMonth() + dir, 1);
-        this.anchor = new Date(nm.getFullYear(), nm.getMonth(), Math.min(a.getDate(), lastDayOfMonth(nm.getFullYear(), nm.getMonth())));
+    root.empty();
+    root.addClass("tc-pane");
+    if (this._narrow) {
+      if (this.mobileDetail) this.renderHabitDetail(root, habits, true);
+      else this.renderHabitList(root, habits, true);
+      return;
+    }
+    const pane = root.createEl("div", { cls: "tc-habits-2pane" });
+    this.renderHabitList(pane.createEl("div", { cls: "tc-habits-list" }), habits, false);
+    this.renderHabitDetail(pane.createEl("div", { cls: "tc-habits-detail" }), habits, false);
+  }
+  openCreate() {
+    const m = new HabitCreateModal(this.app, this.plugin);
+    const orig = m.onClose.bind(m);
+    m.onClose = () => {
+      orig();
+      this.refresh();
+    };
+    m.open();
+  }
+  currentStreak(habit) {
+    let s = 0;
+    const today = parseISO(todayISO());
+    for (let i = 0; i < 180; i++) {
+      const v = this.val(toISO(addDays(today, -i)), habit);
+      if (habitDone(v, habit)) s++;
+      else if (i === 0) continue;
+      else break;
+    }
+    return s;
+  }
+  cellInput(cell, habit, iso, v) {
+    if (habit.auto) return;
+    cell.addClass("tc-clickable");
+    cell.onclick = () => {
+      if (habit.type === "bool") setHabitValue(this.app, iso, habit, v > 0 ? null : true);
+      else new HabitCompleteModal(this.app, habit, iso, () => {
+      }).open();
+    };
+    const clearMenu = (pos) => {
+      const menu = new obsidian6.Menu();
+      menu.addItem((i) => i.setTitle(t("\u041E\u0447\u0438\u0441\u0442\u0438\u0442\u0438")).setIcon("eraser").onClick(() => setHabitValue(this.app, iso, habit, null)));
+      menu.showAtPosition({ x: pos.clientX, y: pos.clientY });
+    };
+    cell.oncontextmenu = (ev) => {
+      ev.preventDefault();
+      clearMenu(ev);
+    };
+    attachLongPress(cell, clearMenu);
+  }
+  // ── left: habit list with week ring-header ───────────────────────────────
+  renderHabitList(root, habits, mobile) {
+    root = root.createEl("div", { cls: "tc-hl" });
+    attachSwipeNav(root, () => this.weekStep(-1), () => this.weekStep(1));
+    const bar = root.createEl("div", { cls: "tc-cal-header" });
+    bar.createEl("div", { text: t("\u0417\u0432\u0438\u0447\u043A\u0438"), cls: "tc-cal-title" });
+    const ctr = bar.createEl("div", { cls: "tc-cal-controls" });
+    const start = startOfWeek(this.anchor), wkEnd = addDays(start, 6);
+    const wkLabel = `${pad(start.getDate())}.${pad(start.getMonth() + 1)} \u2013 ${pad(wkEnd.getDate())}.${pad(wkEnd.getMonth() + 1)}`;
+    this.navGroup(ctr, wkLabel, (dir) => this.weekStep(dir));
+    const add = ctr.createEl("button", { cls: "clickable-icon" });
+    obsidian6.setIcon(add, "plus");
+    add.setAttribute("aria-label", t("\u041D\u043E\u0432\u0430 \u0437\u0432\u0438\u0447\u043A\u0430"));
+    add.onclick = () => this.openCreate();
+    const days = [];
+    for (let i = 0; i < 7; i++) days.push(addDays(start, i));
+    const todayStr = todayISO();
+    const head = root.createEl("div", { cls: "tc-hl-grid tc-hl-weekhead" });
+    head.createEl("div", { cls: "tc-hl-corner" });
+    for (const d of days) {
+      const iso = toISO(d);
+      const col = head.createEl("div", { cls: iso === todayStr ? "tc-hl-dayhead tc-hl-today" : "tc-hl-dayhead" });
+      col.createEl("div", { text: WD_UA[mondayIdx(d)], cls: "tc-col-wd" });
+      let sum = 0;
+      for (const h of habits) sum += habitProgress(this.val(iso, h), h);
+      makeRing(col, habits.length ? sum / habits.length : 0, "var(--interactive-accent)", { size: 22, stroke: 3, center: String(d.getDate()) });
+    }
+    for (const habit of habits) {
+      const row = root.createEl("div", { cls: "tc-hl-grid tc-hl-row" + (habit.id === this.selectedHabit ? " is-selected" : "") });
+      const info = row.createEl("div", { cls: "tc-hl-info" });
+      info.onclick = () => {
+        this.selectedHabit = habit.id;
+        if (this._narrow) this.mobileDetail = true;
         this.refresh();
+      };
+      const badge = info.createEl("div", { cls: "tc-hl-badge", text: habit.emoji || "\u2022" });
+      if (habit.color) badge.style.background = `color-mix(in srgb, ${habit.color} 30%, transparent)`;
+      const meta = info.createEl("div", { cls: "tc-hl-meta" });
+      meta.createEl("div", { text: habit.name, cls: "tc-hl-name" });
+      meta.createEl("div", { cls: "tc-hl-streak", text: `\u{1F525} ${this.currentStreak(habit)} ${t("\u0434\u043D.")}` });
+      for (const d of days) {
+        const iso = toISO(d);
+        const cell = row.createEl("div", { cls: "tc-hl-cell" });
+        const v = this.val(iso, habit);
+        const w = makeRing(cell, habitProgress(v, habit), habit.color || "var(--interactive-accent)", { size: 20, stroke: 3 });
+        if (habitDone(v, habit)) w.addClass("tc-ring-done");
+        this.cellInput(cell, habit, iso, v);
+      }
     }
-    yearStep(dir) {
-        const ty = this.anchor.getFullYear() + dir, cy = new Date().getFullYear();
-        if (ty < cy) this.anchor = new Date(ty, 11, 31);       // past year → last month + last week
-        else if (ty === cy) this.anchor = new Date();          // current year → today
-        else this.anchor = new Date(ty, 0, 1);                 // future → start
+  }
+  // ── right: detail of the selected habit ──────────────────────────────────
+  renderHabitDetail(root, habits, mobile) {
+    const habit = habits.find((h) => h.id === this.selectedHabit) || habits[0];
+    const head = root.createEl("div", { cls: "tc-hd-head" });
+    if (mobile) {
+      const back = head.createEl("button", { cls: "clickable-icon" });
+      obsidian6.setIcon(back, "arrow-left");
+      back.setAttribute("aria-label", t("\u2190 \u041D\u0430\u0437\u0430\u0434"));
+      back.onclick = () => {
+        this.mobileDetail = false;
         this.refresh();
+      };
     }
-    // ◀ [label → today] ▶  — identical control reused for week / month / year
-    navGroup(container, label, stepFn) {
-        const g = container.createEl('div', { cls: 'tc-nav-group' });
-        const pv = g.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(pv, 'chevron-left'); pv.onclick = () => stepFn(-1);
-        const lbl = g.createEl('button', { cls: 'tc-nav-label', text: label });
-        lbl.setAttribute('aria-label', t('До поточного'));
-        lbl.onclick = () => { this.anchor = new Date(); this.refresh(); };
-        const nx = g.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(nx, 'chevron-right'); nx.onclick = () => stepFn(1);
-        return g;
+    const title = head.createEl("div", { cls: "tc-hd-title" });
+    title.createEl("span", { cls: "tc-hd-emoji", text: habit.emoji || "\u2022" });
+    title.createEl("span", { text: habit.name });
+    if (!habit.auto) {
+      const more = head.createEl("button", { cls: "clickable-icon" });
+      obsidian6.setIcon(more, "more-horizontal");
+      more.onclick = (e) => {
+        const menu = new obsidian6.Menu();
+        menu.addItem((it) => it.setTitle(t("\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438")).setIcon("pencil").onClick(() => {
+          new HabitEditModal(this.app, this.plugin, habit, () => this.refresh()).open();
+        }));
+        menu.addItem((it) => it.setTitle(t("\u0412\u0438\u0434\u0430\u043B\u0438\u0442\u0438")).setIcon("trash").onClick(async () => {
+          this.plugin.settings.habits = this.plugin.settings.habits.filter((h) => h.id !== habit.id);
+          await this.plugin.saveSettings();
+          this.selectedHabit = null;
+          this.mobileDetail = false;
+          this.refresh();
+        }));
+        menu.showAtMouseEvent(e);
+      };
     }
-
-    async refresh() {
-        this._narrow = this.isNarrow();
-        const root = this.containerEl.children[1];
-        const habits = habitList(this.plugin.settings);
-
-        if (!habits.length) {
-            root.empty(); root.addClass('tc-pane');
-            const bar = root.createEl('div', { cls: 'tc-cal-header' });
-            bar.createEl('div', { text: t('Звички'), cls: 'tc-cal-title' });
-            const add = bar.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(add, 'plus');
-            add.onclick = () => this.openCreate();
-            root.createEl('p', { text: t('Звичок ще немає. Створіть їх через Ctrl+P → Звичка.'), cls: 'tc-empty' });
-            return;
-        }
-        if (!this.selectedHabit || !habits.find(h => h.id === this.selectedHabit)) this.selectedHabit = habits[0].id;
-
-        // ── gather ALL data BEFORE emptying (anti-flicker). Frontmatter is read once
-        //    from the (synchronous) metadata cache; word counts only if a word habit exists.
-        this._files = getDateFiles(this.app);                     // [{file, date}]
-        this._fm = new Map();
-        for (const { file, date } of this._files) {
-            const fc = this.app.metadataCache.getFileCache(file);
-            this._fm.set(date, (fc && fc.frontmatter) || {});
-        }
-        this._words = new Map();
-        if (habits.some(h => h.auto === 'words')) {
-            for (const { file, date } of this._files) this._words.set(date, countWords(await this.app.vault.read(file)));
-        }
-
-        // ── render synchronously ──
-        root.empty();
-        root.addClass('tc-pane');
-        if (this._narrow) {
-            if (this.mobileDetail) this.renderHabitDetail(root, habits, true);
-            else this.renderHabitList(root, habits, true);
-            return;
-        }
-        const pane = root.createEl('div', { cls: 'tc-habits-2pane' });
-        this.renderHabitList(pane.createEl('div', { cls: 'tc-habits-list' }), habits, false);
-        this.renderHabitDetail(pane.createEl('div', { cls: 'tc-habits-detail' }), habits, false);
+    const y = this.anchor.getFullYear(), m = this.anchor.getMonth();
+    const last = new Date(y, m + 1, 0).getDate();
+    const monthIsos = [];
+    for (let dd = 1; dd <= last; dd++) monthIsos.push(toISO(new Date(y, m, dd)));
+    const monthVals = {};
+    for (const iso of monthIsos) monthVals[iso] = this.val(iso, habit);
+    let monthChecks = 0, monthCount = 0;
+    for (const iso of monthIsos) {
+      const v = monthVals[iso];
+      monthCount += v;
+      if (habitDone(v, habit)) monthChecks++;
     }
-
-    openCreate() {
-        const m = new HabitCreateModal(this.app, this.plugin);
-        const orig = m.onClose.bind(m);
-        m.onClose = () => { orig(); this.refresh(); };
-        m.open();
+    const rate = monthIsos.length ? Math.round(monthChecks / monthIsos.length * 100) : 0;
+    let totalChecks = 0, totalCount = 0;
+    for (const { date } of this._files) {
+      const v = this.val(date, habit);
+      totalCount += v;
+      if (habitDone(v, habit)) totalChecks++;
     }
-
-    currentStreak(habit) {
-        let s = 0;
-        const today = parseISO(todayISO());
-        for (let i = 0; i < 180; i++) {
-            const v = this.val(toISO(addDays(today, -i)), habit);
-            if (habitDone(v, habit)) s++;
-            else if (i === 0) continue;   // today still pending — don't zero an ongoing streak
-            else break;
-        }
-        return s;
+    const streak = this.currentStreak(habit);
+    const grid = root.createEl("div", { cls: "tc-metric-grid" });
+    const card = (icon, label, value, sub) => {
+      const c = grid.createEl("div", { cls: "tc-metric-card" });
+      const top = c.createEl("div", { cls: "tc-metric-top" });
+      const ic = top.createEl("span", { cls: "tc-metric-icon" });
+      obsidian6.setIcon(ic, icon);
+      top.createEl("span", { text: label, cls: "tc-metric-label" });
+      c.createEl("div", { text: String(value), cls: "tc-metric-value" });
+      if (sub) c.createEl("div", { text: sub, cls: "tc-metric-sub" });
+    };
+    card("check-circle", t("\u0429\u043E\u043C\u0456\u0441\u044F\u0447\u043D\u0456 \u043F\u0435\u0440\u0435\u0432\u0456\u0440\u043A\u0438"), monthChecks, t("\u0414\u0435\u043D\u044C"));
+    card("list", t("\u0417\u0430\u0433\u0430\u043B\u044C\u043D\u0430 \u0440\u0435\u0454\u0441\u0442\u0440\u0430\u0446\u0456\u044F"), totalChecks, t("\u0414\u0435\u043D\u044C"));
+    card("percent", t("\u0429\u043E\u043C\u0456\u0441\u044F\u0447\u043D\u0430 \u0441\u0442\u0430\u0432\u043A\u0430 \u0440\u0435\u0454\u0441\u0442\u0440\u0430\u0446\u0456\u0457"), rate + " %");
+    card("flame", t("\u041F\u043E\u0442\u043E\u0447\u043D\u0430 \u0441\u0435\u0440\u0456\u044F"), streak, t("\u0414\u0435\u043D\u044C"));
+    card("bar-chart", t("\u0429\u043E\u043C\u0456\u0441\u044F\u0447\u043D\u0435 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u043D\u044F"), monthCount, t("\u0420\u0430\u0445\u0443\u043D\u043E\u043A"));
+    card("bar-chart-2", t("\u0417\u0430\u0433\u0430\u043B\u044C\u043D\u0438\u0439 \u043E\u0431\u0441\u044F\u0433 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u043D\u044F"), totalCount, t("\u0420\u0430\u0445\u0443\u043D\u043E\u043A"));
+    this.renderRingCalendar(root, habit, monthVals, y, m);
+    this.renderBarChart(root, habit, monthIsos, monthVals);
+    this.renderHeatmapBlock(root, habit);
+  }
+  renderRingCalendar(root, habit, monthVals, y, m) {
+    const wrap = root.createEl("div", { cls: "tc-ring-cal" });
+    const hd = wrap.createEl("div", { cls: "tc-cal-header" });
+    hd.createEl("div", { text: t("\u041C\u0456\u0441\u044F\u0446\u044C"), cls: "tc-hd-subhead" });
+    this.navGroup(hd, `${MONTHS_UA[m]} ${y}`, (dir) => this.monthStep(dir));
+    const grid = wrap.createEl("div", { cls: "tc-ringcal-grid" });
+    attachSwipeNav(grid, () => this.monthStep(-1), () => this.monthStep(1));
+    for (const wd of weekdayHeaders()) grid.createEl("div", { text: wd, cls: "tc-wd" });
+    const todayStr = todayISO();
+    for (const d of monthGridDays(y, m)) {
+      const inMonth = d.getMonth() === m;
+      const iso = toISO(d);
+      const cell = grid.createEl("div", { cls: inMonth ? "tc-ringcal-cell" : "tc-ringcal-cell tc-outside" });
+      const v = inMonth ? monthVals[iso] : 0;
+      makeRing(cell, habitProgress(v, habit), habit.color || "var(--interactive-accent)", { size: 34, stroke: 3, center: String(d.getDate()) });
+      if (iso === todayStr) cell.addClass("tc-today");
+      if (inMonth) this.cellInput(cell, habit, iso, v);
     }
-
-    cellInput(cell, habit, iso, v) {
-        if (habit.auto) return;
-        cell.addClass('tc-clickable');
-        // no manual refresh — the metadataCache 'changed' event re-renders with fresh data
-        cell.onclick = () => {
-            if (habit.type === 'bool') setHabitValue(this.app, iso, habit, v > 0 ? null : true);
-            else new HabitCompleteModal(this.app, habit, iso, () => {}).open();
-        };
+  }
+  renderBarChart(root, habit, monthIsos, monthVals) {
+    const wrap = root.createEl("div", { cls: "tc-barchart-wrap" });
+    wrap.createEl("div", { cls: "tc-hd-subhead", text: "Daily Goals" + (habit.unit ? ` (${habit.unit})` : "") });
+    let max = habit.goal > 0 ? habit.goal : 1;
+    for (const iso of monthIsos) max = Math.max(max, monthVals[iso]);
+    const chart = wrap.createEl("div", { cls: "tc-barchart" });
+    const tip = chart.createEl("div", { cls: "tc-bar-tip" });
+    tip.style.display = "none";
+    if (habit.goal > 0) {
+      const line = chart.createEl("div", { cls: "tc-bar-goalline" });
+      line.style.bottom = `${habit.goal / max * 100}%`;
+      line.createEl("span", { cls: "tc-bar-goallabel", text: t("\u0426\u0456\u043B\u044C") + " " + habit.goal });
     }
-
-    // ── left: habit list with week ring-header ───────────────────────────────
-    renderHabitList(root, habits, mobile) {
-        const bar = root.createEl('div', { cls: 'tc-cal-header' });
-        bar.createEl('div', { text: t('Звички'), cls: 'tc-cal-title' });
-        const ctr = bar.createEl('div', { cls: 'tc-cal-controls' });
-        const start = startOfWeek(this.anchor), wkEnd = addDays(start, 6);
-        const wkLabel = `${pad(start.getDate())}.${pad(start.getMonth() + 1)} – ${pad(wkEnd.getDate())}.${pad(wkEnd.getMonth() + 1)}`;
-        this.navGroup(ctr, wkLabel, dir => this.weekStep(dir));
-        const add = ctr.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(add, 'plus');
-        add.setAttribute('aria-label', t('Нова звичка')); add.onclick = () => this.openCreate();
-
-        const days = []; for (let i = 0; i < 7; i++) days.push(addDays(start, i));
-        const todayStr = todayISO();
-
-        const head = root.createEl('div', { cls: 'tc-hl-grid tc-hl-weekhead' });
-        head.createEl('div', { cls: 'tc-hl-corner' });
-        for (const d of days) {
-            const iso = toISO(d);
-            const col = head.createEl('div', { cls: iso === todayStr ? 'tc-hl-dayhead tc-hl-today' : 'tc-hl-dayhead' });
-            col.createEl('div', { text: WD_UA[(d.getDay() + 6) % 7], cls: 'tc-col-wd' });
-            let sum = 0; for (const h of habits) sum += habitProgress(this.val(iso, h), h);
-            makeRing(col, habits.length ? sum / habits.length : 0, 'var(--interactive-accent)', { size: 26, stroke: 3, center: String(d.getDate()) });
-        }
-
-        for (const habit of habits) {
-            const row = root.createEl('div', { cls: 'tc-hl-grid tc-hl-row' + (habit.id === this.selectedHabit ? ' is-selected' : '') });
-            const info = row.createEl('div', { cls: 'tc-hl-info' });
-            info.onclick = () => { this.selectedHabit = habit.id; if (this._narrow) this.mobileDetail = true; this.refresh(); };
-            const badge = info.createEl('div', { cls: 'tc-hl-badge', text: habit.emoji || '•' });
-            if (habit.color) badge.style.background = `color-mix(in srgb, ${habit.color} 30%, transparent)`;
-            const meta = info.createEl('div', { cls: 'tc-hl-meta' });
-            meta.createEl('div', { text: habit.name, cls: 'tc-hl-name' });
-            meta.createEl('div', { cls: 'tc-hl-streak', text: `🔥 ${this.currentStreak(habit)} ${t('дн.')}` });
-
-            for (const d of days) {
-                const iso = toISO(d);
-                const cell = row.createEl('div', { cls: 'tc-hl-cell' });
-                const v = this.val(iso, habit);
-                const w = makeRing(cell, habitProgress(v, habit), habit.color || 'var(--interactive-accent)', { size: 24, stroke: 3 });
-                if (habitDone(v, habit)) w.addClass('tc-ring-done');
-                this.cellInput(cell, habit, iso, v);
-            }
-        }
+    monthIsos.forEach((iso, idx) => {
+      const v = monthVals[iso];
+      const col = chart.createEl("div", { cls: "tc-bar-col" });
+      const fill = col.createEl("div", { cls: habitDone(v, habit) ? "tc-bar-fill tc-bar-done" : "tc-bar-fill" });
+      fill.style.height = `${Math.min(1, v / max) * 100}%`;
+      if (habit.color && habitDone(v, habit)) fill.style.background = habit.color;
+      col.addEventListener("mouseenter", () => {
+        tip.style.display = "";
+        tip.setText(String(v));
+        tip.style.left = `${(idx + 0.5) / monthIsos.length * 100}%`;
+      });
+      col.addEventListener("mouseleave", () => {
+        tip.style.display = "none";
+      });
+    });
+    const axis = wrap.createEl("div", { cls: "tc-barchart-axis" });
+    monthIsos.forEach((iso, idx) => {
+      const day = idx + 1;
+      const lab = axis.createEl("div", { cls: "tc-bar-axislabel" });
+      if (day === 1 || day % 5 === 0) lab.setText(String(day));
+    });
+  }
+  renderHeatmapBlock(root, habit) {
+    const wrap = root.createEl("div", { cls: "tc-heatblock" });
+    const hd = wrap.createEl("div", { cls: "tc-cal-header" });
+    hd.createEl("div", { text: t("\u0420\u0456\u043A"), cls: "tc-hd-subhead" });
+    this.navGroup(hd, String(this.anchor.getFullYear()), (dir) => this.yearStep(dir));
+    const yy = this.anchor.getFullYear();
+    const from = new Date(yy, 0, 1), to = new Date(yy, 11, 31);
+    const base = habit.color || "var(--interactive-accent)";
+    let max = habit.goal > 0 ? habit.goal : 1;
+    for (let d2 = new Date(from); d2 <= to; d2 = addDays(d2, 1)) max = Math.max(max, this.val(toISO(d2), habit));
+    const unit = habit.unit || (habit.type === "bool" ? t("\u0440\u0430\u0437\u0456\u0432") : "");
+    const activeWeek = toISO(startOfWeek(this.anchor));
+    const cols = wrap.createEl("div", { cls: "tc-heat tc-heat-year" });
+    let d = startOfWeek(from);
+    while (d <= to) {
+      const col = cols.createEl("div", { cls: "tc-heat-col" });
+      if (toISO(d) === activeWeek) col.addClass("tc-heat-col-active");
+      for (let i = 0; i < 7; i++) {
+        const day = addDays(d, i);
+        const iso = toISO(day);
+        const dim = day < from || day > to;
+        const v = dim ? 0 : this.val(iso, habit);
+        const cell = col.createEl("div", { cls: dim ? "tc-heat-cell tc-heat-dim" : "tc-heat-cell" });
+        cell.style.background = heatColor(base, heatLevel(v, max));
+        cell.title = `${iso}: ${v}${unit ? " " + unit : ""}`;
+      }
+      d = addDays(d, 7);
     }
-
-    // ── right: detail of the selected habit ──────────────────────────────────
-    renderHabitDetail(root, habits, mobile) {
-        const habit = habits.find(h => h.id === this.selectedHabit) || habits[0];
-
-        const head = root.createEl('div', { cls: 'tc-hd-head' });
-        if (mobile) {
-            const back = head.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(back, 'arrow-left');
-            back.setAttribute('aria-label', t('← Назад')); back.onclick = () => { this.mobileDetail = false; this.refresh(); };
-        }
-        const title = head.createEl('div', { cls: 'tc-hd-title' });
-        title.createEl('span', { cls: 'tc-hd-emoji', text: habit.emoji || '•' });
-        title.createEl('span', { text: habit.name });
-        if (!habit.auto) {
-            const more = head.createEl('button', { cls: 'clickable-icon' }); obsidian.setIcon(more, 'more-horizontal');
-            more.onclick = e => {
-                const menu = new obsidian.Menu();
-                menu.addItem(it => it.setTitle(t('Редагувати')).setIcon('pencil').onClick(() => {
-                    new HabitEditModal(this.app, this.plugin, habit, () => this.refresh()).open();
-                }));
-                menu.addItem(it => it.setTitle(t('Видалити')).setIcon('trash').onClick(async () => {
-                    this.plugin.settings.habits = this.plugin.settings.habits.filter(h => h.id !== habit.id);
-                    await this.plugin.saveSettings();
-                    this.selectedHabit = null; this.mobileDetail = false; this.refresh();
-                }));
-                menu.showAtMouseEvent(e);
-            };
-        }
-
-        // month (follows the shared anchor) + all-time aggregates — all synchronous
-        const y = this.anchor.getFullYear(), m = this.anchor.getMonth();
-        const last = new Date(y, m + 1, 0).getDate();
-        const monthIsos = []; for (let dd = 1; dd <= last; dd++) monthIsos.push(toISO(new Date(y, m, dd)));
-        const monthVals = {}; for (const iso of monthIsos) monthVals[iso] = this.val(iso, habit);
-
-        let monthChecks = 0, monthCount = 0;
-        for (const iso of monthIsos) { const v = monthVals[iso]; monthCount += v; if (habitDone(v, habit)) monthChecks++; }
-        const rate = monthIsos.length ? Math.round(monthChecks / monthIsos.length * 100) : 0;
-
-        let totalChecks = 0, totalCount = 0;
-        for (const { date } of this._files) { const v = this.val(date, habit); totalCount += v; if (habitDone(v, habit)) totalChecks++; }
-        const streak = this.currentStreak(habit);
-
-        const grid = root.createEl('div', { cls: 'tc-metric-grid' });
-        const card = (icon, label, value, sub) => {
-            const c = grid.createEl('div', { cls: 'tc-metric-card' });
-            const top = c.createEl('div', { cls: 'tc-metric-top' });
-            const ic = top.createEl('span', { cls: 'tc-metric-icon' }); obsidian.setIcon(ic, icon);
-            top.createEl('span', { text: label, cls: 'tc-metric-label' });
-            c.createEl('div', { text: String(value), cls: 'tc-metric-value' });
-            if (sub) c.createEl('div', { text: sub, cls: 'tc-metric-sub' });
-        };
-        card('check-circle', t('Щомісячні перевірки'), monthChecks, t('День'));
-        card('list', t('Загальна реєстрація'), totalChecks, t('День'));
-        card('percent', t('Щомісячна ставка реєстрації'), rate + ' %');
-        card('flame', t('Поточна серія'), streak, t('День'));
-        card('bar-chart', t('Щомісячне виконання'), monthCount, t('Рахунок'));
-        card('bar-chart-2', t('Загальний обсяг виконання'), totalCount, t('Рахунок'));
-
-        this.renderRingCalendar(root, habit, monthVals, y, m);
-        this.renderBarChart(root, habit, monthIsos, monthVals);
-        this.renderHeatmapBlock(root, habit);
+  }
+};
+var HabitCompleteModal = class extends obsidian6.Modal {
+  constructor(app, habit, iso, onDone) {
+    super(app);
+    this.habit = habit;
+    this.iso = iso;
+    this.onDone = onDone;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("tc-editor");
+    contentEl.createEl("h3", { text: `${this.habit.emoji ? this.habit.emoji + " " : ""}${this.habit.name}` });
+    const done = () => {
+      this.close();
+      if (this.onDone) this.onDone();
+    };
+    if (this.habit.type === "bool") {
+      const btns2 = contentEl.createEl("div", { cls: "tc-modal-btns" });
+      btns2.createEl("button", { text: t("\u0421\u043A\u0430\u0441\u0443\u0432\u0430\u0442\u0438") }).onclick = () => this.close();
+      btns2.createEl("button", { text: t("\u0412\u0438\u043A\u043E\u043D\u0430\u043D\u043E"), cls: "mod-cta" }).onclick = async () => {
+        await setHabitValue(this.app, this.iso, this.habit, true);
+        done();
+      };
+      return;
     }
+    let input;
+    const cur = readFrontmatter(this.app, this.iso)[this.habit.property];
+    const save = async () => {
+      const n = Number(input.getValue());
+      await setHabitValue(this.app, this.iso, this.habit, isNaN(n) || n <= 0 ? null : n);
+      done();
+    };
+    new obsidian6.Setting(contentEl).setName(`${t("\u0421\u043A\u0456\u043B\u044C\u043A\u0438")}${this.habit.unit ? " (" + this.habit.unit + ")" : ""}`).addText((c) => {
+      input = c;
+      c.inputEl.type = "number";
+      c.inputEl.style.width = "8em";
+      if (cur) c.setValue(String(cur));
+      c.inputEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") save();
+      });
+      setTimeout(() => c.inputEl.focus(), 0);
+    });
+    const btns = contentEl.createEl("div", { cls: "tc-modal-btns" });
+    btns.createEl("button", { text: t("\u0421\u043A\u0430\u0441\u0443\u0432\u0430\u0442\u0438") }).onclick = () => this.close();
+    btns.createEl("button", { text: t("\u0417\u0431\u0435\u0440\u0435\u0433\u0442\u0438"), cls: "mod-cta" }).onclick = save;
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
 
-    renderRingCalendar(root, habit, monthVals, y, m) {
-        const wrap = root.createEl('div', { cls: 'tc-ring-cal' });
-        const hd = wrap.createEl('div', { cls: 'tc-cal-header' });
-        hd.createEl('div', { text: t('Місяць'), cls: 'tc-hd-subhead' });
-        this.navGroup(hd, `${MONTHS_UA[m]} ${y}`, dir => this.monthStep(dir));
-
-        const grid = wrap.createEl('div', { cls: 'tc-ringcal-grid' });
-        for (const wd of weekdayHeaders()) grid.createEl('div', { text: wd, cls: 'tc-wd' });
-        const todayStr = todayISO();
-        const gs = startOfWeek(new Date(y, m, 1));
-        for (let i = 0; i < 42; i++) {
-            const d = addDays(gs, i);
-            const inMonth = d.getMonth() === m;
-            const iso = toISO(d);
-            const cell = grid.createEl('div', { cls: inMonth ? 'tc-ringcal-cell' : 'tc-ringcal-cell tc-outside' });
-            const v = inMonth ? monthVals[iso] : 0;
-            makeRing(cell, habitProgress(v, habit), habit.color || 'var(--interactive-accent)', { size: 34, stroke: 3, center: String(d.getDate()) });
-            if (iso === todayStr) cell.addClass('tc-today');
-            if (inMonth) this.cellInput(cell, habit, iso, v);
-        }
+// src/task-editor-modal.js
+var obsidian7 = __toESM(require("obsidian"), 1);
+var TaskEditorModal = class extends obsidian7.Modal {
+  constructor(app, task, onClose, plugin) {
+    super(app);
+    this.file = task.file;
+    this.line = task.line;
+    this.date = task.date;
+    this.project = !!task.project;
+    this.task = task;
+    this.onCloseCb = onClose;
+    this._plugin = plugin || null;
+    this.deleted = false;
+    this._lineSave = obsidian7.debounce(() => this.applyLine(), 400, false);
+    this._descSave = obsidian7.debounce(() => this.saveDescription(), 500, false);
+  }
+  get plugin() {
+    return this._plugin || this.app.plugins && this.app.plugins.plugins && this.app.plugins.plugins["markday"] || { settings: DEFAULT_SETTINGS };
+  }
+  async reload() {
+    const content = await this.app.vault.read(this.file);
+    const found = parseTasks(content, { inlineDate: this.project }).find((t2) => t2.line === this.line);
+    if (!found) {
+      this.task = null;
+      return;
     }
-
-    renderBarChart(root, habit, monthIsos, monthVals) {
-        const wrap = root.createEl('div', { cls: 'tc-barchart-wrap' });
-        wrap.createEl('div', { cls: 'tc-hd-subhead', text: 'Daily Goals' + (habit.unit ? ` (${habit.unit})` : '') });
-        let max = habit.goal > 0 ? habit.goal : 1;
-        for (const iso of monthIsos) max = Math.max(max, monthVals[iso]);
-
-        const chart = wrap.createEl('div', { cls: 'tc-barchart' });
-        const tip = chart.createEl('div', { cls: 'tc-bar-tip' }); tip.style.display = 'none';
-        if (habit.goal > 0) {
-            const line = chart.createEl('div', { cls: 'tc-bar-goalline' });
-            line.style.bottom = `${habit.goal / max * 100}%`;
-            line.createEl('span', { cls: 'tc-bar-goallabel', text: t('Ціль') + ' ' + habit.goal });
-        }
-        monthIsos.forEach((iso, idx) => {
-            const v = monthVals[iso];
-            const col = chart.createEl('div', { cls: 'tc-bar-col' });
-            const fill = col.createEl('div', { cls: habitDone(v, habit) ? 'tc-bar-fill tc-bar-done' : 'tc-bar-fill' });
-            fill.style.height = `${Math.min(1, v / max) * 100}%`;
-            if (habit.color && habitDone(v, habit)) fill.style.background = habit.color;
-            col.addEventListener('mouseenter', () => { tip.style.display = ''; tip.setText(String(v)); tip.style.left = `${(idx + 0.5) / monthIsos.length * 100}%`; });
-            col.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
-        });
-
-        const axis = wrap.createEl('div', { cls: 'tc-barchart-axis' });
-        monthIsos.forEach((iso, idx) => {
-            const day = idx + 1;
-            const lab = axis.createEl('div', { cls: 'tc-bar-axislabel' });
-            if (day === 1 || day % 5 === 0) lab.setText(String(day));
-        });
+    if (this.project) this.date = found.dateToken;
+    this.task = { ...found, file: this.file, date: this.date, project: this.project };
+  }
+  onOpen() {
+    this.renderAll();
+  }
+  // ── live persistence ─────────────────────────────────────────────────────
+  async applyLine() {
+    if (!this.deleted && this.task) await rewriteTaskLine(this.app, this.file, this.line, this.task);
+  }
+  async saveDescription() {
+    if (!this.deleted && this.task && this.descInput) await setDescription(this.app, this.file, this.task, this.descInput.value, this.plugin.settings);
+  }
+  // statusId: any configured checkbox status id (not just the 3 built-ins) — see STATUSES
+  async setStatus(statusId) {
+    const st = STATUSES.find((s) => s.id === statusId) || statusForChar(charForStatusId(statusId));
+    this.task.statusChar = st.char;
+    this.task.done = st.behavior === "done";
+    this.task.cancelled = st.behavior === "cancelled";
+    await this.applyLine();
+    this.renderAll();
+  }
+  dateLabel() {
+    const time = this.task.start ? " \xB7 " + (this.task.end ? `${this.task.start}\u2013${this.task.end}` : this.task.start) : "";
+    return (this.date ? humanDate(this.date) : t("\u0411\u0435\u0437 \u0434\u0430\u0442\u0438")) + time;
+  }
+  openDatePicker() {
+    const draft = { date: this.date, start: this.task.start, end: this.task.end };
+    const apply = async () => {
+      if (draft.date && draft.date !== this.date) {
+        const loc = await moveTaskToDay(this.app, this.task, draft.date, draft.start || null, draft.end || null, this.plugin.settings);
+        this.file = loc.file;
+        this.line = loc.line;
+        this.date = draft.date;
+      } else {
+        this.task.start = draft.start || null;
+        this.task.end = this.task.start && draft.end ? draft.end : null;
+        await this.applyLine();
+      }
+      this.renderAll();
+    };
+    new DatePickerModal(this.app, draft, apply).open();
+  }
+  async renderAll() {
+    await this.reload();
+    if (!this.task) {
+      this.close();
+      return;
     }
-
-    renderHeatmapBlock(root, habit) {
-        const wrap = root.createEl('div', { cls: 'tc-heatblock' });
-        const hd = wrap.createEl('div', { cls: 'tc-cal-header' });
-        hd.createEl('div', { text: t('Рік'), cls: 'tc-hd-subhead' });
-        this.navGroup(hd, String(this.anchor.getFullYear()), dir => this.yearStep(dir));
-
-        const yy = this.anchor.getFullYear();
-        const from = new Date(yy, 0, 1), to = new Date(yy, 11, 31);
-        const base = habit.color || 'var(--interactive-accent)';
-        let max = habit.goal > 0 ? habit.goal : 1;
-        for (let d = new Date(from); d <= to; d = addDays(d, 1)) max = Math.max(max, this.val(toISO(d), habit));
-        const unit = habit.unit || (habit.type === 'bool' ? t('разів') : '');
-        const activeWeek = toISO(startOfWeek(this.anchor));
-
-        const cols = wrap.createEl('div', { cls: 'tc-heat tc-heat-year' });
-        let d = startOfWeek(from);
-        while (d <= to) {
-            const col = cols.createEl('div', { cls: 'tc-heat-col' });
-            if (toISO(d) === activeWeek) col.addClass('tc-heat-col-active');
-            for (let i = 0; i < 7; i++) {
-                const day = addDays(d, i);
-                const iso = toISO(day);
-                const dim = day < from || day > to;
-                const v = dim ? 0 : this.val(iso, habit);
-                const cell = col.createEl('div', { cls: dim ? 'tc-heat-cell tc-heat-dim' : 'tc-heat-cell' });
-                cell.style.background = heatColor(base, heatLevel(v, max));
-                cell.title = `${iso}: ${v}${unit ? ' ' + unit : ''}`;
-            }
-            d = addDays(d, 7);
-        }
+    const tags = collectTags(this.app);
+    const groups = await collectGroups(this.app, this.plugin.settings);
+    this._groups = groups;
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("tc-editor", "tc-task-edit");
+    const l1 = contentEl.createEl("div", { cls: "tc-te-l1" });
+    const cb = makeStatusCheckbox(l1, this.task, (checked) => this.setStatus(checked ? "done" : "todo"), "tc-te-check");
+    cb.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      openStatusMenu(e, this.task, (st) => this.setStatus(st.id));
+    });
+    const dateBtn = l1.createEl("button", { cls: "tc-te-date" });
+    const dic = dateBtn.createEl("span", { cls: "tc-te-date-ic" });
+    obsidian7.setIcon(dic, "calendar");
+    dateBtn.createEl("span", { cls: "tc-te-date-txt", text: this.dateLabel() });
+    dateBtn.onclick = () => this.openDatePicker();
+    const prio = l1.createEl("button", { cls: "tc-te-prio clickable-icon" });
+    obsidian7.setIcon(prio, "alert-circle");
+    prio.setAttribute("aria-label", t("\u041F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442"));
+    if (this.task.priority) {
+      prio.addClass("is-set");
+      prio.style.color = prioColor(this.task.priority);
     }
+    prio.onclick = (e) => {
+      const menu = new obsidian7.Menu();
+      menu.addItem((it) => it.setTitle("\u2014").setChecked(!this.task.priority).onClick(async () => {
+        this.task.priority = null;
+        await this.applyLine();
+        this.renderAll();
+      }));
+      priorityKeys.forEach((k) => menu.addItem((it) => it.setTitle(k).setChecked(this.task.priority === k).onClick(async () => {
+        this.task.priority = k;
+        await this.applyLine();
+        this.renderAll();
+      })));
+      menu.showAtMouseEvent(e);
+    };
+    const titleInput = contentEl.createEl("input", { cls: "tc-title-input tc-te-title" });
+    titleInput.placeholder = t("\u041D\u0430\u0437\u0432\u0430 \u0437\u0430\u0434\u0430\u0447\u0456");
+    titleInput.value = this.task.text || "";
+    titleInput.addEventListener("input", () => {
+      this.task.text = titleInput.value;
+      this._lineSave();
+    });
+    titleInput.addEventListener("blur", () => {
+      this.task.text = titleInput.value.trim();
+      this.applyLine();
+    });
+    const l3 = contentEl.createEl("div", { cls: "tc-te-l3" });
+    const ta = l3.createEl("textarea", { cls: "tc-editor-desc" });
+    ta.rows = 4;
+    ta.placeholder = t("\u041E\u043F\u0438\u0441, \u0442\u0435\u0433\u0438 #, \u0433\u0440\u0443\u043F\u0438 @\u2026");
+    ta.value = this.task.desc || "";
+    this.descInput = ta;
+    ta.addEventListener("input", () => this._descSave());
+    ta.addEventListener("blur", () => this.saveDescription());
+    attachInlineTagAutocomplete(ta, tags, groups, (sig, val) => {
+      if (sig === "#") {
+        if (!this.task.tags.includes(val)) this.task.tags.push(val);
+        this.drawTagChips();
+      } else {
+        this.task.group = val;
+        this.renderGroupBadge();
+      }
+      this.applyLine();
+    });
+    this.subWrap = l3.createEl("div", { cls: "tc-te-subs" });
+    this.renderSubtasks();
+    this.tagChipsEl = l3.createEl("div", { cls: "tc-chips tc-te-tags" });
+    this.drawTagChips();
+    const l4 = contentEl.createEl("div", { cls: "tc-te-l4" });
+    this.groupSlot = l4.createEl("div", { cls: "tc-te-groupslot" });
+    this.renderGroupBadge();
+    const more = l4.createEl("button", { cls: "clickable-icon" });
+    obsidian7.setIcon(more, "more-horizontal");
+    more.setAttribute("aria-label", t("\u0429\u0435"));
+    more.onclick = (e) => this.moreMenu(e);
+  }
+  drawTagChips() {
+    this.tagChipsEl.empty();
+    for (const tg of this.task.tags || []) {
+      const chip = this.tagChipsEl.createEl("span", { cls: "tc-chip" });
+      chip.createSpan({ text: "#" + tg });
+      const col = COLORS.tags[tg];
+      if (col) tintBadge(chip, col);
+      chip.createEl("span", { text: "\u2715", cls: "tc-chip-x" }).onclick = () => {
+        this.task.tags = this.task.tags.filter((x) => x !== tg);
+        this.applyLine();
+        this.drawTagChips();
+      };
+    }
+    const add = this.tagChipsEl.createEl("span", { cls: "tc-chip tc-chip-add", text: "+" });
+    add.setAttribute("aria-label", t("\u0414\u043E\u0434\u0430\u0442\u0438 \u0442\u0435\u0433 \u0443 \u043E\u043F\u0438\u0441"));
+    add.onclick = () => {
+      this.descInput.focus();
+    };
+  }
+  renderGroupBadge() {
+    this.groupSlot.empty();
+    const badge = this.groupSlot.createEl("button", { cls: this.task.group ? "tc-te-group" : "tc-te-group tc-te-nogroup" });
+    badge.setText(this.task.group ? "@" + this.task.group : t("\u0431\u0435\u0437 \u0433\u0440\u0443\u043F\u0438"));
+    if (this.task.group) tintBadge(badge, COLORS.groups[this.task.group] || autoColor(this.task.group));
+    badge.onclick = (e) => {
+      const menu = new obsidian7.Menu();
+      menu.addItem((it) => it.setTitle(t("\u0431\u0435\u0437 \u0433\u0440\u0443\u043F\u0438")).setChecked(!this.task.group).onClick(async () => {
+        this.task.group = null;
+        await this.applyLine();
+        this.renderGroupBadge();
+      }));
+      for (const g of this._groups || []) menu.addItem((it) => it.setTitle("@" + g).setChecked(this.task.group === g).onClick(async () => {
+        this.task.group = g;
+        await this.applyLine();
+        this.renderGroupBadge();
+      }));
+      menu.showAtMouseEvent(e);
+    };
+  }
+  moreMenu(e) {
+    const menu = new obsidian7.Menu();
+    menu.addItem((it) => it.setTitle(t("\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u043D\u043E\u0442\u0430\u0442\u043A\u0443")).setIcon("file-text").onClick(() => {
+      openDay(this.app, this.date);
+      this.close();
+    }));
+    if (this.task.recId) {
+      menu.addItem((it) => it.setTitle(t("\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438 \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0443 \u0437\u0430\u0434\u0430\u0447\u0443")).setIcon("repeat").onClick(() => {
+        const rule = (this.plugin.settings.recurrences || []).find((r) => r.id === this.task.recId);
+        if (rule) new RecurrenceEditModal(this.app, this.plugin, rule, () => this.plugin.refreshViews && this.plugin.refreshViews()).open();
+      }));
+    } else {
+      menu.addItem((it) => it.setTitle(t("\u0417\u0440\u043E\u0431\u0438\u0442\u0438 \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u043E\u044E")).setIcon("repeat").onClick(() => this.convertToRecurring()));
+    }
+    menu.addSeparator();
+    menu.addItem((it) => it.setTitle(t("\u0412\u0438\u0434\u0430\u043B\u0438\u0442\u0438")).setIcon("trash").onClick(async () => {
+      await removeTaskBlock(this.app, this.file, this.task);
+      this.deleted = true;
+      this.close();
+    }));
+    menu.showAtMouseEvent(e);
+  }
+  convertToRecurring() {
+    const rec = { freq: "daily", interval: 1, weekdays: [], monthMode: "day", monthday: "", nth: 1, weekday: 0, which: "first", month: (/* @__PURE__ */ new Date()).getMonth() };
+    new RecurrenceCustomModal(this.app, rec, async () => {
+      const rule = buildRule(serializeTaskBody(this.task), this.date || todayISO(), null, rec);
+      this.plugin.settings.recurrences.push(rule);
+      await this.plugin.saveSettings();
+      await removeTaskBlock(this.app, this.file, this.task);
+      this.deleted = true;
+      if (this.plugin.refreshViews) this.plugin.refreshViews();
+      this.close();
+    }).open();
+  }
+  renderSubtasks() {
+    this.subWrap.empty();
+    for (const s of this.task.subtasks) {
+      const r = this.subWrap.createEl("div", { cls: "tc-subrow" });
+      makeCheckbox(r, s.done, async (checked) => {
+        await toggleSubtask(this.app, this.file, this.line, s.line, checked);
+        await this.reload();
+        this.renderSubtasks();
+      });
+      r.createEl("span", { text: s.text || "(\u043F\u043E\u0440\u043E\u0436\u043D\u044F)", cls: s.done ? "tc-label tc-done" : "tc-label" });
+      r.createEl("span", { text: "\u2715", cls: "tc-del" }).onclick = async () => {
+        await removeSubtask(this.app, this.file, this.line, s.line);
+        await this.reload();
+        this.renderSubtasks();
+      };
+    }
+    const add = this.subWrap.createEl("div", { cls: "tc-add-row" });
+    const inp = add.createEl("input", { cls: "tc-input" });
+    inp.type = "text";
+    inp.placeholder = t("+ \u043F\u0456\u0434\u0437\u0430\u0434\u0430\u0447\u0430");
+    inp.addEventListener("keydown", async (e) => {
+      if (e.key !== "Enter") return;
+      const v = inp.value.trim();
+      if (!v) return;
+      await addChild(this.app, this.file, this.task, `- [ ] ${v}`);
+      await this.reload();
+      this.renderSubtasks();
+    });
+  }
+  onClose() {
+    const text = this.descInput ? this.descInput.value : null;
+    this.contentEl.empty();
+    (async () => {
+      if (!this.deleted && this.task) {
+        await this.applyLine();
+        if (text != null) await setDescription(this.app, this.file, this.task, text, this.plugin.settings);
+      }
+      if (this.onCloseCb) this.onCloseCb();
+    })();
+  }
+};
+
+// src/render.js
+function makeCheckbox(parent, checked, onChange, cls) {
+  const input = parent.createEl("input", cls ? { cls } : {});
+  input.type = "checkbox";
+  input.checked = checked;
+  input.addEventListener("change", () => {
+    if (onChange) onChange(input.checked);
+  });
+  return input;
+}
+function makeStatusCheckbox(parent, task, onChange, cls) {
+  const st = statusForChar(taskMark(task));
+  const isCustom = st.behavior === "cancelled" || st.behavior === "active" && st.id && st.id !== "todo";
+  if (isCustom) {
+    const boxCls = st.behavior === "cancelled" ? "tc-xbox" : "tc-statusbox";
+    const box = parent.createEl("span", { cls: cls ? `${boxCls} ${cls}` : boxCls });
+    if (st.icon) obsidian8.setIcon(box, st.icon);
+    else box.setText(st.char.trim() ? st.char : "\u2715");
+    box.setAttribute("aria-label", t(st.label));
+    box.addEventListener("click", (e) => {
+      e.stopPropagation();
+      onChange(true);
+    });
+    return box;
+  }
+  return makeCheckbox(parent, task.done, onChange, cls);
+}
+async function completeTask(app, task, checked, settings, cascade = true) {
+  if (task.virtual) return materializeVirtual(app, task, checked, settings);
+  if (cascade && task.subtasks && task.subtasks.length) return toggleTaskCascade(app, task.file, task, checked);
+  return toggleTask(app, task.file, task.line, checked);
+}
+async function materializeAndEdit(app, task, settings, refresh, plugin) {
+  const { file, line } = await materializeVirtual(app, task, false, settings);
+  const created = parseTasks(await app.vault.read(file)).find((x) => x.line === line);
+  await refresh();
+  if (created) new TaskEditorModal(app, { ...created, file, date: task.date }, refresh, plugin).open();
+}
+function openStatusMenu(e, task, onPick) {
+  const menu = new obsidian8.Menu();
+  const current = taskMark(task);
+  for (const st of STATUSES) {
+    menu.addItem((i) => {
+      i.setTitle(st.icon ? t(st.label) : `${st.char.trim() ? st.char : "\xB7"}  ${t(st.label)}`).setChecked(current === st.char).onClick(() => onPick(st));
+      if (st.icon) i.setIcon(st.icon);
+    });
+  }
+  menu.showAtPosition({ x: e.clientX, y: e.clientY });
+}
+function tintBadge(el, color) {
+  if (!color) return;
+  el.addClass("tc-tinted");
+  el.style.setProperty("--chip", color);
+}
+function applyCardColor(el, task, colorBy, priorityDot) {
+  const base = cardColor(task, colorBy);
+  if (base) {
+    el.addClass("tc-colored");
+    el.style.setProperty("--card-color", base);
+  }
+  if (priorityDot && colorBy !== "priority" && task.priority) {
+    el.createEl("span", { cls: "tc-prio-dot" }).style.background = prioColor(task.priority);
+  }
+}
+function renderBadges(container, task, s) {
+  s = s || {};
+  if (task.priority && s.showPriority !== false) {
+    const b = container.createEl("span", { text: task.priority, cls: "tc-badge" });
+    tintBadge(b, prioColor(task.priority));
+  }
+  if (task.group && s.showGroups !== false) {
+    const b = container.createEl("span", { text: `@${task.group}`, cls: "tc-badge tc-group" });
+    tintBadge(b, COLORS.groups[task.group]);
+  }
+  if (s.showTags !== false) {
+    for (const tag of task.tags) {
+      const b = container.createEl("span", { text: `#${tag}`, cls: "tc-badge tc-tag" });
+      tintBadge(b, COLORS.tags[tag]);
+    }
+  }
+}
+function renderTaskRow(app, container, task, refresh, opts = {}) {
+  const s = opts.settings || {};
+  const wrapper = container.createEl("div", { cls: "tc-item" });
+  const row = wrapper.createEl("div", { cls: "tc-row" });
+  if (task.priority) row.style.setProperty("--card-color", prioColor(task.priority));
+  if (task.start) row.addClass("tc-event");
+  if (task.virtual) row.addClass("tc-virtual");
+  if (task.recId || task.virtual) row.addClass("tc-recurring");
+  if (task.done) row.addClass("tc-row-done");
+  if (task.cancelled) row.addClass("tc-cancelled");
+  const subs = task.subtasks || [];
+  const cb = makeStatusCheckbox(row, task, async (checked) => {
+    await completeTask(app, task, checked, s);
+    await refresh();
+  }, "tc-cb");
+  cb.onclick = (e) => e.stopPropagation();
+  if (!task.virtual && task.file) {
+    const statusMenu = async (e) => openStatusMenu(e, task, async (st) => {
+      await setTaskStatus(app, task.file, task.line, st.id);
+      await refresh();
+    });
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      statusMenu(e);
+    });
+    attachLongPress(row, statusMenu);
+    attachSwipeComplete(row, async () => {
+      await completeTask(app, task, !task.done, s);
+      await refresh();
+    });
+  }
+  const main = row.createEl("div", { cls: "tc-row-main" });
+  const top = main.createEl("div", { cls: "tc-row-top" });
+  top.createEl("span", { text: task.text || "(\u043F\u043E\u0440\u043E\u0436\u043D\u044F \u0437\u0430\u0434\u0430\u0447\u0430)", cls: "tc-label" });
+  const right = top.createEl("span", { cls: "tc-row-right" });
+  if (subs.length) {
+    const done = subs.filter((x) => x.done).length;
+    const ring = makeRing(right, done / subs.length, "var(--interactive-accent)", { size: 16, stroke: 2.5 });
+    ring.addClass("tc-subprog");
+    ring.setAttribute("aria-label", `${done}/${subs.length}`);
+  }
+  if (opts.overdue && task.date) {
+    const d = parseISO(task.date);
+    right.createEl("span", { text: `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`, cls: "tc-date-chip tc-overdue-date" });
+  } else {
+    if (opts.showDate && task.date) right.createEl("span", { text: task.date, cls: "tc-date-chip" });
+    if (task.start) right.createEl("span", { text: task.end ? `${task.start}\u2013${task.end}` : task.start, cls: "tc-time" });
+  }
+  renderBadges(main.createEl("div", { cls: "tc-badges" }), task, s);
+  if (opts.showDetails && task.desc) main.createEl("div", { text: task.desc, cls: "tc-desc-preview" });
+  row.addClass("tc-clickable");
+  if (!task.virtual && task.file) {
+    row.onclick = () => new TaskEditorModal(app, task, refresh, opts.plugin).open();
+  } else if (task.virtual) {
+    row.onclick = () => materializeAndEdit(app, task, s, refresh, opts.plugin);
+  }
+  return wrapper;
+}
+function renderHabitStrip(app, container, habits, vals, iso, onDone) {
+  const list = habits.filter((h) => !h.auto);
+  if (!list.length) return false;
+  const strip = container.createEl("div", { cls: "tc-habit-strip" });
+  for (const h of list) {
+    const b = strip.createEl("button", { cls: vals[h.id] > 0 ? "tc-habit-chip is-done" : "tc-habit-chip" });
+    if (h.color) b.style.setProperty("--hc", h.color);
+    b.createSpan({ text: h.emoji || "\u2022", cls: "tc-habit-chip-emoji" });
+    b.createSpan({ text: h.name, cls: "tc-habit-chip-name" });
+    b.onclick = () => new HabitCompleteModal(app, h, iso, onDone).open();
+  }
+  return true;
+}
+function quickAdd(app, container, dateStr, refresh, placeholder, settings) {
+  const wrap = container.createEl("div", { cls: "tc-add-row" });
+  const input = wrap.createEl("input", { cls: "tc-input" });
+  input.type = "text";
+  input.placeholder = placeholder || "\u041D\u043E\u0432\u0430 \u0437\u0430\u0434\u0430\u0447\u0430...";
+  const doAdd = async () => {
+    const text = input.value.trim();
+    if (!text) return;
+    const file = await getOrCreateDateFile(app, dateStr);
+    await addTask(app, file, text, settings);
+    await refresh();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doAdd();
+  });
+  return wrap;
 }
 
-// ─── Settings tab ────────────────────────────────────────────────────────────
-
-class TaskCalendarSettingTab extends obsidian.PluginSettingTab {
-    constructor(app, plugin) {
-        super(app, plugin);
-        this.plugin = plugin;
+// src/timeline.js
+var HOUR_PX = 50;
+var _tlDragTask = null;
+function minToHHMM(min) {
+  return `${pad(Math.floor(min / 60))}:${pad(min % 60)}`;
+}
+function snapStep(min, step) {
+  return Math.round(min / step) * step;
+}
+function clampMin(v, lo, hi) {
+  return Math.min(hi, Math.max(lo, v));
+}
+function renderTimeline(view, root, n) {
+  const app = view.app;
+  const settings = view.plugin.settings;
+  const refresh = () => view.refresh();
+  const map = view._map;
+  const workStart = settings.workStart ?? 8;
+  const workEnd = settings.workEnd ?? 20;
+  const step = settings.snapMinutes || 15;
+  const start = view.rangeStartDate();
+  const todayStr = todayISO();
+  const days = [];
+  let minStart = Infinity, maxEnd = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const day = addDays(start, i);
+    const iso = toISO(day);
+    const entry = map.get(iso);
+    const tasks = entry ? entry.tasks.slice() : [];
+    for (const t2 of tasks) {
+      if (!t2.start) continue;
+      const s = timeMin(t2.start);
+      const e = t2.end ? timeMin(t2.end) : s + 60;
+      if (s < minStart) minStart = s;
+      if (e > maxEnd) maxEnd = e;
     }
-
-    display() {
-        const { containerEl } = this;
-        containerEl.empty();
-
-        containerEl.createEl('h3', { text: 'Markday' });
-
-        new obsidian.Setting(containerEl)
-            .setName(t('Мова'))
-            .addDropdown(d => {
-                d.addOption('auto', t('Авто')).addOption('uk', 'Українська').addOption('en', 'English');
-                d.setValue(this.plugin.settings.language || 'auto');
-                d.onChange(async v => { this.plugin.settings.language = v; await this.plugin.saveSettings(); this.display(); });
-            });
-
-        const dn = getDailyNotesConfig(this.app);
-        const loc = dn.folder ? `${dn.folder}/` : '(vault root)';
-        containerEl.createEl('p', {
-            text: `Daily Notes: ${loc}${dn.format}.md`,
-            cls: 'setting-item-description'
+    days.push({ day, iso, tasks });
+  }
+  if (days.some((d) => d.iso === todayStr)) {
+    const nowMin = (/* @__PURE__ */ new Date()).getHours() * 60 + (/* @__PURE__ */ new Date()).getMinutes();
+    if (nowMin < minStart) minStart = nowMin;
+    if (nowMin > maxEnd) maxEnd = nowMin;
+  }
+  let rangeStart = workStart;
+  let rangeEnd = workEnd;
+  if (minStart !== Infinity && minStart < rangeStart * 60) rangeStart = Math.floor(minStart / 60);
+  if (maxEnd !== -Infinity && maxEnd > rangeEnd * 60) rangeEnd = Math.ceil(maxEnd / 60);
+  if (view.showEarly) rangeStart = 0;
+  if (view.showLate) rangeEnd = 24;
+  rangeStart = Math.max(0, Math.min(rangeStart, workStart));
+  rangeEnd = Math.min(24, Math.max(rangeEnd, workEnd));
+  if (rangeStart >= rangeEnd) {
+    rangeStart = 0;
+    rangeEnd = 24;
+  }
+  const rangeStartMin = rangeStart * 60;
+  const rangeEndMin = rangeEnd * 60;
+  const gridH = (rangeEnd - rangeStart) * HOUR_PX;
+  const ctx = { rangeStartMin, rangeEndMin, step, refresh, colorBy: settings.colorBy, priorityDot: settings.priorityDot };
+  const wrap = root.createEl("div", { cls: "tc-tl" });
+  wrap.style.setProperty("--tc-col-count", String(n));
+  const header = wrap.createEl("div", { cls: "tc-tl-header" });
+  header.createEl("div", { cls: "tc-tl-corner" });
+  for (const d of days) {
+    const h = header.createEl("div", { cls: "tc-tl-dayhead" });
+    if (d.iso === todayStr) h.addClass("tc-col-today");
+    h.createEl("span", { text: WD_UA[mondayIdx(d.day)], cls: "tc-col-wd" });
+    h.createEl("span", { text: `${pad(d.day.getDate())}.${pad(d.day.getMonth() + 1)}`, cls: "tc-col-date" });
+  }
+  const allday = wrap.createEl("div", { cls: "tc-tl-allday" });
+  allday.createEl("div", { cls: "tc-tl-axislabel", text: t("\u0432\u0435\u0441\u044C \u0434\u0435\u043D\u044C") });
+  for (const d of days) {
+    const cell = allday.createEl("div", { cls: "tc-tl-alldaycell" });
+    quickAdd(app, cell, d.iso, refresh, t("+ \u0437\u0430\u0434\u0430\u0447\u0430"), settings);
+    d.tasks.filter((t2) => !t2.start).sort(dayOrder).forEach((t2) => {
+      const w = renderAllDayChip(view, cell, t2, ctx);
+      if (!t2.virtual && t2.file) {
+        w.setAttribute("draggable", "true");
+        w.addEventListener("dragstart", (e) => {
+          _tlDragTask = t2;
+          e.dataTransfer.effectAllowed = "move";
         });
+        w.addEventListener("dragend", () => {
+          _tlDragTask = null;
+        });
+      }
+    });
+  }
+  if (rangeStart > 0) {
+    const s = wrap.createEl("div", { cls: "tc-tl-strip" });
+    s.createEl("span", { text: `\u25BE 00:00 \u2013 ${pad(rangeStart)}:00` });
+    s.onclick = () => {
+      view.showEarly = true;
+      refresh();
+    };
+  }
+  const grid = wrap.createEl("div", { cls: "tc-tl-grid" });
+  grid.style.height = `${gridH}px`;
+  const axis = grid.createEl("div", { cls: "tc-tl-axis" });
+  for (let h = rangeStart; h < rangeEnd; h++) {
+    const hr = axis.createEl("div", { cls: "tc-tl-hour" });
+    hr.style.height = `${HOUR_PX}px`;
+    hr.createEl("span", { text: `${pad(h)}:00` });
+  }
+  view._tlCols = [];
+  for (const d of days) {
+    const col = grid.createEl("div", { cls: "tc-tl-col" });
+    if (d.iso === todayStr) col.addClass("tc-col-today");
+    view._tlCols.push({ iso: d.iso, el: col });
+    for (let h = rangeStart; h < rangeEnd; h++) {
+      col.createEl("div", { cls: "tc-tl-hourline" }).style.height = `${HOUR_PX}px`;
+    }
+    const dIso = d.iso;
+    bindGridCreate(col, dIso, ctx, view);
+    col.addEventListener("dragover", (e) => {
+      if (_tlDragTask) {
+        e.preventDefault();
+        col.addClass("tc-tl-col-drop");
+      }
+    });
+    col.addEventListener("dragleave", () => col.removeClass("tc-tl-col-drop"));
+    col.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      col.removeClass("tc-tl-col-drop");
+      const t2 = _tlDragTask;
+      _tlDragTask = null;
+      if (!t2) return;
+      const y = e.clientY - col.getBoundingClientRect().top;
+      const min = clampMin(snapStep(rangeStartMin + y / HOUR_PX * 60, step), rangeStartMin, rangeEndMin - step);
+      if (t2.date === dIso) {
+        t2.start = minToHHMM(min);
+        t2.end = null;
+        await rewriteTaskLine(app, t2.file, t2.line, t2);
+      } else {
+        await moveTaskToDay(app, t2, dIso, minToHHMM(min), null, settings);
+      }
+      refresh();
+    });
+    const evs = d.tasks.filter((t2) => t2.start).map((t2) => ({
+      t: t2,
+      sm: timeMin(t2.start),
+      em: t2.end ? timeMin(t2.end) : timeMin(t2.start) + 15
+    }));
+    assignColumns(evs);
+    for (const ev of evs) renderEventCard(view, col, ev.t, ctx, ev);
+  }
+  if (rangeEnd < 24) {
+    const s = wrap.createEl("div", { cls: "tc-tl-strip" });
+    s.createEl("span", { text: `\u25B4 ${pad(rangeEnd)}:00 \u2013 24:00` });
+    s.onclick = () => {
+      view.showLate = true;
+      refresh();
+    };
+  }
+  if (view._nowTimer) {
+    clearInterval(view._nowTimer);
+    view._nowTimer = null;
+  }
+  if (days.some((d) => d.iso === todayStr)) {
+    const nowLine = grid.createEl("div", { cls: "tc-tl-now" });
+    const place = () => {
+      const m = /* @__PURE__ */ new Date();
+      const mm = m.getHours() * 60 + m.getMinutes();
+      if (mm < rangeStartMin || mm > rangeEndMin) {
+        nowLine.style.display = "none";
+        return;
+      }
+      nowLine.style.display = "";
+      nowLine.style.top = `${(mm - rangeStartMin) / 60 * HOUR_PX}px`;
+    };
+    place();
+    view._nowTimer = window.setInterval(() => {
+      if (!nowLine.isConnected) {
+        clearInterval(view._nowTimer);
+        view._nowTimer = null;
+        return;
+      }
+      place();
+    }, 6e4);
+  }
+}
+function assignColumns(items) {
+  items.sort((a, b) => a.sm - b.sm || a.em - b.em);
+  let i = 0;
+  while (i < items.length) {
+    let j = i + 1;
+    let clusterEnd = items[i].em;
+    const cluster = [items[i]];
+    while (j < items.length && items[j].sm < clusterEnd) {
+      cluster.push(items[j]);
+      clusterEnd = Math.max(clusterEnd, items[j].em);
+      j++;
+    }
+    const colEnds = [];
+    for (const ev of cluster) {
+      let placed = false;
+      for (let c = 0; c < colEnds.length; c++) {
+        if (ev.sm >= colEnds[c]) {
+          ev.col = c;
+          colEnds[c] = ev.em;
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        ev.col = colEnds.length;
+        colEnds.push(ev.em);
+      }
+    }
+    for (const ev of cluster) ev.cols = colEnds.length;
+    i = j;
+  }
+}
+function bindGridCreate(col, dIso, ctx, view) {
+  const isEmptyGrid = (target) => target === col || target.classList.contains("tc-tl-hourline");
+  const startSession = (clientY0) => {
+    const rect = col.getBoundingClientRect();
+    const toMin = (y) => ctx.rangeStartMin + (y - rect.top) / HOUR_PX * 60;
+    const preview = col.createEl("div", { cls: "tc-tl-event tc-tl-preview" });
+    const a = toMin(clientY0);
+    let b = a, moved = false;
+    const paint = () => {
+      const lo = Math.min(a, b), hi = Math.max(a, b);
+      preview.style.top = `${(lo - ctx.rangeStartMin) / 60 * HOUR_PX}px`;
+      preview.style.height = `${Math.max((hi - lo) / 60 * HOUR_PX, 6)}px`;
+    };
+    paint();
+    return {
+      move(clientY) {
+        b = toMin(clientY);
+        if (Math.abs(b - a) > 4) moved = true;
+        paint();
+      },
+      async finish() {
+        preview.remove();
+        let lo = clampMin(snapStep(Math.min(a, b), ctx.step), ctx.rangeStartMin, ctx.rangeEndMin - ctx.step);
+        let hi = moved ? clampMin(snapStep(Math.max(a, b), ctx.step), lo + ctx.step, ctx.rangeEndMin) : lo + 60;
+        hi = clampMin(hi, lo + ctx.step, ctx.rangeEndMin);
+        const file = await getOrCreateDateFile(view.app, dIso);
+        const lineNum = await addTask(view.app, file, `${minToHHMM(lo)}-${minToHHMM(hi)} ${t("\u041D\u043E\u0432\u0430 \u043F\u043E\u0434\u0456\u044F")}`, view.plugin.settings);
+        const created = parseTasks(await view.app.vault.read(file)).find((x) => x.line === lineNum);
+        if (created) new TaskEditorModal(view.app, { ...created, file, date: dIso }, () => view.refresh(), view.plugin).open();
+        else view.refresh();
+      }
+    };
+  };
+  col.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "touch") return;
+    if (e.button !== 0) return;
+    if (!isEmptyGrid(e.target)) return;
+    e.preventDefault();
+    const session2 = startSession(e.clientY);
+    const onMove = (ev) => session2.move(ev.clientY);
+    const onUp = async () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      await session2.finish();
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  });
+  let session = null;
+  attachHoldDrag(col, {
+    accept: (e) => isEmptyGrid(e.target),
+    onStart: (x, y) => {
+      session = startSession(y);
+    },
+    onMove: (x, y) => {
+      if (session) session.move(y);
+    },
+    onEnd: async () => {
+      const s = session;
+      session = null;
+      if (s) await s.finish();
+    }
+  });
+}
+function renderAllDayChip(view, cell, task, ctx) {
+  const app = view.app;
+  const card = cell.createEl("div", { cls: "tc-tl-allday-card" });
+  applyCardColor(card, task, ctx.colorBy, ctx.priorityDot);
+  if (task.virtual) card.addClass("tc-virtual");
+  if (task.recId && !task.virtual) card.addClass("tc-tl-recurring");
+  if (task.done) card.addClass("tc-tl-done");
+  if (task.cancelled) card.addClass("tc-cancelled");
+  const cb = makeStatusCheckbox(card, task, async (checked) => {
+    await completeTask(app, task, checked, view.plugin.settings);
+    ctx.refresh();
+  }, "tc-tl-cb");
+  cb.addEventListener("click", (e) => e.stopPropagation());
+  card.createEl("span", { cls: "tc-tl-event-title", text: task.text || "(\u0431\u0435\u0437 \u043D\u0430\u0437\u0432\u0438)" });
+  if (task.virtual || !task.file) card.onclick = () => materializeAndEdit(app, task, view.plugin.settings, ctx.refresh, view.plugin);
+  else {
+    card.onclick = () => new TaskEditorModal(app, task, () => view.refresh(), view.plugin).open();
+    card.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openStatusMenu(e, task, async (st) => {
+        await setTaskStatus(app, task.file, task.line, st.id);
+        ctx.refresh();
+      });
+    });
+  }
+  return card;
+}
+function renderEventCard(view, col, task, ctx, layout) {
+  const app = view.app;
+  const sm = timeMin(task.start);
+  const em = task.end ? timeMin(task.end) : sm + 15;
+  const pxPerMin = HOUR_PX / 60;
+  const compact = em - sm <= 30;
+  const card = col.createEl("div", { cls: compact ? "tc-tl-event tc-tl-event-compact" : "tc-tl-event" });
+  card.style.top = `${(sm - ctx.rangeStartMin) * pxPerMin}px`;
+  card.style.height = `${Math.max((em - sm) * pxPerMin, 20)}px`;
+  if (layout && layout.cols > 1) {
+    card.style.left = `calc(${(layout.col / layout.cols * 100).toFixed(4)}% + 1px)`;
+    card.style.width = `calc(${(100 / layout.cols).toFixed(4)}% - 2px)`;
+    card.style.right = "auto";
+  }
+  applyCardColor(card, task, ctx.colorBy, ctx.priorityDot);
+  if (task.virtual) card.addClass("tc-virtual");
+  if (task.recId && !task.virtual) card.addClass("tc-tl-recurring");
+  if (task.done) card.addClass("tc-tl-done");
+  if (task.cancelled) card.addClass("tc-cancelled");
+  const cb = makeStatusCheckbox(card, task, async (checked) => {
+    await completeTask(app, task, checked, view.plugin.settings, false);
+    ctx.refresh();
+  }, "tc-tl-cb");
+  cb.addEventListener("pointerdown", (e) => e.stopPropagation());
+  cb.addEventListener("click", (e) => e.stopPropagation());
+  const body = card.createEl("div", { cls: compact ? "tc-tl-event-body tc-tl-event-body-row" : "tc-tl-event-body" });
+  const tag = compact ? "span" : "div";
+  body.createEl(tag, { cls: "tc-tl-event-title", text: task.text || "(\u0431\u0435\u0437 \u043D\u0430\u0437\u0432\u0438)" });
+  card._timeEl = body.createEl(tag, {
+    cls: "tc-tl-event-time",
+    text: task.end ? `${task.start}\u2013${task.end}` : task.start
+  });
+  if (task.virtual || !task.file) {
+    card.addClass("tc-tl-event-virtual");
+    card.onclick = () => materializeAndEdit(app, task, view.plugin.settings, ctx.refresh, view.plugin);
+    return;
+  }
+  card.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openStatusMenu(e, task, async (st) => {
+      await setTaskStatus(app, task.file, task.line, st.id);
+      ctx.refresh();
+    });
+  });
+  const topH = card.createEl("div", { cls: "tc-tl-handle tc-tl-handle-top" });
+  const botH = card.createEl("div", { cls: "tc-tl-handle tc-tl-handle-bottom" });
+  bindTimelineDrag(card, card, task, view, ctx, "move");
+  bindTimelineDrag(topH, card, task, view, ctx, "resize-top");
+  bindTimelineDrag(botH, card, task, view, ctx, "resize-bottom");
+}
+function bindTimelineDrag(handleEl, card, task, view, ctx, mode) {
+  const pxPerMin = HOUR_PX / 60;
+  handleEl.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const startY = e.clientY;
+    const origStart = timeMin(task.start);
+    const origEnd = task.end ? timeMin(task.end) : origStart + 60;
+    const hadEnd = task.end != null;
+    const dur = origEnd - origStart;
+    let moved = false;
+    let ns = origStart, ne = origEnd;
+    let targetIso = task.date;
+    const paint = () => {
+      card.style.top = `${(ns - ctx.rangeStartMin) * pxPerMin}px`;
+      card.style.height = `${Math.max((ne - ns) * pxPerMin, 30)}px`;
+      if (card._timeEl) {
+        const showEnd = mode !== "move" || hadEnd;
+        card._timeEl.textContent = showEnd ? `${minToHHMM(ns)}\u2013${minToHHMM(ne)}` : minToHHMM(ns);
+      }
+    };
+    const onMove = (ev) => {
+      if (Math.abs(ev.clientY - startY) > 3) moved = true;
+      const d = snapStep((ev.clientY - startY) / pxPerMin, ctx.step);
+      if (mode === "move") {
+        ns = clampMin(origStart + d, ctx.rangeStartMin, ctx.rangeEndMin - dur);
+        ne = ns + dur;
+      } else if (mode === "resize-top") {
+        ns = clampMin(origStart + d, ctx.rangeStartMin, origEnd - ctx.step);
+        ne = origEnd;
+      } else {
+        ne = clampMin(origEnd + d, origStart + ctx.step, ctx.rangeEndMin);
+        ns = origStart;
+      }
+      if (mode === "move" && view._tlCols) {
+        for (const c of view._tlCols) {
+          const r = c.el.getBoundingClientRect();
+          if (ev.clientX >= r.left && ev.clientX < r.right) {
+            if (c.iso !== targetIso) {
+              targetIso = c.iso;
+              c.el.appendChild(card);
+              moved = true;
+            }
+            break;
+          }
+        }
+      }
+      paint();
+    };
+    const onUp = async () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (!moved) {
+        if (mode === "move") new TaskEditorModal(view.app, task, () => view.refresh(), view.plugin).open();
+        return;
+      }
+      const start = minToHHMM(ns);
+      const end = mode === "move" ? hadEnd ? minToHHMM(ne) : null : minToHHMM(ne);
+      if (mode === "move" && targetIso !== task.date) {
+        await moveTaskToDay(view.app, task, targetIso, start, end, view.plugin.settings);
+      } else {
+        task.start = start;
+        task.end = end;
+        await rewriteTaskLine(view.app, task.file, task.line, task);
+      }
+      view.refresh();
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  });
+}
 
-        new obsidian.Setting(containerEl)
-            .setName(t('Рівень заголовка'))
-            .setDesc(t('Під яким рівнем заголовка зберігати задачі (# = 1 … ###### = 6)'))
-            .addDropdown(d => {
-                for (let i = 1; i <= 6; i++) d.addOption(String(i), `${'#'.repeat(i)} (рівень ${i})`);
-                d.setValue(String(this.plugin.settings.headingLevel));
-                d.onChange(async v => {
-                    this.plugin.settings.headingLevel = Number(v);
-                    await this.plugin.saveSettings();
+// src/calendar-view.js
+var CAL_MODES = [["month", "\u041C\u0456\u0441\u044F\u0446\u044C"], ["week", "\u0422\u0438\u0436\u0434\u0435\u043D\u044C"], ["workweek", "\u0420\u043E\u0431\u043E\u0447\u0438\u0439 \u0442\u0438\u0436\u0434\u0435\u043D\u044C"], ["3day", "3 \u0434\u043D\u0456"]];
+var COLOR_OPTS = [["priority", "\u041A\u043E\u043B\u0456\u0440: \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442"], ["tag", "\u041A\u043E\u043B\u0456\u0440: \u0442\u0435\u0433"], ["group", "\u041A\u043E\u043B\u0456\u0440: \u0433\u0440\u0443\u043F\u0430"], ["none", "\u0411\u0435\u0437 \u043A\u043E\u043B\u044C\u043E\u0440\u0443"]];
+var CalendarView = class extends obsidian9.ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.mode = "month";
+    this.anchor = /* @__PURE__ */ new Date();
+    this.expanded = /* @__PURE__ */ new Set();
+    this.selectedDate = todayISO();
+    this.showEarly = false;
+    this.showLate = false;
+    this.filter = null;
+  }
+  getViewType() {
+    return CAL_VIEW;
+  }
+  getDisplayText() {
+    return t("\u041A\u0430\u043B\u0435\u043D\u0434\u0430\u0440");
+  }
+  getIcon() {
+    return "calendar";
+  }
+  async onOpen() {
+    await this.refresh();
+  }
+  isMonthish() {
+    return this.mode === "month";
+  }
+  isOverview() {
+    return this.mode === "month" && (this.containerEl.children[1] && this.containerEl.children[1].clientWidth || 9999) < 1250;
+  }
+  resetOffHours() {
+    this.showEarly = false;
+    this.showLate = false;
+  }
+  dayCount() {
+    return this.mode === "week" ? 7 : this.mode === "workweek" ? 5 : 3;
+  }
+  rangeStartDate() {
+    return this.mode === "workweek" ? startOfWorkWeek(this.anchor) : this.mode === "week" ? startOfWeek(this.anchor) : this.anchor;
+  }
+  shift(dir) {
+    if (this.isMonthish()) {
+      this.anchor = new Date(this.anchor.getFullYear(), this.anchor.getMonth() + dir, 1);
+    } else {
+      this.anchor = addDays(this.anchor, dir * (this.mode === "3day" ? 3 : 7));
+    }
+    this.resetOffHours();
+    this.refresh();
+  }
+  setMode(m) {
+    this.mode = m;
+    this.resetOffHours();
+    this.refresh();
+  }
+  goToday() {
+    this.anchor = /* @__PURE__ */ new Date();
+    this.selectedDate = todayISO();
+    this.resetOffHours();
+    this.refresh();
+  }
+  visibleRange() {
+    if (this.isMonthish()) {
+      const start2 = startOfWeek(new Date(this.anchor.getFullYear(), this.anchor.getMonth(), 1));
+      return [toISO(start2), toISO(addDays(start2, 41))];
+    }
+    const start = this.rangeStartDate();
+    return [toISO(start), toISO(addDays(start, this.dayCount() - 1))];
+  }
+  matchFilter(t2) {
+    const f = this.filter;
+    if (!f) return true;
+    if (f.kind === "tag") return (t2.tags || []).includes(f.value);
+    if (f.kind === "group") return t2.group === f.value;
+    return t2.priority === f.value;
+  }
+  onResize() {
+    const c = compactMode(this);
+    const ov = this.isOverview();
+    if (c !== this._lastCompact || ov !== this._overview) {
+      this.refresh();
+      return;
+    }
+    if (this.mode === "month") {
+      clearTimeout(this._resizeTimer);
+      this._resizeTimer = setTimeout(() => this.refresh(), 120);
+    }
+  }
+  async refresh() {
+    const mobile = compactMode(this);
+    this._lastCompact = mobile;
+    const map = await loadAllTasks(this.app);
+    const [s, e] = this.visibleRange();
+    addVirtuals(map, this.plugin.settings.recurrences, s, e);
+    this._filterOpts = { tags: /* @__PURE__ */ new Set(), groups: /* @__PURE__ */ new Set(), priorities: /* @__PURE__ */ new Set() };
+    for (const { tasks } of map.values()) for (const t2 of tasks) {
+      (t2.tags || []).forEach((x) => this._filterOpts.tags.add(x));
+      if (t2.group) this._filterOpts.groups.add(t2.group);
+      if (t2.priority) this._filterOpts.priorities.add(t2.priority);
+    }
+    if (this.filter) for (const entry of map.values()) entry.tasks = entry.tasks.filter((t2) => this.matchFilter(t2));
+    const root = this.containerEl.children[1];
+    root.empty();
+    root.addClass("tc-pane", "tc-cal-pane");
+    const overview = this.isOverview();
+    this._overview = overview;
+    root.toggleClass("tc-cal-fill", this.mode === "month" && !overview);
+    this.renderHeader(root, mobile);
+    if (this.mode === "month") {
+      if (overview) this.renderOverview(root, map);
+      else this.renderMonth(root, map, mobile);
+    } else {
+      this._map = map;
+      renderTimeline(this, root, this.dayCount());
+    }
+  }
+  renderHeader(root, mobile) {
+    const s = this.plugin.settings;
+    const bar = root.createEl("div", { cls: "tc-cal-header" });
+    if (mobile) {
+      const modeBtn = bar.createEl("button", { cls: "clickable-icon" });
+      obsidian9.setIcon(modeBtn, "layout-grid");
+      modeBtn.setAttribute("aria-label", t("\u0420\u0435\u0436\u0438\u043C"));
+      modeBtn.onclick = (e) => this.modeMenu(e);
+      const title = bar.createEl("div", { text: this.titleText(), cls: "tc-cal-title" });
+      title.onclick = () => this.goToday();
+      const right2 = bar.createEl("div", { cls: "tc-cal-controls" });
+      const prev2 = right2.createEl("button", { cls: "clickable-icon" });
+      obsidian9.setIcon(prev2, "chevron-left");
+      prev2.onclick = () => this.shift(-1);
+      const next2 = right2.createEl("button", { cls: "clickable-icon" });
+      obsidian9.setIcon(next2, "chevron-right");
+      next2.onclick = () => this.shift(1);
+      const more = right2.createEl("button", { cls: "clickable-icon" });
+      obsidian9.setIcon(more, "more-horizontal");
+      if (this.filter) more.addClass("is-active");
+      more.onclick = (e) => this.mobileMenu(e);
+      return;
+    }
+    bar.createEl("div", { text: this.titleText(), cls: "tc-cal-title" });
+    const right = bar.createEl("div", { cls: "tc-cal-controls" });
+    const colorSel = right.createEl("select", { cls: "dropdown" });
+    for (const [v, l] of COLOR_OPTS) {
+      const o = colorSel.createEl("option", { text: t(l) });
+      o.value = v;
+      if (s.colorBy === v) o.selected = true;
+    }
+    colorSel.onchange = async () => {
+      s.colorBy = colorSel.value;
+      await this.plugin.saveSettings();
+    };
+    const modeSel = right.createEl("select", { cls: "dropdown" });
+    for (const [v, l] of CAL_MODES) {
+      const o = modeSel.createEl("option", { text: t(l) });
+      o.value = v;
+      if (this.mode === v) o.selected = true;
+    }
+    modeSel.onchange = () => this.setMode(modeSel.value);
+    const filterBtn = right.createEl("button", { cls: "clickable-icon" });
+    obsidian9.setIcon(filterBtn, "filter");
+    filterBtn.setAttribute("aria-label", t("\u0424\u0456\u043B\u044C\u0442\u0440"));
+    if (this.filter) filterBtn.addClass("is-active");
+    filterBtn.onclick = (e) => this.filterMenu(e);
+    const dispBtn = right.createEl("button", { cls: "clickable-icon" });
+    obsidian9.setIcon(dispBtn, "more-horizontal");
+    dispBtn.setAttribute("aria-label", t("\u0412\u0456\u0434\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u043D\u044F"));
+    dispBtn.onclick = (e) => this.displayMenu(e);
+    const nav = right.createEl("div", { cls: "tc-nav-group" });
+    const prev = nav.createEl("button", { cls: "clickable-icon" });
+    obsidian9.setIcon(prev, "chevron-left");
+    prev.onclick = () => this.shift(-1);
+    nav.createEl("button", { text: t("\u0421\u044C\u043E\u0433\u043E\u0434\u043D\u0456") }).onclick = () => this.goToday();
+    const next = nav.createEl("button", { cls: "clickable-icon" });
+    obsidian9.setIcon(next, "chevron-right");
+    next.onclick = () => this.shift(1);
+  }
+  modeMenu(e) {
+    const m = new obsidian9.Menu();
+    for (const [v, l] of CAL_MODES) m.addItem((it) => it.setTitle(t(l)).setChecked(this.mode === v).onClick(() => this.setMode(v)));
+    m.showAtMouseEvent(e);
+  }
+  // mobile: colour + filter + display in one menu
+  mobileMenu(e) {
+    const s = this.plugin.settings;
+    const m = new obsidian9.Menu();
+    m.addItem((it) => it.setTitle(t("\u041A\u043E\u043B\u0456\u0440")).setDisabled(true));
+    for (const [v, l] of COLOR_OPTS) m.addItem((it) => it.setTitle(t(l)).setChecked(s.colorBy === v).onClick(async () => {
+      s.colorBy = v;
+      await this.plugin.saveSettings();
+    }));
+    m.addSeparator();
+    m.addItem((it) => it.setTitle(t("\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u0442\u0435\u0433\u0438")).setChecked(s.showTags).onClick(async () => {
+      s.showTags = !s.showTags;
+      await this.plugin.saveSettings();
+    }));
+    m.addItem((it) => it.setTitle(t("\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u0433\u0440\u0443\u043F\u0438")).setChecked(s.showGroups).onClick(async () => {
+      s.showGroups = !s.showGroups;
+      await this.plugin.saveSettings();
+    }));
+    m.addItem((it) => it.setTitle(t("\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438")).setChecked(s.showPriority).onClick(async () => {
+      s.showPriority = !s.showPriority;
+      await this.plugin.saveSettings();
+    }));
+    m.addItem((it) => it.setTitle(t("\u041A\u0440\u0430\u043F\u043A\u0430 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0443")).setChecked(s.priorityDot).onClick(async () => {
+      s.priorityDot = !s.priorityDot;
+      await this.plugin.saveSettings();
+    }));
+    m.addSeparator();
+    m.addItem((it) => it.setTitle(this.filter ? t("\u0424\u0456\u043B\u044C\u0442\u0440: \u0437\u043C\u0456\u043D\u0438\u0442\u0438/\u0437\u043D\u044F\u0442\u0438") : t("\u0424\u0456\u043B\u044C\u0442\u0440\u2026")).onClick(() => setTimeout(() => this.filterMenu(e), 0)));
+    m.showAtMouseEvent(e);
+  }
+  filterMenu(e) {
+    const m = new obsidian9.Menu();
+    m.addItem((it) => it.setTitle(t("\u0411\u0435\u0437 \u0444\u0456\u043B\u044C\u0442\u0440\u0430")).setChecked(!this.filter).onClick(() => {
+      this.filter = null;
+      this.refresh();
+    }));
+    const sect = (title, kind, values) => {
+      const arr = [...values].sort();
+      if (!arr.length) return;
+      m.addSeparator();
+      m.addItem((it) => it.setTitle(title).setDisabled(true));
+      for (const v of arr) {
+        const active = this.filter && this.filter.kind === kind && this.filter.value === v;
+        const label = kind === "tag" ? `#${v}` : kind === "group" ? `@${v}` : v;
+        m.addItem((it) => it.setTitle(label).setChecked(active).onClick(() => {
+          this.filter = { kind, value: v };
+          this.refresh();
+        }));
+      }
+    };
+    sect(t("\u0422\u0435\u0433\u0438"), "tag", this._filterOpts.tags);
+    sect(t("\u0413\u0440\u0443\u043F\u0438"), "group", this._filterOpts.groups);
+    sect(t("\u041F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438"), "priority", this._filterOpts.priorities);
+    m.showAtMouseEvent(e);
+  }
+  displayMenu(e) {
+    const s = this.plugin.settings;
+    const m = new obsidian9.Menu();
+    const toggle = (title, key) => m.addItem((it) => it.setTitle(title).setChecked(s[key]).onClick(async () => {
+      s[key] = !s[key];
+      await this.plugin.saveSettings();
+    }));
+    toggle("\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u0442\u0435\u0433\u0438", "showTags");
+    toggle("\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u0433\u0440\u0443\u043F\u0438", "showGroups");
+    toggle("\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438", "showPriority");
+    m.addSeparator();
+    toggle("\u041A\u0440\u0430\u043F\u043A\u0430 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0443", "priorityDot");
+    m.showAtMouseEvent(e);
+  }
+  titleText() {
+    if (this.isMonthish()) return `${MONTHS_UA[this.anchor.getMonth()]} ${this.anchor.getFullYear()}`;
+    const start = this.rangeStartDate();
+    return `${toISO(start)} \u2192 ${toISO(addDays(start, this.dayCount() - 1))}`;
+  }
+  monthDays() {
+    return monthGridDays(this.anchor.getFullYear(), this.anchor.getMonth());
+  }
+  renderMonth(root, map, mobile) {
+    const s = this.plugin.settings;
+    const refresh = () => this.refresh();
+    const grid = root.createEl("div", { cls: "tc-month-grid" });
+    attachSwipeNav(grid, () => this.shift(-1), () => this.shift(1));
+    for (const wd of weekdayHeaders()) grid.createEl("div", { text: wd, cls: "tc-wd" });
+    const days = this.monthDays();
+    const todayStr = todayISO();
+    for (let w = 0; w < 6; w++) {
+      let weekHasSelected = false;
+      for (let i = 0; i < 7; i++) {
+        const day = days[w * 7 + i];
+        const iso = toISO(day);
+        if (iso === this.selectedDate) weekHasSelected = true;
+        const cell = grid.createEl("div", { cls: "tc-day-cell" });
+        if (day.getMonth() !== this.anchor.getMonth()) cell.addClass("tc-outside");
+        if (iso === todayStr) cell.addClass("tc-today");
+        if (mobile && iso === this.selectedDate) cell.addClass("tc-selected");
+        const head = cell.createEl("div", { cls: "tc-day-head" });
+        const num = head.createEl("span", { text: String(day.getDate()) });
+        if (!mobile) {
+          num.onclick = (ev) => {
+            ev.stopPropagation();
+            openDay(this.app, iso);
+          };
+          cell.ondblclick = () => openDay(this.app, iso);
+          cell.oncontextmenu = (ev) => {
+            if (ev.defaultPrevented) return;
+            ev.preventDefault();
+            const menu = new obsidian9.Menu();
+            menu.addItem((i2) => i2.setTitle(t("\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u0437\u0430\u0434\u0430\u0447\u0443")).setIcon("plus").onClick(() => new TaskCreateModal(this.app, this.plugin, iso).open()));
+            menu.addItem((i2) => i2.setTitle(t("\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u043D\u043E\u0442\u0430\u0442\u043A\u0443")).setIcon("file-text").onClick(() => openDay(this.app, iso)));
+            menu.showAtPosition({ x: ev.clientX, y: ev.clientY });
+          };
+        }
+        const entry = map.get(iso);
+        if (entry && entry.tasks.length) {
+          const items = cell.createEl("div", { cls: "tc-day-items" });
+          items.dataset.date = iso;
+          entry.tasks.slice().sort(dayOrder).forEach((t2) => {
+            const bar = items.createEl("div", { cls: "tc-bar" });
+            if (t2.done) bar.addClass("tc-bar-done");
+            if (t2.cancelled) bar.addClass("tc-bar-cancelled");
+            if (t2.virtual) bar.addClass("tc-virtual");
+            if (t2.recId || t2.virtual) bar.addClass("tc-bar-recurring");
+            applyCardColor(bar, t2, s.colorBy, s.priorityDot);
+            if (!mobile) {
+              const cbx = makeStatusCheckbox(bar, t2, async (checked) => {
+                await completeTask(this.app, t2, checked, s);
+                refresh();
+              }, "tc-bar-cbx");
+              cbx.onclick = (ev) => ev.stopPropagation();
+            }
+            bar.createEl("span", { text: t2.text || "(\u0431\u0435\u0437 \u043D\u0430\u0437\u0432\u0438)", cls: "tc-bar-text" });
+            if (t2.start) bar.createEl("span", { text: t2.start, cls: "tc-bar-time" });
+            if (!t2.virtual && t2.file) {
+              bar.oncontextmenu = (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                openStatusMenu(ev, t2, async (st) => {
+                  await setTaskStatus(this.app, t2.file, t2.line, st.id);
+                  refresh();
                 });
-            });
-
-        new obsidian.Setting(containerEl)
-            .setName(t('Текст заголовка'))
-            .setDesc(t('Назва заголовка, під яким будуть задачі (напр. "Задачі" або "Tasks")'))
-            .addText(t => {
-                t.setPlaceholder('Задачі');
-                t.setValue(this.plugin.settings.headingText);
-                t.onChange(async v => {
-                    this.plugin.settings.headingText = v.trim() || DEFAULT_SETTINGS.headingText;
-                    await this.plugin.saveSettings();
-                });
-            });
-
-        new obsidian.Setting(containerEl)
-            .setName(t('Робочі години — початок'))
-            .setDesc(t('На часовій шкалі раніші години згорнуті (можна розгорнути)'))
-            .addDropdown(d => {
-                for (let h = 0; h <= 23; h++) d.addOption(String(h), `${String(h).padStart(2, '0')}:00`);
-                d.setValue(String(this.plugin.settings.workStart));
-                d.onChange(async v => { this.plugin.settings.workStart = Number(v); await this.plugin.saveSettings(); });
-            });
-
-        new obsidian.Setting(containerEl)
-            .setName(t('Робочі години — кінець'))
-            .setDesc(t('На часовій шкалі пізніші години згорнуті (можна розгорнути)'))
-            .addDropdown(d => {
-                for (let h = 1; h <= 24; h++) d.addOption(String(h), `${String(h).padStart(2, '0')}:00`);
-                d.setValue(String(this.plugin.settings.workEnd));
-                d.onChange(async v => { this.plugin.settings.workEnd = Number(v); await this.plugin.saveSettings(); });
-            });
-
-        new obsidian.Setting(containerEl)
-            .setName(t('Крок часової шкали'))
-            .setDesc(t('Прилипання при перетягуванні/зміні розміру'))
-            .addDropdown(d => {
-                [5, 10, 15, 30, 60].forEach(m => d.addOption(String(m), `${m} хв`));
-                d.setValue(String(this.plugin.settings.snapMinutes));
-                d.onChange(async v => { this.plugin.settings.snapMinutes = Number(v); await this.plugin.saveSettings(); });
-            });
-
-        new obsidian.Setting(containerEl)
-            .setName(t('Перший день тижня'))
-            .addDropdown(d => {
-                d.addOption('1', t('Понеділок')).addOption('0', t('Неділя'));
-                d.setValue(String(this.plugin.settings.firstDayOfWeek));
-                d.onChange(async v => { this.plugin.settings.firstDayOfWeek = Number(v); await this.plugin.saveSettings(); });
-            });
-
-        this.renderDefaults(containerEl);
-        this.renderRecurrences(containerEl);
-        this.renderHabits(containerEl);
-        this.renderColors(containerEl);
-    }
-
-    renderDefaults(containerEl) {
-        const s = this.plugin.settings;
-        containerEl.createEl('h4', { text: t('Стандартні значення') });
-        containerEl.createEl('p', { text: t('Підставляються в нову задачу, якщо не вказані вручну.'), cls: 'setting-item-description' });
-
-        new obsidian.Setting(containerEl).setName(t('Стандартний тег'))
-            .addText(c => c.setPlaceholder('—').setValue(s.defaultTag)
-                .onChange(async v => { s.defaultTag = v.trim().replace(/^#/, ''); await this.plugin.saveSettings(); }));
-        new obsidian.Setting(containerEl).setName(t('Стандартна група'))
-            .addText(c => c.setPlaceholder('—').setValue(s.defaultGroup)
-                .onChange(async v => { s.defaultGroup = v.trim().replace(/^@/, ''); await this.plugin.saveSettings(); }));
-        new obsidian.Setting(containerEl).setName(t('Стандартний пріоритет'))
-            .addDropdown(d => {
-                d.addOption('', '—');
-                priorityKeys.forEach(k => d.addOption(k, k));
-                d.setValue(s.defaultPriority || '');
-                d.onChange(async v => { s.defaultPriority = v; await this.plugin.saveSettings(); });
-            });
-    }
-
-    renderColors(containerEl) {
-        containerEl.createEl('h4', { text: t('Кольори та пріоритети') });
-        const c = this.plugin.settings.colors;
-
-        containerEl.createEl('h5', { text: t('Пріоритети') });
-        containerEl.createEl('p', {
-            text: t('Ключ використовується у тексті задачі як !ключ. Порядок = ранг (нижчий зверху, вищий знизу).'),
-            cls: 'setting-item-description'
-        });
-
-        c.priorities.forEach((p, idx) => {
-            const s = new obsidian.Setting(containerEl);
-            s.addText(t => t.setPlaceholder('ключ').setValue(p.key)
-                .onChange(async v => { p.key = v.trim(); await this.plugin.saveSettings(); }));
-            s.addColorPicker(cp => cp.setValue(p.color || '#888888')
-                .onChange(async v => { p.color = v; await this.plugin.saveSettings(); }));
-            s.addExtraButton(b => b.setIcon('arrow-up').setTooltip(t('Вище')).onClick(async () => {
-                if (idx > 0) {
-                    [c.priorities[idx - 1], c.priorities[idx]] = [c.priorities[idx], c.priorities[idx - 1]];
-                    await this.plugin.saveSettings(); this.display();
-                }
-            }));
-            s.addExtraButton(b => b.setIcon('arrow-down').setTooltip(t('Нижче')).onClick(async () => {
-                if (idx < c.priorities.length - 1) {
-                    [c.priorities[idx + 1], c.priorities[idx]] = [c.priorities[idx], c.priorities[idx + 1]];
-                    await this.plugin.saveSettings(); this.display();
-                }
-            }));
-            s.addExtraButton(b => b.setIcon('trash').setTooltip(t('Видалити')).onClick(async () => {
-                c.priorities.splice(idx, 1); await this.plugin.saveSettings(); this.display();
-            }));
-        });
-        new obsidian.Setting(containerEl).addButton(b => b.setButtonText(t('+ пріоритет'))
-            .onClick(async () => {
-                c.priorities.push({ key: 'new', color: '#888888' });
-                await this.plugin.saveSettings(); this.display();
-            }));
-
-        this.renderColorList(containerEl, t('Кольори тегів'), c.tags, '#тег (без #)');
-        this.renderColorList(containerEl, t('Кольори груп'), c.groups, '@група (без @)');
-    }
-
-    renderColorList(containerEl, title, arr, placeholder) {
-        containerEl.createEl('h5', { text: title });
-        arr.forEach((item, idx) => {
-            const s = new obsidian.Setting(containerEl);
-            s.addText(t => t.setPlaceholder(placeholder).setValue(item.name)
-                .onChange(async v => { item.name = v.trim(); await this.plugin.saveSettings(); }));
-            s.addColorPicker(cp => cp.setValue(item.color || '#888888')
-                .onChange(async v => { item.color = v; await this.plugin.saveSettings(); }));
-            s.addExtraButton(b => b.setIcon('trash').setTooltip(t('Видалити')).onClick(async () => {
-                arr.splice(idx, 1); await this.plugin.saveSettings(); this.display();
-            }));
-        });
-        new obsidian.Setting(containerEl).addButton(b => b.setButtonText(t('+ додати'))
-            .onClick(async () => {
-                arr.push({ name: '', color: '#888888' });
-                await this.plugin.saveSettings(); this.display();
-            }));
-    }
-
-    renderHabits(containerEl) {
-        containerEl.createEl('h4', { text: t('Звички') });
-        containerEl.createEl('p', { text: t('Створення — через швидке створення (Ctrl+P). Тут — редагування та видалення.'), cls: 'setting-item-description' });
-
-        const wc = this.plugin.settings.wordCount;
-        new obsidian.Setting(containerEl)
-            .setName(t('Звичка: кількість написаних слів'))
-            .setDesc(t('Автоматично рахує слова в нотатці дня'))
-            .addToggle(c => c.setValue(wc.enabled).onChange(async v => { wc.enabled = v; await this.plugin.saveSettings(); this.display(); }));
-        if (wc.enabled) {
-            new obsidian.Setting(containerEl).setName(t('— емодзі'))
-                .addText(c => { c.setValue(wc.emoji || '').onChange(async v => { wc.emoji = v.trim(); await this.plugin.saveSettings(); }); c.inputEl.style.width = '3em'; });
-            new obsidian.Setting(containerEl).setName(t('— колір'))
-                .addColorPicker(cp => cp.setValue(wc.color || '#9aa0a6').onChange(async v => { wc.color = v; await this.plugin.saveSettings(); }));
-        }
-
-        const habits = this.plugin.settings.habits || [];
-        if (!habits.length) containerEl.createEl('p', { text: t('Поки немає звичок.'), cls: 'setting-item-description' });
-        for (const h of habits) {
-            new obsidian.Setting(containerEl)
-                .setName(h.name)
-                .setDesc(`property: ${h.property} · ${h.type === 'bool' ? t('так/ні') : t('Кількість') + (h.unit ? ` (${h.unit})` : '')}`)
-                .addExtraButton(b => b.setIcon('pencil').setTooltip(t('Редагувати'))
-                    .onClick(() => new HabitEditModal(this.app, this.plugin, h, () => this.display()).open()))
-                .addExtraButton(b => b.setIcon('trash').setTooltip(t('Видалити')).onClick(async () => {
-                    this.plugin.settings.habits = habits.filter(x => x.id !== h.id);
-                    await this.plugin.saveSettings();
-                    this.display();
-                }));
-        }
-    }
-
-    renderRecurrences(containerEl) {
-        containerEl.createEl('h4', { text: t('Регулярні задачі') });
-        containerEl.createEl('p', { text: t('Створення — через швидке створення (Ctrl+P). Тут — редагування та видалення.'), cls: 'setting-item-description' });
-        const rules = this.plugin.settings.recurrences || [];
-        if (!rules.length) containerEl.createEl('p', { text: t('Поки немає регулярних задач.'), cls: 'setting-item-description' });
-        for (const rule of rules) {
-            new obsidian.Setting(containerEl)
-                .setName(rule.raw)
-                .setDesc(`${describeRule(rule)} · з ${rule.start}${rule.end ? ` до ${rule.end}` : ''}`)
-                .addExtraButton(b => b.setIcon('pencil').setTooltip(t('Редагувати'))
-                    .onClick(() => new RecurrenceEditModal(this.app, this.plugin, rule, () => this.display()).open()))
-                .addExtraButton(b => b.setIcon('trash').setTooltip(t('Видалити')).onClick(async () => {
-                    this.plugin.settings.recurrences = rules.filter(r => r.id !== rule.id);
-                    await this.plugin.saveSettings();
-                    this.display();
-                }));
-        }
-    }
-}
-
-// ─── Plugin ──────────────────────────────────────────────────────────────────
-
-class TaskCalendarPlugin extends obsidian.Plugin {
-    async onload() {
-        await this.loadSettings();
-
-        this.registerView(LIST_VIEW, leaf => new ListView(leaf, this));
-        this.registerView(CAL_VIEW, leaf => new CalendarView(leaf, this));
-        this.registerView(HABITS_VIEW, leaf => new HabitsView(leaf, this));
-        this.registerView(MINI_VIEW, leaf => new MiniCalendarView(leaf, this));
-        this.registerView(SMART_VIEW, leaf => new SmartView(leaf, this));
-
-        this.addRibbonIcon('list-todo', t('Markday — Розумний список'), () => this.openView(SMART_VIEW));
-        this.addRibbonIcon('calendar', t('Markday — Календар'), () => this.openView(CAL_VIEW));
-        this.addRibbonIcon('list-checks', t('Markday — Список'), () => this.openView(LIST_VIEW));
-        this.addRibbonIcon('check-circle', t('Markday — Звички'), () => this.openView(HABITS_VIEW));
-        this.addRibbonIcon('calendar-days', t('Markday — Міні-календар'), () => this.openView(MINI_VIEW, true));
-
-        this.addCommand({ id: 'open-smart', name: t('Відкрити Розумний список'), callback: () => this.openView(SMART_VIEW) });
-        this.addCommand({ id: 'open-calendar', name: t('Відкрити Календар'), callback: () => this.openView(CAL_VIEW) });
-        this.addCommand({ id: 'open-list', name: t('Відкрити Список задач'), callback: () => this.openView(LIST_VIEW) });
-        this.addCommand({ id: 'open-habits', name: t('Відкрити Звички'), callback: () => this.openView(HABITS_VIEW) });
-        this.addCommand({ id: 'open-mini', name: t('Відкрити Міні-календар (бічна панель)'), callback: () => this.openView(MINI_VIEW, true) });
-        this.addCommand({
-            id: 'open-today-file', name: t('Відкрити/створити нотатку сьогодні'),
-            callback: async () => {
-                const file = await getOrCreateDateFile(this.app, todayISO());
-                this.app.workspace.getLeaf().openFile(file);
+              };
             }
-        });
-        this.addCommand({
-            id: 'create-task', name: t('Створити задачу'),
-            callback: () => new TaskCreateModal(this.app, this).open()
-        });
-        this.addCommand({
-            id: 'create-habit', name: t('Створити звичку'),
-            callback: () => new HabitCreateModal(this.app, this).open()
-        });
-
-        this.addSettingTab(new TaskCalendarSettingTab(this.app, this));
-    }
-
-    async loadSettings() {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-        // copy arrays/objects so we never mutate DEFAULT_SETTINGS
-        this.settings.recurrences = (this.settings.recurrences || []).slice();
-        this.settings.habits = (this.settings.habits || []).slice();
-        this.settings.wordCount = Object.assign({}, DEFAULT_SETTINGS.wordCount, this.settings.wordCount);
-        const c = this.settings.colors || {};
-        this.settings.colors = {
-            priorities: (c.priorities || DEFAULT_SETTINGS.colors.priorities).map(x => ({ ...x })),
-            tags: (c.tags || []).map(x => ({ ...x })),
-            groups: (c.groups || []).map(x => ({ ...x }))
+            if (!mobile && !t2.virtual && t2.file) {
+              bar.onclick = (ev) => {
+                ev.stopPropagation();
+                new TaskEditorModal(this.app, t2, refresh, this.plugin).open();
+              };
+            } else if (!mobile && t2.virtual) {
+              bar.onclick = (ev) => {
+                ev.stopPropagation();
+                materializeAndEdit(this.app, t2, s, refresh, this.plugin);
+              };
+            }
+          });
+        }
+        if (mobile) cell.onclick = () => {
+          this.selectedDate = this.selectedDate === iso ? null : iso;
+          this.refresh();
         };
-        applyConfig(this.settings);
+      }
+      if (mobile && weekHasSelected && this.selectedDate) this.renderMonthExpand(grid, map, this.selectedDate);
     }
+    this.trimMonthOverflow(root, mobile);
+  }
+  // after layout: in each day cell keep as many task bars as fit, replace the rest with "+N"
+  trimMonthOverflow(root, mobile) {
+    let attempts = 0;
+    const run = () => {
+      const probe = root.querySelector(".tc-day-items");
+      if (probe && probe.clientHeight === 0 && attempts++ < 10) {
+        requestAnimationFrame(run);
+        return;
+      }
+      root.querySelectorAll(".tc-day-items").forEach((items) => {
+        const bars = Array.from(items.children).filter((c) => c.classList.contains("tc-bar") && !c.classList.contains("tc-bar-more"));
+        if (bars.length < 2) return;
+        const avail = items.clientHeight;
+        if (!avail) return;
+        const cs = getComputedStyle(items);
+        const gap = parseFloat(cs.rowGap || cs.gap) || 2;
+        const barH = (bars[0].getBoundingClientRect().height || 21) + gap;
+        const full = Math.floor((avail + gap) / barH);
+        if (bars.length <= full) return;
+        const keep = Math.max(1, full - 1);
+        for (let i = keep; i < bars.length; i++) bars[i].remove();
+        const more = items.createEl("div", { cls: "tc-bar tc-bar-more", text: `+${bars.length - keep}` });
+        more.onclick = (ev) => {
+          if (mobile) {
+            this.selectedDate = items.dataset.date;
+            this.refresh();
+          } else {
+            ev.stopPropagation();
+            openDay(this.app, items.dataset.date);
+          }
+        };
+      });
+    };
+    requestAnimationFrame(run);
+  }
+  renderMonthExpand(grid, map, iso) {
+    const settings = this.plugin.settings;
+    const refresh = () => this.refresh();
+    const panel = grid.createEl("div", { cls: "tc-month-expand" });
+    const head = panel.createEl("div", { cls: "tc-day-detail-head" });
+    head.createEl("span", { text: humanDate(iso), cls: "tc-day-detail-date" });
+    head.createEl("button", { text: t("\u041D\u043E\u0442\u0430\u0442\u043A\u0430") }).onclick = () => openDay(this.app, iso);
+    const entry = map.get(iso);
+    const tasks = entry ? entry.tasks.slice().sort(dayOrder) : [];
+    if (tasks.length) {
+      const list = panel.createEl("div", { cls: "tc-list" });
+      tasks.forEach((t2) => renderTaskRow(this.app, list, t2, refresh, { settings, plugin: this.plugin }));
+    } else {
+      panel.createEl("div", { text: t("\u0417\u0430\u0434\u0430\u0447 \u043D\u0435\u043C\u0430\u0454"), cls: "tc-col-empty" });
+    }
+    quickAdd(this.app, panel, iso, refresh, t("+ \u0437\u0430\u0434\u0430\u0447\u0430"), settings);
+  }
+  // "Перелік": compact month with done/undone dots + selected-day task list
+  renderOverview(root, map) {
+    const s = this.plugin.settings;
+    const wrap = root.createEl("div", { cls: "tc-overview" });
+    attachSwipeNav(wrap, () => this.shift(-1), () => this.shift(1));
+    const grid = wrap.createEl("div", { cls: "tc-month-grid tc-dots-grid" });
+    for (const wd of weekdayHeaders()) grid.createEl("div", { text: wd, cls: "tc-wd" });
+    const todayStr = todayISO();
+    for (const day of this.monthDays()) {
+      const iso = toISO(day);
+      const cell = grid.createEl("div", { cls: "tc-day-cell tc-dots-cell" });
+      if (day.getMonth() !== this.anchor.getMonth()) cell.addClass("tc-outside");
+      if (iso === todayStr) cell.addClass("tc-today");
+      if (iso === this.selectedDate) cell.addClass("tc-selected");
+      cell.createEl("div", { text: String(day.getDate()), cls: "tc-dots-num" });
+      const entry = map.get(iso);
+      if (entry && entry.tasks.length) {
+        const dots = cell.createEl("div", { cls: "tc-dots" });
+        entry.tasks.slice(0, 12).forEach((t2) => {
+          const d = dots.createEl("span", { cls: "tc-dot" });
+          const c = cardColor(t2, s.colorBy) || "var(--interactive-accent)";
+          if (t2.cancelled) d.addClass("tc-dot-x");
+          else if (t2.done) {
+            d.addClass("tc-dot-hollow");
+            d.style.borderColor = c;
+          } else d.style.background = c;
+        });
+      }
+      cell.onclick = () => {
+        this.selectedDate = iso;
+        this.refresh();
+      };
+    }
+    this.renderDayDetail(wrap, map, this.selectedDate);
+  }
+  renderDayDetail(root, map, iso) {
+    const settings = this.plugin.settings;
+    const refresh = () => this.refresh();
+    const panel = root.createEl("div", { cls: "tc-day-detail" });
+    const head = panel.createEl("div", { cls: "tc-day-detail-head" });
+    head.createEl("span", { text: humanDate(iso), cls: "tc-day-detail-date" });
+    head.createEl("button", { text: t("\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u043D\u043E\u0442\u0430\u0442\u043A\u0443") }).onclick = () => openDay(this.app, iso);
+    renderTaskComposer(this.app, this.plugin, panel, iso, refresh);
+    const entry = map.get(iso);
+    const tasks = entry ? entry.tasks.slice().sort(dayOrder) : [];
+    if (tasks.length) {
+      const list = panel.createEl("div", { cls: "tc-list" });
+      tasks.forEach((t2) => renderTaskRow(this.app, list, t2, refresh, { settings, plugin: this.plugin }));
+    } else {
+      panel.createEl("div", { text: t("\u0417\u0430\u0434\u0430\u0447 \u043D\u0435\u043C\u0430\u0454"), cls: "tc-col-empty" });
+    }
+  }
+};
 
-    async saveSettings() {
-        await this.saveData(this.settings);
-        applyConfig(this.settings);
-        this.refreshViews();
+// src/list-view.js
+var obsidian10 = __toESM(require("obsidian"), 1);
+var ListView = class extends obsidian10.ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.groupBy = "date";
+    this.sortBy = "priority";
+    this.hideDone = false;
+    this.showDetails = false;
+    this.prioFilter = null;
+    this.activeFilter = { kind: "view", value: "all" };
+    this.sidebarOpen = true;
+    this.showHabits = false;
+    this.collapsed = /* @__PURE__ */ new Set();
+  }
+  getViewType() {
+    return LIST_VIEW;
+  }
+  getDisplayText() {
+    return t("\u0421\u043F\u0438\u0441\u043E\u043A \u0437\u0430\u0434\u0430\u0447");
+  }
+  getIcon() {
+    return "list-checks";
+  }
+  async onOpen() {
+    this.sidebarOpen = !compactMode(this);
+    await this.refresh();
+  }
+  onResize() {
+    const c = compactMode(this);
+    if (c !== this._lastCompact) {
+      this._lastCompact = c;
+      this.sidebarOpen = !c;
+      this.refresh();
     }
+  }
+  async refresh() {
+    const settings = this.plugin.settings;
+    const map = await loadAllTasks(this.app);
+    addVirtuals(map, settings.recurrences, todayISO(), toISO(addDays(/* @__PURE__ */ new Date(), LIST_HORIZON_DAYS)));
+    const todayStr = todayISO();
+    const next7End = toISO(addDays(/* @__PURE__ */ new Date(), 7));
+    let pool = [];
+    for (const { tasks: ts } of map.values()) pool = pool.concat(ts);
+    const aheadN = Math.max(1, Number(settings.recurrenceAhead) || 1);
+    const futVirt = pool.filter((x) => x.virtual && x.recId && x.date >= todayStr).sort((a, b) => a.date.localeCompare(b.date));
+    const seen = {}, dropped = /* @__PURE__ */ new Set();
+    for (const x of futVirt) {
+      seen[x.recId] = (seen[x.recId] || 0) + 1;
+      if (seen[x.recId] > aheadN) dropped.add(x);
+    }
+    if (dropped.size) pool = pool.filter((x) => !dropped.has(x));
+    const open = pool.filter((x) => !x.done && !x.cancelled);
+    const viewCounts = {
+      all: open.length,
+      today: open.filter((x) => x.date === todayStr).length,
+      next7: open.filter((x) => x.date >= todayStr && x.date <= next7End).length,
+      overdue: open.filter((x) => x.date < todayStr).length
+    };
+    const groupCounts = /* @__PURE__ */ new Map(), tagCounts = /* @__PURE__ */ new Map();
+    for (const x of open) {
+      if (x.group) groupCounts.set(x.group, (groupCounts.get(x.group) || 0) + 1);
+      for (const tg of x.tags || []) tagCounts.set(tg, (tagCounts.get(tg) || 0) + 1);
+    }
+    const f = this.activeFilter;
+    let tasks = pool.filter((x) => {
+      if (f.kind === "group") return x.group === f.value;
+      if (f.kind === "tag") return (x.tags || []).includes(f.value);
+      if (f.value === "today") return x.date === todayStr;
+      if (f.value === "next7") return x.date >= todayStr && x.date <= next7End;
+      if (f.value === "overdue") return x.date < todayStr && !x.done && !x.cancelled;
+      return !(x.date < todayStr && (x.done || x.cancelled));
+    });
+    if (this.prioFilter) tasks = tasks.filter((x) => x.priority === this.prioFilter);
+    if (this.hideDone) tasks = tasks.filter((x) => !x.done && !x.cancelled);
+    const habits = this.showHabits ? habitList(settings).filter((h) => !h.auto) : [];
+    const habitVals = {};
+    for (const h of habits) habitVals[h.id] = await getHabitValue(this.app, todayStr, h);
+    this._lastCompact = compactMode(this);
+    const root = this.containerEl.children[1];
+    root.empty();
+    root.addClass("tc-pane", "tc-listview");
+    const pane = root.createEl("div", { cls: "tc-list-2pane" });
+    if (this.sidebarOpen) this.renderSidebar(pane, { viewCounts, groupCounts, tagCounts });
+    const main = pane.createEl("div", { cls: "tc-list-main" });
+    this.renderHeader(main);
+    if (habits.length) renderHabitStrip(this.app, main, habits, habitVals, todayStr, () => this.refresh());
+    this.renderTasks(main, tasks, settings, todayStr);
+  }
+  // ── left sidebar: day views · groups · tags ──────────────────────────────
+  renderSidebar(pane, data) {
+    const compact = compactMode(this);
+    if (compact) {
+      const backdrop = pane.createEl("div", { cls: "tc-side-backdrop" });
+      backdrop.onclick = () => {
+        this.sidebarOpen = false;
+        this.refresh();
+      };
+    }
+    const side = pane.createEl("div", { cls: compact ? "tc-list-side tc-list-side-overlay" : "tc-list-side" });
+    const sel = (kind, value) => this.activeFilter.kind === kind && this.activeFilter.value === value;
+    const pick = (kind, value) => {
+      this.activeFilter = { kind, value };
+      if (compactMode(this)) this.sidebarOpen = false;
+      this.refresh();
+    };
+    const row = (parent, o) => {
+      const r = parent.createEl("div", { cls: o.active ? "tc-side-row is-active" : "tc-side-row" });
+      if (o.icon) {
+        const i = r.createEl("span", { cls: "tc-side-ic" });
+        obsidian10.setIcon(i, o.icon);
+      }
+      if (o.dot) r.createEl("span", { cls: "tc-side-dot" }).style.background = o.dot;
+      r.createEl("span", { cls: "tc-side-label", text: o.label });
+      if (o.count) r.createEl("span", { cls: "tc-side-count", text: String(o.count) });
+      r.onclick = o.onClick;
+    };
+    const vsec = side.createEl("div", { cls: "tc-side-sec" });
+    vsec.createEl("div", { cls: "tc-side-sec-title", text: t("\u041F\u0435\u0440\u0435\u0433\u043B\u044F\u0434\u0438") });
+    const views = [["all", "\u0412\u0441\u0456", "layers"], ["today", "\u0421\u044C\u043E\u0433\u043E\u0434\u043D\u0456", "calendar-check"], ["next7", "\u041D\u0430\u0441\u0442\u0443\u043F\u043D\u0456 7 \u0434\u043D\u0456\u0432", "calendar-range"], ["overdue", "\u041F\u0440\u043E\u0442\u0435\u0440\u043C\u0456\u043D\u043E\u0432\u0430\u043D\u0456", "alert-triangle"]];
+    for (const [val, label, icon] of views) row(vsec, { icon, label: t(label), count: data.viewCounts[val], active: sel("view", val), onClick: () => pick("view", val) });
+    const groups = [...data.groupCounts.keys()].sort();
+    if (groups.length) {
+      const gsec = side.createEl("div", { cls: "tc-side-sec" });
+      gsec.createEl("div", { cls: "tc-side-sec-title", text: t("\u0413\u0440\u0443\u043F\u0438") });
+      for (const name of groups) row(gsec, { dot: COLORS.groups[name] || autoColor(name), label: "@" + name, count: data.groupCounts.get(name), active: sel("group", name), onClick: () => pick("group", name) });
+    }
+    const tags = [...data.tagCounts.keys()].sort();
+    if (tags.length) {
+      const tsec = side.createEl("div", { cls: "tc-side-sec" });
+      tsec.createEl("div", { cls: "tc-side-sec-title", text: t("\u0422\u0435\u0433\u0438") });
+      for (const name of tags) row(tsec, { dot: COLORS.tags[name], label: "#" + name, count: data.tagCounts.get(name), active: sel("tag", name), onClick: () => pick("tag", name) });
+    }
+  }
+  filterTitle() {
+    const f = this.activeFilter;
+    if (f.kind === "group") return "@" + f.value;
+    if (f.kind === "tag") return "#" + f.value;
+    return { all: t("\u0412\u0441\u0456"), today: t("\u0421\u044C\u043E\u0433\u043E\u0434\u043D\u0456"), next7: t("\u041D\u0430\u0441\u0442\u0443\u043F\u043D\u0456 7 \u0434\u043D\u0456\u0432"), overdue: t("\u041F\u0440\u043E\u0442\u0435\u0440\u043C\u0456\u043D\u043E\u0432\u0430\u043D\u0456") }[f.value] || t("\u0412\u0441\u0456");
+  }
+  composerDefaults() {
+    if (this.activeFilter.kind === "group") return { group: this.activeFilter.value };
+    if (this.activeFilter.kind === "tag") return { tags: [this.activeFilter.value] };
+    return null;
+  }
+  // ── main header (filter · group · more on the title row) + composer ───────
+  renderHeader(main) {
+    const head = main.createEl("div", { cls: "tc-list-head" });
+    const ham = head.createEl("button", { cls: "clickable-icon" });
+    obsidian10.setIcon(ham, "panel-left");
+    ham.setAttribute("aria-label", t("\u041F\u0430\u043D\u0435\u043B\u044C \u0444\u0456\u043B\u044C\u0442\u0440\u0456\u0432"));
+    ham.onclick = () => {
+      this.sidebarOpen = !this.sidebarOpen;
+      this.refresh();
+    };
+    head.createEl("div", { cls: "tc-list-title", text: this.filterTitle() });
+    head.createEl("div", { cls: "tc-toolbar-spacer" });
+    this.iconBtn(head, "filter", t("\u0424\u0456\u043B\u044C\u0442\u0440"), (e) => this.filterMenu(e));
+    this.iconBtn(head, "arrow-down-up", t("\u0421\u043E\u0440\u0442\u0443\u0432\u0430\u043D\u043D\u044F \u0442\u0430 \u0433\u0440\u0443\u043F\u0443\u0432\u0430\u043D\u043D\u044F"), (e) => this.sortMenu(e));
+    this.iconBtn(head, "more-horizontal", t("\u0411\u0456\u043B\u044C\u0448\u0435"), (e) => this.moreMenu(e));
+    renderTaskComposer(this.app, this.plugin, main, todayISO(), () => this.refresh(), this.composerDefaults());
+  }
+  iconBtn(parent, icon, tip, onClick) {
+    const b = parent.createEl("button", { cls: "clickable-icon" });
+    obsidian10.setIcon(b, icon);
+    b.setAttribute("aria-label", tip);
+    b.onclick = onClick;
+    return b;
+  }
+  filterMenu(e) {
+    const m = new obsidian10.Menu();
+    m.addItem((it) => it.setTitle(t("\u0423\u0441\u0456 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438")).setChecked(!this.prioFilter).onClick(() => {
+      this.prioFilter = null;
+      this.refresh();
+    }));
+    priorityKeys.forEach((k) => m.addItem((it) => it.setTitle("!" + k).setChecked(this.prioFilter === k).onClick(() => {
+      this.prioFilter = k;
+      this.refresh();
+    })));
+    m.showAtMouseEvent(e);
+  }
+  sortMenu(e) {
+    const m = new obsidian10.Menu();
+    m.addItem((it) => it.setTitle(t("\u0413\u0440\u0443\u043F\u0443\u0432\u0430\u043D\u043D\u044F")).setDisabled(true));
+    for (const [v, l] of [["none", "\u0411\u0435\u0437 \u0433\u0440\u0443\u043F"], ["date", "\u0417\u0430 \u0434\u0430\u0442\u043E\u044E"], ["tag", "\u0417\u0430 \u0442\u0435\u0433\u043E\u043C"], ["group", "\u0417\u0430 \u0433\u0440\u0443\u043F\u043E\u044E"], ["priority", "\u0417\u0430 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u043E\u043C"]]) {
+      m.addItem((it) => it.setTitle(t(l)).setChecked(this.groupBy === v).onClick(() => {
+        this.groupBy = v;
+        this.refresh();
+      }));
+    }
+    m.addSeparator();
+    m.addItem((it) => it.setTitle(t("\u0421\u043E\u0440\u0442\u0443\u0432\u0430\u043D\u043D\u044F")).setDisabled(true));
+    for (const [v, l] of [["priority", "\u041F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442"], ["date", "\u0414\u0430\u0442\u0430"], ["time", "\u0427\u0430\u0441"], ["text", "\u041D\u0430\u0437\u0432\u0430"]]) {
+      m.addItem((it) => it.setTitle(t(l)).setChecked(this.sortBy === v).onClick(() => {
+        this.sortBy = v;
+        this.refresh();
+      }));
+    }
+    m.showAtMouseEvent(e);
+  }
+  moreMenu(e) {
+    const m = new obsidian10.Menu();
+    m.addItem((it) => it.setTitle(t("\u0421\u0445\u043E\u0432\u0430\u0442\u0438 \u0432\u0438\u043A\u043E\u043D\u0430\u043D\u0456")).setChecked(this.hideDone).onClick(() => {
+      this.hideDone = !this.hideDone;
+      this.refresh();
+    }));
+    m.addItem((it) => it.setTitle(t("\u041F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u0434\u0435\u0442\u0430\u043B\u0456")).setChecked(this.showDetails).onClick(() => {
+      this.showDetails = !this.showDetails;
+      this.refresh();
+    }));
+    m.addItem((it) => it.setTitle(t("\u0417\u0432\u0438\u0447\u043A\u0438 \u0441\u044C\u043E\u0433\u043E\u0434\u043D\u0456")).setChecked(this.showHabits).onClick(() => {
+      this.showHabits = !this.showHabits;
+      this.refresh();
+    }));
+    m.showAtMouseEvent(e);
+  }
+  // group header with a collapse caret; returns true if the group body should render
+  groupHead(sec, key, title, count) {
+    const h = sec.createEl("div", { cls: "tc-group-head" });
+    const car = h.createEl("span", { cls: "tc-group-caret" });
+    obsidian10.setIcon(car, this.collapsed.has(key) ? "chevron-right" : "chevron-down");
+    h.createEl("span", { text: title, cls: "tc-group-title" });
+    h.createEl("span", { text: String(count), cls: "tc-group-count" });
+    h.onclick = () => {
+      this.collapsed.has(key) ? this.collapsed.delete(key) : this.collapsed.add(key);
+      this.refresh();
+    };
+    return !this.collapsed.has(key);
+  }
+  renderTasks(main, tasks, settings, todayStr) {
+    if (!tasks.length) {
+      main.createEl("p", { text: t("\u0417\u0430\u0434\u0430\u0447 \u043D\u0435 \u0437\u043D\u0430\u0439\u0434\u0435\u043D\u043E."), cls: "tc-empty" });
+      return;
+    }
+    if (this.activeFilter.kind === "view" && this.activeFilter.value === "all" && this.groupBy === "date") {
+      return this.renderAllBuckets(main, tasks, settings, todayStr);
+    }
+    const sortFn = this.makeSortFn();
+    const refresh = () => this.refresh();
+    const isOverdue = (t2) => t2.date < todayStr && !t2.done && !t2.cancelled;
+    const inOverdueView = this.activeFilter.kind === "view" && this.activeFilter.value === "overdue";
+    const overdueTasks = inOverdueView ? [] : tasks.filter(isOverdue);
+    const rest = overdueTasks.length ? tasks.filter((t2) => !isOverdue(t2)) : tasks;
+    if (overdueTasks.length) {
+      const sec = main.createEl("div", { cls: "tc-group tc-overdue-group" });
+      if (this.groupHead(sec, "__overdue", t("\u041F\u0440\u043E\u0442\u0435\u0440\u043C\u0456\u043D\u043E\u0432\u0430\u043D\u0456"), overdueTasks.length)) {
+        const list = sec.createEl("div", { cls: "tc-list" });
+        overdueTasks.sort((a, b) => (a.date || "").localeCompare(b.date || "") || dayOrder(a, b)).forEach((t2) => renderTaskRow(this.app, list, t2, refresh, { overdue: true, showDetails: this.showDetails, settings, plugin: this.plugin }));
+      }
+    }
+    if (this.groupBy === "none") {
+      const list = main.createEl("div", { cls: "tc-list" });
+      rest.sort(sortFn).forEach((t2) => renderTaskRow(this.app, list, t2, refresh, { showDate: true, showDetails: this.showDetails, settings, plugin: this.plugin }));
+      return;
+    }
+    for (const [key, items] of this.buildGroups(rest)) {
+      const sec = main.createEl("div", { cls: "tc-group" });
+      const title = this.groupBy === "date" ? key === "__nodate" ? t("\u0411\u0435\u0437 \u0434\u0430\u0442\u0438") : humanDate(key) : t(key);
+      if (this.groupHead(sec, key, title, items.length)) {
+        const list = sec.createEl("div", { cls: "tc-list" });
+        items.sort(sortFn).forEach((t2) => renderTaskRow(this.app, list, t2, refresh, { showDate: this.groupBy !== "date", showDetails: this.showDetails, settings, plugin: this.plugin }));
+      }
+    }
+  }
+  // "All" + group-by-date → coarse buckets: Overdue / Next 7 days / Later (date instead of time)
+  renderAllBuckets(main, tasks, settings, todayStr) {
+    const refresh = () => this.refresh();
+    const next7End = toISO(addDays(/* @__PURE__ */ new Date(), 7));
+    const od = [], n7 = [], later = [];
+    for (const x of tasks) {
+      if (x.date < todayStr) {
+        if (!x.done && !x.cancelled) od.push(x);
+      } else if (x.date <= next7End) n7.push(x);
+      else later.push(x);
+    }
+    const byDate = (a, b) => (a.date || "").localeCompare(b.date || "") || dayOrder(a, b);
+    const bucket = (key, title, items, opts) => {
+      if (!items.length) return;
+      const sec = main.createEl("div", { cls: key === "__overdue" ? "tc-group tc-overdue-group" : "tc-group" });
+      if (this.groupHead(sec, key, title, items.length)) {
+        const list = sec.createEl("div", { cls: "tc-list" });
+        items.sort(byDate).forEach((t2) => renderTaskRow(this.app, list, t2, refresh, Object.assign({ showDetails: this.showDetails, settings, plugin: this.plugin }, opts)));
+      }
+    };
+    bucket("__overdue", t("\u041F\u0440\u043E\u0442\u0435\u0440\u043C\u0456\u043D\u043E\u0432\u0430\u043D\u0456"), od, { overdue: true });
+    bucket("__next7", t("\u041D\u0430\u0441\u0442\u0443\u043F\u043D\u0456 7 \u0434\u043D\u0456\u0432"), n7, {});
+    bucket("__later", t("\u041F\u0456\u0437\u043D\u0456\u0448\u0435"), later, { showDate: true });
+  }
+  makeSortFn() {
+    if (this.sortBy === "priority") {
+      return (a, b) => (priorityRank[b.priority] || 0) - (priorityRank[a.priority] || 0) || a.text.localeCompare(b.text);
+    }
+    if (this.sortBy === "date") return (a, b) => (a.date || "").localeCompare(b.date || "");
+    if (this.sortBy === "time") return (a, b) => (a.date || "").localeCompare(b.date || "") || dayOrder(a, b);
+    return (a, b) => a.text.localeCompare(b.text);
+  }
+  buildGroups(tasks) {
+    const groups = /* @__PURE__ */ new Map();
+    const push = (key, t2) => {
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(t2);
+    };
+    for (const t2 of tasks) {
+      if (this.groupBy === "date") push(t2.date || "__nodate", t2);
+      else if (this.groupBy === "group") push(t2.group ? `@${t2.group}` : "\u0411\u0435\u0437 \u0433\u0440\u0443\u043F\u0438", t2);
+      else if (this.groupBy === "priority") push(t2.priority ? t2.priority : "\u0411\u0435\u0437 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0443", t2);
+      else if (this.groupBy === "tag") {
+        if (t2.tags.length === 0) push("\u0411\u0435\u0437 \u0442\u0435\u0433\u0456\u0432", t2);
+        else t2.tags.forEach((tag) => push(`#${tag}`, t2));
+      }
+    }
+    const placeholder = ["\u0411\u0435\u0437 \u0433\u0440\u0443\u043F\u0438", "\u0411\u0435\u0437 \u0442\u0435\u0433\u0456\u0432", "\u0411\u0435\u0437 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0443", "__nodate"];
+    const keys = [...groups.keys()].sort((a, b) => {
+      const pa = placeholder.includes(a), pb = placeholder.includes(b);
+      if (pa !== pb) return pa ? 1 : -1;
+      if (this.groupBy === "priority") return (priorityRank[b] || 0) - (priorityRank[a] || 0);
+      return a.localeCompare(b);
+    });
+    return keys.map((k) => [k, groups.get(k)]);
+  }
+};
 
-    refreshViews() {
-        [LIST_VIEW, CAL_VIEW, HABITS_VIEW, MINI_VIEW, SMART_VIEW].forEach(t =>
-            this.app.workspace.getLeavesOfType(t).forEach(l => {
-                if (l.view && l.view.refresh) l.view.refresh();
-            }));
+// src/mini-calendar-view.js
+var obsidian11 = __toESM(require("obsidian"), 1);
+var MiniCalendarView = class extends obsidian11.ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.anchor = /* @__PURE__ */ new Date();
+  }
+  getViewType() {
+    return MINI_VIEW;
+  }
+  getDisplayText() {
+    return t("\u041C\u0456\u043D\u0456-\u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440");
+  }
+  getIcon() {
+    return "calendar-days";
+  }
+  async onOpen() {
+    await this.refresh();
+    const bump = obsidian11.debounce(() => this.refresh(), 250, true);
+    this.registerEvent(this.app.vault.on("modify", bump));
+    this.registerEvent(this.app.vault.on("create", bump));
+    this.registerEvent(this.app.vault.on("delete", bump));
+    this.registerEvent(this.app.vault.on("rename", bump));
+  }
+  shift(dir) {
+    this.anchor = new Date(this.anchor.getFullYear(), this.anchor.getMonth() + dir, 1);
+    this.refresh();
+  }
+  async refresh() {
+    const map = await loadAllTasks(this.app);
+    const root = this.containerEl.children[1];
+    root.empty();
+    root.addClass("tc-pane", "tcm-pane");
+    const bar = root.createEl("div", { cls: "tcm-header" });
+    bar.createEl("button", { text: "\u2039", cls: "tcm-nav" }).onclick = () => this.shift(-1);
+    const title = bar.createEl("div", { text: `${MONTHS_UA[this.anchor.getMonth()]} ${this.anchor.getFullYear()}`, cls: "tcm-title" });
+    title.onclick = () => {
+      this.anchor = /* @__PURE__ */ new Date();
+      this.refresh();
+    };
+    bar.createEl("button", { text: "\u203A", cls: "tcm-nav" }).onclick = () => this.shift(1);
+    const grid = root.createEl("div", { cls: "tcm-grid" });
+    attachSwipeNav(grid, () => this.shift(-1), () => this.shift(1));
+    for (const wd of weekdayHeaders()) grid.createEl("div", { text: wd, cls: "tcm-wd" });
+    const todayStr = todayISO();
+    for (const day of monthGridDays(this.anchor.getFullYear(), this.anchor.getMonth())) {
+      const iso = toISO(day);
+      const cell = grid.createEl("div", { cls: "tcm-cell" });
+      if (day.getMonth() !== this.anchor.getMonth()) cell.addClass("tcm-outside");
+      if (iso === todayStr) cell.addClass("tcm-today");
+      const entry = map.get(iso);
+      if (entry) cell.addClass("tcm-has-file");
+      cell.createEl("div", { text: String(day.getDate()), cls: "tcm-num" });
+      const dots = cell.createEl("div", { cls: "tcm-dots" });
+      if (entry && entry.tasks.length) {
+        const total = entry.tasks.length;
+        const done = entry.tasks.filter((t2) => t2.done).length;
+        if (done === 0) miniDot(dots, false);
+        else if (done === total) miniDot(dots, true);
+        else {
+          miniDot(dots, true);
+          miniDot(dots, false);
+        }
+      }
+      cell.onclick = () => openDay(this.app, iso);
+      cell.oncontextmenu = (evt) => this.showDayMenu(evt, iso);
     }
-
-    async openView(type, left = false) {
-        this.app.workspace.detachLeavesOfType(type);
-        // on mobile open full-screen in the main area; on desktop use a side panel
-        const leaf = obsidian.Platform.isMobile
-            ? this.app.workspace.getLeaf(false)
-            : (left ? this.app.workspace.getLeftLeaf(false) : this.app.workspace.getRightLeaf(false));
-        await leaf.setViewState({ type, active: true });
-        this.app.workspace.revealLeaf(leaf);
+  }
+  showDayMenu(evt, iso) {
+    evt.preventDefault();
+    const file = this.app.vault.getAbstractFileByPath(dateToPath(this.app, parseISO(iso)));
+    const menu = new obsidian11.Menu();
+    if (file) {
+      this.app.workspace.trigger("file-menu", menu, file, "mini-calendar");
+    } else {
+      menu.addItem((item) => item.setTitle(t("\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u043D\u043E\u0442\u0430\u0442\u043A\u0443")).setIcon("file-plus").onClick(async () => {
+        const f = await getOrCreateDateFile(this.app, iso);
+        this.app.workspace.getLeaf().openFile(f);
+      }));
     }
-
-    onunload() {
-        this.app.workspace.detachLeavesOfType(LIST_VIEW);
-        this.app.workspace.detachLeavesOfType(CAL_VIEW);
-        this.app.workspace.detachLeavesOfType(HABITS_VIEW);
-        this.app.workspace.detachLeavesOfType(MINI_VIEW);
-        this.app.workspace.detachLeavesOfType(SMART_VIEW);
-    }
+    menu.showAtMouseEvent(evt);
+  }
+};
+function miniDot(container, filled) {
+  container.createEl("span", { cls: filled ? "tcm-dot tcm-dot-filled" : "tcm-dot tcm-dot-hollow" });
 }
 
-module.exports = TaskCalendarPlugin;
+// src/settings-tab.js
+var obsidian12 = __toESM(require("obsidian"), 1);
+var TaskCalendarSettingTab = class extends obsidian12.PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+  // Native settings section — the exact DOM structure core Obsidian renders its own
+  // grouped settings with (.setting-group → heading .setting-item + a .setting-items
+  // wrapper holding the rows), so the app/theme styling applies with no custom CSS:
+  //   <div class="setting-group">
+  //     <div class="setting-item setting-item-heading">…</div>
+  //     <div class="setting-items"> …rows… </div>
+  //   </div>
+  section(containerEl, title) {
+    const group = containerEl.createEl("div", { cls: "setting-group" });
+    new obsidian12.Setting(group).setName(title).setHeading();
+    return group.createEl("div", { cls: "setting-items" });
+  }
+  note(group, text) {
+    group.createEl("p", { text, cls: "tc-group-note" });
+  }
+  // Compact "N шт." count used on summary rows for list-backed sections
+  countDesc(n) {
+    return n ? `${n} ${t("\u0448\u0442.")}` : t("\u041F\u043E\u0440\u043E\u0436\u043D\u044C\u043E");
+  }
+  // Up/down/trash trio shared by every reorderable list in the manager modals
+  reorderControls(row, list, idx, rerender) {
+    const swap = async (j) => {
+      [list[j], list[idx]] = [list[idx], list[j]];
+      await this.plugin.saveSettings();
+      rerender();
+    };
+    row.addExtraButton((b) => b.setIcon("arrow-up").setTooltip(t("\u0412\u0438\u0449\u0435")).onClick(() => {
+      if (idx > 0) swap(idx - 1);
+    }));
+    row.addExtraButton((b) => b.setIcon("arrow-down").setTooltip(t("\u041D\u0438\u0436\u0447\u0435")).onClick(() => {
+      if (idx < list.length - 1) swap(idx + 1);
+    }));
+    row.addExtraButton((b) => b.setIcon("trash").setTooltip(t("\u0412\u0438\u0434\u0430\u043B\u0438\u0442\u0438")).onClick(async () => {
+      list.splice(idx, 1);
+      await this.plugin.saveSettings();
+      rerender();
+    }));
+  }
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    this.renderGeneral(containerEl);
+    this.renderTimeline(containerEl);
+    this.renderDefaults(containerEl);
+    this.renderScenarios(containerEl);
+    this.renderCheckboxStatuses(containerEl);
+    this.renderRecurrences(containerEl);
+    this.renderHabits(containerEl);
+    this.renderColors(containerEl);
+  }
+  renderGeneral(containerEl) {
+    const group = this.section(containerEl, t("\u0417\u0430\u0433\u0430\u043B\u044C\u043D\u0435"));
+    new obsidian12.Setting(group).setName(t("\u041C\u043E\u0432\u0430")).addDropdown((d) => {
+      d.addOption("auto", t("\u0410\u0432\u0442\u043E")).addOption("uk", "\u0423\u043A\u0440\u0430\u0457\u043D\u0441\u044C\u043A\u0430").addOption("en", "English");
+      d.setValue(this.plugin.settings.language || "auto");
+      d.onChange(async (v) => {
+        this.plugin.settings.language = v;
+        await this.plugin.saveSettings();
+        this.display();
+      });
+    });
+    const dn = getDailyNotesConfig(this.app);
+    const loc = dn.folder ? `${dn.folder}/` : "(vault root)";
+    this.note(group, `Daily Notes: ${loc}${dn.format}.md`);
+    new obsidian12.Setting(group).setName(t("\u0420\u0456\u0432\u0435\u043D\u044C \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0430")).setDesc(t("\u041F\u0456\u0434 \u044F\u043A\u0438\u043C \u0440\u0456\u0432\u043D\u0435\u043C \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0430 \u0437\u0431\u0435\u0440\u0456\u0433\u0430\u0442\u0438 \u0437\u0430\u0434\u0430\u0447\u0456 (# = 1 \u2026 ###### = 6)")).addDropdown((d) => {
+      for (let i = 1; i <= 6; i++) d.addOption(String(i), `${"#".repeat(i)} (\u0440\u0456\u0432\u0435\u043D\u044C ${i})`);
+      d.setValue(String(this.plugin.settings.headingLevel));
+      d.onChange(async (v) => {
+        this.plugin.settings.headingLevel = Number(v);
+        await this.plugin.saveSettings();
+      });
+    });
+    new obsidian12.Setting(group).setName(t("\u0422\u0435\u043A\u0441\u0442 \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0430")).setDesc(t('\u041D\u0430\u0437\u0432\u0430 \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0430, \u043F\u0456\u0434 \u044F\u043A\u0438\u043C \u0431\u0443\u0434\u0443\u0442\u044C \u0437\u0430\u0434\u0430\u0447\u0456 (\u043D\u0430\u043F\u0440. "\u0417\u0430\u0434\u0430\u0447\u0456" \u0430\u0431\u043E "Tasks")')).addText((c) => {
+      c.setPlaceholder("\u0417\u0430\u0434\u0430\u0447\u0456");
+      c.setValue(this.plugin.settings.headingText);
+      c.onChange(async (v) => {
+        this.plugin.settings.headingText = v.trim() || DEFAULT_SETTINGS.headingText;
+        await this.plugin.saveSettings();
+      });
+    });
+    new obsidian12.Setting(group).setName(t("\u041F\u0435\u0440\u0448\u0438\u0439 \u0434\u0435\u043D\u044C \u0442\u0438\u0436\u043D\u044F")).addDropdown((d) => {
+      d.addOption("1", t("\u041F\u043E\u043D\u0435\u0434\u0456\u043B\u043E\u043A")).addOption("0", t("\u041D\u0435\u0434\u0456\u043B\u044F"));
+      d.setValue(String(this.plugin.settings.firstDayOfWeek));
+      d.onChange(async (v) => {
+        this.plugin.settings.firstDayOfWeek = Number(v);
+        await this.plugin.saveSettings();
+      });
+    });
+  }
+  renderTimeline(containerEl) {
+    const group = this.section(containerEl, t("\u0427\u0430\u0441\u043E\u0432\u0430 \u0448\u043A\u0430\u043B\u0430"));
+    new obsidian12.Setting(group).setName(t("\u0420\u043E\u0431\u043E\u0447\u0456 \u0433\u043E\u0434\u0438\u043D\u0438 \u2014 \u043F\u043E\u0447\u0430\u0442\u043E\u043A")).setDesc(t("\u041D\u0430 \u0447\u0430\u0441\u043E\u0432\u0456\u0439 \u0448\u043A\u0430\u043B\u0456 \u0440\u0430\u043D\u0456\u0448\u0456 \u0433\u043E\u0434\u0438\u043D\u0438 \u0437\u0433\u043E\u0440\u043D\u0443\u0442\u0456 (\u043C\u043E\u0436\u043D\u0430 \u0440\u043E\u0437\u0433\u043E\u0440\u043D\u0443\u0442\u0438)")).addDropdown((d) => {
+      for (let h = 0; h <= 23; h++) d.addOption(String(h), `${String(h).padStart(2, "0")}:00`);
+      d.setValue(String(this.plugin.settings.workStart));
+      d.onChange(async (v) => {
+        this.plugin.settings.workStart = Number(v);
+        await this.plugin.saveSettings();
+      });
+    });
+    new obsidian12.Setting(group).setName(t("\u0420\u043E\u0431\u043E\u0447\u0456 \u0433\u043E\u0434\u0438\u043D\u0438 \u2014 \u043A\u0456\u043D\u0435\u0446\u044C")).setDesc(t("\u041D\u0430 \u0447\u0430\u0441\u043E\u0432\u0456\u0439 \u0448\u043A\u0430\u043B\u0456 \u043F\u0456\u0437\u043D\u0456\u0448\u0456 \u0433\u043E\u0434\u0438\u043D\u0438 \u0437\u0433\u043E\u0440\u043D\u0443\u0442\u0456 (\u043C\u043E\u0436\u043D\u0430 \u0440\u043E\u0437\u0433\u043E\u0440\u043D\u0443\u0442\u0438)")).addDropdown((d) => {
+      for (let h = 1; h <= 24; h++) d.addOption(String(h), `${String(h).padStart(2, "0")}:00`);
+      d.setValue(String(this.plugin.settings.workEnd));
+      d.onChange(async (v) => {
+        this.plugin.settings.workEnd = Number(v);
+        await this.plugin.saveSettings();
+      });
+    });
+    new obsidian12.Setting(group).setName(t("\u041A\u0440\u043E\u043A \u0447\u0430\u0441\u043E\u0432\u043E\u0457 \u0448\u043A\u0430\u043B\u0438")).setDesc(t("\u041F\u0440\u0438\u043B\u0438\u043F\u0430\u043D\u043D\u044F \u043F\u0440\u0438 \u043F\u0435\u0440\u0435\u0442\u044F\u0433\u0443\u0432\u0430\u043D\u043D\u0456/\u0437\u043C\u0456\u043D\u0456 \u0440\u043E\u0437\u043C\u0456\u0440\u0443")).addDropdown((d) => {
+      [5, 10, 15, 30, 60].forEach((m) => d.addOption(String(m), `${m} \u0445\u0432`));
+      d.setValue(String(this.plugin.settings.snapMinutes));
+      d.onChange(async (v) => {
+        this.plugin.settings.snapMinutes = Number(v);
+        await this.plugin.saveSettings();
+      });
+    });
+  }
+  renderDefaults(containerEl) {
+    const s = this.plugin.settings;
+    const group = this.section(containerEl, t("\u0421\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u0456 \u0437\u043D\u0430\u0447\u0435\u043D\u043D\u044F"));
+    this.note(group, t("\u041F\u0456\u0434\u0441\u0442\u0430\u0432\u043B\u044F\u044E\u0442\u044C\u0441\u044F \u0432 \u043D\u043E\u0432\u0443 \u0437\u0430\u0434\u0430\u0447\u0443, \u044F\u043A\u0449\u043E \u043D\u0435 \u0432\u043A\u0430\u0437\u0430\u043D\u0456 \u0432\u0440\u0443\u0447\u043D\u0443."));
+    new obsidian12.Setting(group).setName(t("\u0421\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u0438\u0439 \u0442\u0435\u0433")).addText((c) => c.setPlaceholder("\u2014").setValue(s.defaultTag).onChange(async (v) => {
+      s.defaultTag = v.trim().replace(/^#/, "");
+      await this.plugin.saveSettings();
+    }));
+    new obsidian12.Setting(group).setName(t("\u0421\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u0430 \u0433\u0440\u0443\u043F\u0430")).addText((c) => c.setPlaceholder("\u2014").setValue(s.defaultGroup).onChange(async (v) => {
+      s.defaultGroup = v.trim().replace(/^@/, "");
+      await this.plugin.saveSettings();
+    }));
+    new obsidian12.Setting(group).setName(t("\u0421\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u0438\u0439 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442")).addDropdown((d) => {
+      d.addOption("", "\u2014");
+      priorityKeys.forEach((k) => d.addOption(k, k));
+      d.setValue(s.defaultPriority || "");
+      d.onChange(async (v) => {
+        s.defaultPriority = v;
+        await this.plugin.saveSettings();
+      });
+    });
+  }
+  // ── list-backed sections: one summary row on the page + full editor in a popup ────────
+  renderScenarios(containerEl) {
+    const s = this.plugin.settings;
+    const list = s.scenarios || (s.scenarios = []);
+    const desc = t("\u0417\u0430\u0434\u0430\u0447\u0456 \u0432 \u0446\u0438\u0445 \u0442\u0435\u043A\u0430\u0445 \u0447\u0438\u0442\u0430\u044E\u0442\u044C\u0441\u044F \u0437 \u0434\u0430\u0442\u043E\u044E \u043F\u043E\u0440\u0443\u0447 \u0456\u0437 \u0442\u0435\u043A\u0441\u0442\u043E\u043C (>\u0420\u0420\u0420\u0420-\u041C\u041C-\u0414\u0414), \u0430 \u043D\u0435 \u0437 \u043D\u0430\u0437\u0432\u0438 \u0444\u0430\u0439\u043B\u0443. \u041F\u0435\u0440\u0448\u0438\u0439 \u0437\u0431\u0456\u0433 \u0442\u0435\u043A\u0438 \u043F\u0435\u0440\u0435\u043C\u0430\u0433\u0430\u0454; \u0440\u0435\u0448\u0442\u0430 \u043D\u043E\u0442\u0430\u0442\u043E\u043A \u043B\u0438\u0448\u0430\u0454\u0442\u044C\u0441\u044F \u0449\u043E\u0434\u0435\u043D\u043D\u0438\u043C\u0438.");
+    const group = this.section(containerEl, t("\u0421\u0446\u0435\u043D\u0430\u0440\u0456\u0457 \u043F\u0430\u0440\u0441\u0438\u043D\u0433\u0443"));
+    new obsidian12.Setting(group).setName(t("\u041F\u0440\u043E\u0454\u043A\u0442\u043D\u0456 \u0442\u0435\u043A\u0438")).setDesc(`${this.countDesc(list.length)} \xB7 ${desc}`).addButton((b) => b.setButtonText(t("\u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u0442\u0438")).onClick(() => {
+      new ListManagerModal(this.app, {
+        title: t("\u0421\u0446\u0435\u043D\u0430\u0440\u0456\u0457 \u043F\u0430\u0440\u0441\u0438\u043D\u0433\u0443"),
+        desc,
+        render: (body, rerender) => this.renderScenarioRows(body, rerender),
+        onDone: () => this.display()
+      }).open();
+    }));
+  }
+  renderScenarioRows(body, rerender) {
+    const list = this.plugin.settings.scenarios;
+    if (!list.length) body.createEl("p", { text: t("\u041F\u043E\u043A\u0438 \u043D\u0435\u043C\u0430\u0454 \u0441\u0446\u0435\u043D\u0430\u0440\u0456\u0457\u0432."), cls: "setting-item-description" });
+    const folders = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof obsidian12.TFolder && f.path !== "/").map((f) => f.path).sort();
+    list.forEach((sc, idx) => {
+      const row = new obsidian12.Setting(body);
+      row.addText((c) => {
+        c.setPlaceholder(t("\u0422\u0435\u043A\u0430 \u043F\u0440\u043E\u0454\u043A\u0442\u0443")).setValue(sc.folder || "").onChange(async (v) => {
+          sc.folder = v.trim();
+          await this.plugin.saveSettings();
+        });
+        attachDatalist(c.inputEl, folders);
+      });
+      this.reorderControls(row, list, idx, rerender);
+    });
+    new obsidian12.Setting(body).addButton((b) => b.setButtonText(t("+ \u0441\u0446\u0435\u043D\u0430\u0440\u0456\u0439")).setCta().onClick(async () => {
+      list.push({ id: genId(), folder: "", mode: "project" });
+      await this.plugin.saveSettings();
+      rerender();
+    }));
+  }
+  renderCheckboxStatuses(containerEl) {
+    const s = this.plugin.settings;
+    const list = s.checkboxStatuses && s.checkboxStatuses.length ? s.checkboxStatuses : s.checkboxStatuses = DEFAULT_CHECKBOX_STATUSES.map((x) => ({ ...x }));
+    const desc = t('\u0421\u0438\u043C\u0432\u043E\u043B, \u0449\u043E \u0437\u0430\u043F\u0438\u0441\u0443\u0454\u0442\u044C\u0441\u044F \u0432 "- [ ]". \u041A\u043B\u0456\u043A \u043F\u043E \u0447\u0435\u043A\u0431\u043E\u043A\u0441\u0443 \u0437\u0430\u0432\u0436\u0434\u0438 \u043F\u0435\u0440\u0435\u043C\u0438\u043A\u0430\u0454 \u0437\u0432\u0438\u0447\u0430\u0439\u043D\u0435 todo/done; \u0456\u043D\u0448\u0456 \u0441\u0442\u0430\u0442\u0443\u0441\u0438 \u2014 \u0447\u0435\u0440\u0435\u0437 \u043F\u0440\u0430\u0432\u0443 \u043A\u043D\u043E\u043F\u043A\u0443 \u043C\u0438\u0448\u0456.');
+    const group = this.section(containerEl, t("\u0421\u0442\u0430\u0442\u0443\u0441\u0438 \u0447\u0435\u043A\u0431\u043E\u043A\u0441\u0456\u0432"));
+    new obsidian12.Setting(group).setName(t("\u0421\u0442\u0430\u0442\u0443\u0441\u0438")).setDesc(`${this.countDesc(list.length)} \xB7 ${desc}`).addButton((b) => b.setButtonText(t("\u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u0442\u0438")).onClick(() => {
+      new ListManagerModal(this.app, {
+        title: t("\u0421\u0442\u0430\u0442\u0443\u0441\u0438 \u0447\u0435\u043A\u0431\u043E\u043A\u0441\u0456\u0432"),
+        desc,
+        render: (body, rerender) => this.renderStatusRows(body, rerender),
+        onDone: () => this.display()
+      }).open();
+    }));
+  }
+  renderStatusRows(body, rerender) {
+    const s = this.plugin.settings;
+    const list = s.checkboxStatuses;
+    const behaviorLabel = { active: t("\u0410\u043A\u0442\u0438\u0432\u043D\u0430"), done: t("\u0412\u0438\u043A\u043E\u043D\u0430\u043D\u043E"), cancelled: t("\u0421\u043A\u0430\u0441\u043E\u0432\u0430\u043D\u043E") };
+    list.forEach((st, idx) => {
+      const row = new obsidian12.Setting(body).setName(t(st.label) || t("\u041D\u043E\u0432\u0430")).setDesc(`${st.char.trim() ? st.char : "\xB7"}  \xB7  ${behaviorLabel[st.behavior] || st.behavior}`);
+      const preview = document.createElement("span");
+      preview.className = "tc-status-row-icon";
+      if (st.icon) obsidian12.setIcon(preview, st.icon);
+      else preview.textContent = st.char.trim() ? st.char : "\xB7";
+      row.settingEl.prepend(preview);
+      row.addExtraButton((b) => b.setIcon("pencil").setTooltip(t("\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438")).onClick(() => {
+        new StatusEditModal(this.app, this.plugin, st, () => rerender()).open();
+      }));
+      this.reorderControls(row, list, idx, rerender);
+    });
+    new obsidian12.Setting(body).addButton((b) => b.setButtonText(t("+ \u0441\u0442\u0430\u0442\u0443\u0441")).setCta().onClick(() => {
+      new StatusEditModal(this.app, this.plugin, null, () => rerender()).open();
+    })).addButton((b) => b.setButtonText(t("\u0421\u043A\u0438\u043D\u0443\u0442\u0438 \u0434\u043E \u0441\u0442\u0430\u043D\u0434\u0430\u0440\u0442\u043D\u0438\u0445")).onClick(async () => {
+      s.checkboxStatuses = DEFAULT_CHECKBOX_STATUSES.map((x) => ({ ...x }));
+      await this.plugin.saveSettings();
+      rerender();
+    }));
+  }
+  renderColors(containerEl) {
+    const c = this.plugin.settings.colors;
+    const group = this.section(containerEl, t("\u041A\u043E\u043B\u044C\u043E\u0440\u0438 \u0442\u0430 \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438"));
+    new obsidian12.Setting(group).setName(t("\u041F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438")).setDesc(`${this.countDesc(c.priorities.length)} \xB7 ${t("\u041A\u043B\u044E\u0447 \u0432\u0438\u043A\u043E\u0440\u0438\u0441\u0442\u043E\u0432\u0443\u0454\u0442\u044C\u0441\u044F \u0443 \u0442\u0435\u043A\u0441\u0442\u0456 \u0437\u0430\u0434\u0430\u0447\u0456 \u044F\u043A !\u043A\u043B\u044E\u0447. \u041F\u043E\u0440\u044F\u0434\u043E\u043A = \u0440\u0430\u043D\u0433.")}`).addButton((b) => b.setButtonText(t("\u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u0442\u0438")).onClick(() => {
+      new ListManagerModal(this.app, {
+        title: t("\u041F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442\u0438"),
+        desc: t("\u041A\u043B\u044E\u0447 \u0432\u0438\u043A\u043E\u0440\u0438\u0441\u0442\u043E\u0432\u0443\u0454\u0442\u044C\u0441\u044F \u0443 \u0442\u0435\u043A\u0441\u0442\u0456 \u0437\u0430\u0434\u0430\u0447\u0456 \u044F\u043A !\u043A\u043B\u044E\u0447. \u041F\u043E\u0440\u044F\u0434\u043E\u043A = \u0440\u0430\u043D\u0433 (\u043D\u0438\u0436\u0447\u0438\u0439 \u0437\u0432\u0435\u0440\u0445\u0443, \u0432\u0438\u0449\u0438\u0439 \u0437\u043D\u0438\u0437\u0443)."),
+        render: (body, rerender) => this.renderPriorityRows(body, rerender),
+        onDone: () => this.display()
+      }).open();
+    }));
+    new obsidian12.Setting(group).setName(t("\u041A\u043E\u043B\u044C\u043E\u0440\u0438 \u0442\u0435\u0433\u0456\u0432")).setDesc(this.countDesc(c.tags.length)).addButton((b) => b.setButtonText(t("\u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u0442\u0438")).onClick(() => {
+      new ListManagerModal(this.app, {
+        title: t("\u041A\u043E\u043B\u044C\u043E\u0440\u0438 \u0442\u0435\u0433\u0456\u0432"),
+        render: (body, rerender) => this.renderColorRows(body, rerender, c.tags, "#\u0442\u0435\u0433 (\u0431\u0435\u0437 #)"),
+        onDone: () => this.display()
+      }).open();
+    }));
+    new obsidian12.Setting(group).setName(t("\u041A\u043E\u043B\u044C\u043E\u0440\u0438 \u0433\u0440\u0443\u043F")).setDesc(this.countDesc(c.groups.length)).addButton((b) => b.setButtonText(t("\u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u0442\u0438")).onClick(() => {
+      new ListManagerModal(this.app, {
+        title: t("\u041A\u043E\u043B\u044C\u043E\u0440\u0438 \u0433\u0440\u0443\u043F"),
+        render: (body, rerender) => this.renderColorRows(body, rerender, c.groups, "@\u0433\u0440\u0443\u043F\u0430 (\u0431\u0435\u0437 @)"),
+        onDone: () => this.display()
+      }).open();
+    }));
+  }
+  renderPriorityRows(body, rerender) {
+    const c = this.plugin.settings.colors;
+    c.priorities.forEach((p, idx) => {
+      const s = new obsidian12.Setting(body);
+      s.addText((c2) => c2.setPlaceholder("\u043A\u043B\u044E\u0447").setValue(p.key).onChange(async (v) => {
+        p.key = v.trim();
+        await this.plugin.saveSettings();
+      }));
+      s.addColorPicker((cp) => cp.setValue(p.color || "#888888").onChange(async (v) => {
+        p.color = v;
+        await this.plugin.saveSettings();
+      }));
+      this.reorderControls(s, c.priorities, idx, rerender);
+    });
+    new obsidian12.Setting(body).addButton((b) => b.setButtonText(t("+ \u043F\u0440\u0456\u043E\u0440\u0438\u0442\u0435\u0442")).setCta().onClick(async () => {
+      c.priorities.push({ key: "new", color: "#888888" });
+      await this.plugin.saveSettings();
+      rerender();
+    }));
+  }
+  renderColorRows(body, rerender, arr, placeholder) {
+    arr.forEach((item, idx) => {
+      const s = new obsidian12.Setting(body);
+      s.addText((c) => c.setPlaceholder(placeholder).setValue(item.name).onChange(async (v) => {
+        item.name = v.trim();
+        await this.plugin.saveSettings();
+      }));
+      s.addColorPicker((cp) => cp.setValue(item.color || "#888888").onChange(async (v) => {
+        item.color = v;
+        await this.plugin.saveSettings();
+      }));
+      s.addExtraButton((b) => b.setIcon("trash").setTooltip(t("\u0412\u0438\u0434\u0430\u043B\u0438\u0442\u0438")).onClick(async () => {
+        arr.splice(idx, 1);
+        await this.plugin.saveSettings();
+        rerender();
+      }));
+    });
+    new obsidian12.Setting(body).addButton((b) => b.setButtonText(t("+ \u0434\u043E\u0434\u0430\u0442\u0438")).setCta().onClick(async () => {
+      arr.push({ name: "", color: "#888888" });
+      await this.plugin.saveSettings();
+      rerender();
+    }));
+  }
+  renderHabits(containerEl) {
+    const wc = this.plugin.settings.wordCount;
+    const habits = this.plugin.settings.habits || [];
+    const group = this.section(containerEl, t("\u0417\u0432\u0438\u0447\u043A\u0438"));
+    new obsidian12.Setting(group).setName(t("\u0417\u0432\u0438\u0447\u043A\u0430: \u043A\u0456\u043B\u044C\u043A\u0456\u0441\u0442\u044C \u043D\u0430\u043F\u0438\u0441\u0430\u043D\u0438\u0445 \u0441\u043B\u0456\u0432")).setDesc(t("\u0410\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u043D\u043E \u0440\u0430\u0445\u0443\u0454 \u0441\u043B\u043E\u0432\u0430 \u0432 \u043D\u043E\u0442\u0430\u0442\u0446\u0456 \u0434\u043D\u044F")).addToggle((c) => c.setValue(wc.enabled).onChange(async (v) => {
+      wc.enabled = v;
+      await this.plugin.saveSettings();
+      this.display();
+    }));
+    if (wc.enabled) {
+      new obsidian12.Setting(group).setName(t("\u2014 \u0435\u043C\u043E\u0434\u0437\u0456")).addText((c) => {
+        c.setValue(wc.emoji || "").onChange(async (v) => {
+          wc.emoji = v.trim();
+          await this.plugin.saveSettings();
+        });
+        c.inputEl.style.width = "3em";
+      });
+      new obsidian12.Setting(group).setName(t("\u2014 \u043A\u043E\u043B\u0456\u0440")).addColorPicker((cp) => cp.setValue(wc.color || "#9aa0a6").onChange(async (v) => {
+        wc.color = v;
+        await this.plugin.saveSettings();
+      }));
+    }
+    new obsidian12.Setting(group).setName(t("\u0417\u0432\u0438\u0447\u043A\u0438")).setDesc(this.countDesc(habits.length)).addButton((b) => b.setButtonText(t("\u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u0442\u0438")).onClick(() => {
+      new ListManagerModal(this.app, {
+        title: t("\u0417\u0432\u0438\u0447\u043A\u0438"),
+        desc: t("\u0421\u0442\u0432\u043E\u0440\u0435\u043D\u043D\u044F \u2014 \u0447\u0435\u0440\u0435\u0437 \u0448\u0432\u0438\u0434\u043A\u0435 \u0441\u0442\u0432\u043E\u0440\u0435\u043D\u043D\u044F (Ctrl+P). \u0422\u0443\u0442 \u2014 \u0440\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u043D\u043D\u044F \u0442\u0430 \u0432\u0438\u0434\u0430\u043B\u0435\u043D\u043D\u044F."),
+        render: (body, rerender) => this.renderHabitRows(body, rerender),
+        onDone: () => this.display()
+      }).open();
+    }));
+  }
+  renderHabitRows(body, rerender) {
+    const habits = this.plugin.settings.habits || [];
+    if (!habits.length) body.createEl("p", { text: t("\u041F\u043E\u043A\u0438 \u043D\u0435\u043C\u0430\u0454 \u0437\u0432\u0438\u0447\u043E\u043A."), cls: "setting-item-description" });
+    for (const h of habits) {
+      new obsidian12.Setting(body).setName(h.name).setDesc(`property: ${h.property} \xB7 ${h.type === "bool" ? t("\u0442\u0430\u043A/\u043D\u0456") : t("\u041A\u0456\u043B\u044C\u043A\u0456\u0441\u0442\u044C") + (h.unit ? ` (${h.unit})` : "")}`).addExtraButton((b) => b.setIcon("pencil").setTooltip(t("\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438")).onClick(() => new HabitEditModal(this.app, this.plugin, h, () => rerender()).open())).addExtraButton((b) => b.setIcon("trash").setTooltip(t("\u0412\u0438\u0434\u0430\u043B\u0438\u0442\u0438")).onClick(async () => {
+        this.plugin.settings.habits = habits.filter((x) => x.id !== h.id);
+        await this.plugin.saveSettings();
+        rerender();
+      }));
+    }
+  }
+  renderRecurrences(containerEl) {
+    const rules = this.plugin.settings.recurrences || [];
+    const group = this.section(containerEl, t("\u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0456 \u0437\u0430\u0434\u0430\u0447\u0456"));
+    new obsidian12.Setting(group).setName(t("\u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0430 \u0437\u0430\u0434\u0430\u0447\u0430 \u0443 \u0441\u043F\u0438\u0441\u043A\u0443")).setDesc(t("\u0421\u043A\u0456\u043B\u044C\u043A\u0438 \u043D\u0430\u0441\u0442\u0443\u043F\u043D\u0438\u0445 \u043F\u043E\u0432\u0442\u043E\u0440\u0456\u0432 \u043F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u0443 \u0441\u043F\u0438\u0441\u043A\u0443")).addText((c) => {
+      c.inputEl.type = "number";
+      c.inputEl.min = "1";
+      c.inputEl.style.width = "5em";
+      c.setValue(String(this.plugin.settings.recurrenceAhead || 1));
+      c.onChange(async (v) => {
+        this.plugin.settings.recurrenceAhead = Math.max(1, Number(v) || 1);
+        await this.plugin.saveSettings();
+      });
+    });
+    new obsidian12.Setting(group).setName(t("\u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0456 \u0437\u0430\u0434\u0430\u0447\u0456")).setDesc(this.countDesc(rules.length)).addButton((b) => b.setButtonText(t("\u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u0442\u0438")).onClick(() => {
+      new ListManagerModal(this.app, {
+        title: t("\u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0456 \u0437\u0430\u0434\u0430\u0447\u0456"),
+        desc: t("\u0421\u0442\u0432\u043E\u0440\u0435\u043D\u043D\u044F \u2014 \u0447\u0435\u0440\u0435\u0437 \u0448\u0432\u0438\u0434\u043A\u0435 \u0441\u0442\u0432\u043E\u0440\u0435\u043D\u043D\u044F (Ctrl+P). \u0422\u0443\u0442 \u2014 \u0440\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u043D\u043D\u044F \u0442\u0430 \u0432\u0438\u0434\u0430\u043B\u0435\u043D\u043D\u044F."),
+        render: (body, rerender) => this.renderRecurrenceRows(body, rerender),
+        onDone: () => this.display()
+      }).open();
+    }));
+  }
+  renderRecurrenceRows(body, rerender) {
+    const rules = this.plugin.settings.recurrences || [];
+    if (!rules.length) body.createEl("p", { text: t("\u041F\u043E\u043A\u0438 \u043D\u0435\u043C\u0430\u0454 \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u0438\u0445 \u0437\u0430\u0434\u0430\u0447."), cls: "setting-item-description" });
+    for (const rule of rules) {
+      new obsidian12.Setting(body).setName(rule.raw).setDesc(`${describeRule(rule)} \xB7 \u0437 ${rule.start}${rule.end ? ` \u0434\u043E ${rule.end}` : ""}`).addExtraButton((b) => b.setIcon("pencil").setTooltip(t("\u0420\u0435\u0434\u0430\u0433\u0443\u0432\u0430\u0442\u0438")).onClick(() => new RecurrenceEditModal(this.app, this.plugin, rule, () => rerender()).open())).addExtraButton((b) => b.setIcon("trash").setTooltip(t("\u0412\u0438\u0434\u0430\u043B\u0438\u0442\u0438")).onClick(async () => {
+        this.plugin.settings.recurrences = rules.filter((r) => r.id !== rule.id);
+        await this.plugin.saveSettings();
+        rerender();
+      }));
+    }
+  }
+};
+
+// src/main.js
+var TaskCalendarPlugin = class extends obsidian13.Plugin {
+  async onload() {
+    await this.loadSettings();
+    this.registerView(LIST_VIEW, (leaf) => new ListView(leaf, this));
+    this.registerView(CAL_VIEW, (leaf) => new CalendarView(leaf, this));
+    this.registerView(HABITS_VIEW, (leaf) => new HabitsView(leaf, this));
+    this.registerView(MINI_VIEW, (leaf) => new MiniCalendarView(leaf, this));
+    this.addRibbonIcon("list-checks", t("Markday \u2014 \u0421\u043F\u0438\u0441\u043E\u043A"), () => this.openView(LIST_VIEW));
+    this.addRibbonIcon("calendar", t("Markday \u2014 \u041A\u0430\u043B\u0435\u043D\u0434\u0430\u0440"), () => this.openView(CAL_VIEW));
+    this.addRibbonIcon("check-circle", t("Markday \u2014 \u0417\u0432\u0438\u0447\u043A\u0438"), () => this.openView(HABITS_VIEW));
+    this.addRibbonIcon("calendar-days", t("Markday \u2014 \u041C\u0456\u043D\u0456-\u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440"), () => this.openView(MINI_VIEW, true));
+    this.addCommand({ id: "open-calendar", name: t("\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u041A\u0430\u043B\u0435\u043D\u0434\u0430\u0440"), callback: () => this.openView(CAL_VIEW) });
+    this.addCommand({ id: "open-list", name: t("\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u0421\u043F\u0438\u0441\u043E\u043A \u0437\u0430\u0434\u0430\u0447"), callback: () => this.openView(LIST_VIEW) });
+    this.addCommand({ id: "open-habits", name: t("\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u0417\u0432\u0438\u0447\u043A\u0438"), callback: () => this.openView(HABITS_VIEW) });
+    this.addCommand({ id: "open-mini", name: t("\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438 \u041C\u0456\u043D\u0456-\u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440 (\u0431\u0456\u0447\u043D\u0430 \u043F\u0430\u043D\u0435\u043B\u044C)"), callback: () => this.openView(MINI_VIEW, true) });
+    this.addCommand({
+      id: "open-today-file",
+      name: t("\u0412\u0456\u0434\u043A\u0440\u0438\u0442\u0438/\u0441\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u043D\u043E\u0442\u0430\u0442\u043A\u0443 \u0441\u044C\u043E\u0433\u043E\u0434\u043D\u0456"),
+      callback: async () => {
+        const file = await getOrCreateDateFile(this.app, todayISO());
+        this.app.workspace.getLeaf().openFile(file);
+      }
+    });
+    this.addCommand({
+      id: "create-task",
+      name: t("\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u0437\u0430\u0434\u0430\u0447\u0443"),
+      callback: () => new TaskCreateModal(this.app, this).open()
+    });
+    this.addCommand({
+      id: "create-habit",
+      name: t("\u0421\u0442\u0432\u043E\u0440\u0438\u0442\u0438 \u0437\u0432\u0438\u0447\u043A\u0443"),
+      callback: () => new HabitCreateModal(this.app, this).open()
+    });
+    this.addSettingTab(new TaskCalendarSettingTab(this.app, this));
+    this.registerEvent(this.app.vault.on("modify", (f) => invalidateTaskCache(f.path)));
+    this.registerEvent(this.app.vault.on("delete", (f) => invalidateTaskCache(f.path)));
+    this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
+      invalidateTaskCache(f.path);
+      invalidateTaskCache(oldPath);
+    }));
+  }
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings.recurrences = (this.settings.recurrences || []).slice();
+    this.settings.habits = (this.settings.habits || []).slice();
+    this.settings.scenarios = (this.settings.scenarios || []).map((x) => ({ ...x }));
+    this.settings.checkboxStatuses = this.settings.checkboxStatuses && this.settings.checkboxStatuses.length ? this.settings.checkboxStatuses.map((x) => ({ ...x })) : DEFAULT_CHECKBOX_STATUSES.map((x) => ({ ...x }));
+    this.settings.wordCount = Object.assign({}, DEFAULT_SETTINGS.wordCount, this.settings.wordCount);
+    const c = this.settings.colors || {};
+    this.settings.colors = {
+      priorities: (c.priorities || DEFAULT_SETTINGS.colors.priorities).map((x) => ({ ...x })),
+      tags: (c.tags || []).map((x) => ({ ...x })),
+      groups: (c.groups || []).map((x) => ({ ...x }))
+    };
+    applyConfig(this.settings);
+  }
+  async saveSettings() {
+    await this.saveData(this.settings);
+    applyConfig(this.settings);
+    invalidateTaskCache();
+    this.refreshViews();
+  }
+  refreshViews() {
+    [LIST_VIEW, CAL_VIEW, HABITS_VIEW, MINI_VIEW].forEach((type) => this.app.workspace.getLeavesOfType(type).forEach((l) => {
+      if (l.view && l.view.refresh) l.view.refresh();
+    }));
+  }
+  async openView(type, left = false) {
+    this.app.workspace.detachLeavesOfType(type);
+    const leaf = obsidian13.Platform.isMobile ? this.app.workspace.getLeaf(false) : left ? this.app.workspace.getLeftLeaf(false) : this.app.workspace.getRightLeaf(false);
+    await leaf.setViewState({ type, active: true });
+    this.app.workspace.revealLeaf(leaf);
+  }
+  onunload() {
+    this.app.workspace.detachLeavesOfType(LIST_VIEW);
+    this.app.workspace.detachLeavesOfType(CAL_VIEW);
+    this.app.workspace.detachLeavesOfType(HABITS_VIEW);
+    this.app.workspace.detachLeavesOfType(MINI_VIEW);
+  }
+};
+var main_default = TaskCalendarPlugin;

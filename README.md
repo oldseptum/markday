@@ -51,19 +51,20 @@ A calendar **and** task manager for [Obsidian](https://obsidian.md) that works e
 
 ## Features
 
-- **Five views**
-  - **Smart list** — a mobile-first agenda: quick add, today’s habits, today’s tasks, then the next 7 days.
+- **Four views**
   - **Calendar** — Month, Overview (dots), Week, Work week and 3‑day modes.
-  - **Tasks** — a grouped/sorted task list with filters and an overdue section.
+  - **Tasks** — a grouped/sorted task list with a filter sidebar and an overdue section.
   - **Habits** — a two‑pane dashboard: weekly overview, per‑day progress rings, streaks, monthly/all‑time stats, a month ring‑calendar, a daily‑goals chart and a year heatmap.
   - **Mini calendar** — a compact month for the sidebar.
-- **Three task states** — `- [ ]` to‑do, `- [x]` done, and `- [-]` **cancelled** (won’t‑do): cancelled tasks stay on the calendar, dimmed, with an ✕ instead of a check.
-- **Tasks & events** — a task becomes an **event** when it has a time (`14:00` or `14:00-15:30`). The week/3‑day **timeline** lets you drag to move, drag the edges to resize, drag across days, and click-drag on empty space to create. A red line marks the current time.
+- **Configurable task statuses** — out of the box `- [ ]` to‑do, `- [x]` done, `- [-]` cancelled, plus `/` in progress, `>` forwarded, `<` scheduled, `!` important and `?` question (the same set the Tasks plugin and the Minimal theme use). Add, rename or remove your own in settings: each status has a character, a label, an **icon** (from Obsidian’s built‑in set, so it looks right with no theme or CSS snippet installed) and a **behavior** — counts as open, done, or cancelled.
+- **Tasks & events** — a task becomes an **event** when it has a time (`14:00` or `14:00-15:30`). The week/3‑day **timeline** lets you drag to move, drag the edges to resize, drag across days, and create by click-dragging empty space (on touch: hold, then drag). A red line marks the current time.
+- **Project folders** — besides Daily Notes, you can point Markday at project folders where tasks carry their date inline (`>2026-07-05`) instead of getting it from the file name. Both kinds show up together on the same day; undated project tasks act as a backlog.
 - **Subtasks & descriptions** — indent a checkbox for a subtask (auto progress + auto‑complete of the parent); add a free‑form description that lives under a per‑task heading (text, images, anything).
 - **Recurring tasks** — defined once, projected on the calendar virtually; a real line is written only when you tick a recurrence (no folder full of generated files). Rules cover daily/weekly/monthly/yearly with custom intervals, specific weekdays, **nth weekday** (e.g. last Friday), **first/last working day**, and yearly‑in‑a‑month.
 - **Habits** — numeric (e.g. pages, km, minutes) or yes/no, with emoji, color and an optional **daily goal** (drives the progress rings and completion %). Values live in the day note’s frontmatter. Includes an optional built‑in **“words written”** habit that counts words in the day’s note automatically.
-- **Organization** — priorities, `#tags`, `@groups`, color rules (by priority/tag/group), filtering, and a configurable colored coding.
-- **Quality of life** — a focused **create** window (title + description with inline `#`/`@` autocomplete, quick status/priority/date/recurrence row), a live‑saving **task editor** card, quick‑create commands (Ctrl/Cmd+P), an inline composer, first‑day‑of‑week, working hours, default tag/group/priority, and a floating **+** button on mobile.
+- **Organization** — priorities, `#tags`, `@groups`, color rules (by priority/tag/group) and filtering.
+- **Desktop & touch interactions** — right‑click any task for the status menu, right‑click a day for “create task / open note”, double‑click a day to open its note. On touch: **swipe** left/right to change period, **long‑press** a task for the status menu, **swipe a task right** to complete it.
+- **Quality of life** — a focused **create** window (title + description with inline `#`/`@` autocomplete, quick status/priority/date/recurrence row), a live‑saving **task editor** card, quick‑create commands (Ctrl/Cmd+P), an inline composer, first‑day‑of‑week, working hours, default tag/group/priority.
 
 ---
 
@@ -75,6 +76,7 @@ Tasks are normal Markdown checkboxes under a configurable heading (default `## T
 ## Tasks
 - [ ] 14:00-15:30 Project meeting #work !high @alpha
 - [x] Read 30 pages #reading
+- [/] Draft the proposal #work             ← in progress
 - [-] File the tax return #chores          ← cancelled (won’t‑do)
 - [ ] Plan the week !med
     - [ ] Review goals          ← subtask (indented checkbox)
@@ -84,7 +86,7 @@ Tasks are normal Markdown checkboxes under a configurable heading (default `## T
 Free text, images, links — anything.
 ```
 
-A checkbox is `- [ ]` to‑do, `- [x]` done, or `- [-]` cancelled. A recurring instance you tick gets a trailing `^rc-<id>` marker; a task with a description gets `^tcd-<id>` linking it to its heading.
+The character inside the checkbox is the **status** (configurable — see Features). A recurring instance you tick gets a trailing `^rc-<id>` marker; a task with a description gets `^tcd-<id>` linking it to its heading.
 
 | Element     | Syntax            | Example          |
 |-------------|-------------------|------------------|
@@ -92,6 +94,7 @@ A checkbox is `- [ ]` to‑do, `- [x]` done, or `- [-]` cancelled. A recurring i
 | Priority    | `!low` `!med` `!high` `!urgent` (customizable) | `!high` |
 | Tag         | `#tag`            | `#work`          |
 | Group       | `@group`          | `@alpha`         |
+| Date *(project folders only)* | `>YYYY-MM-DD` | `>2026-07-05` |
 
 Habit values are stored in the day note’s YAML frontmatter, e.g.:
 
@@ -127,23 +130,33 @@ The repository includes `example-vault/` with the plugin pre‑installed and a f
 
 - **Language** — Auto / Українська / English
 - **Heading** level and text used to store tasks
-- **Working hours** and **timeline step** (snap)
 - **First day of week**
+- **Timeline** — working hours and step (snap)
 - **Defaults** — default tag, group and priority for new tasks
+- **Parsing scenarios** — project folders that use inline `>date` instead of Daily Notes
+- **Checkbox statuses** — add/edit the recognized `- [x]` marks, their icons and behavior
 - **Colors & priorities** — rename priorities, set colors for priorities/tags/groups
 - Manage **recurring tasks** and **habits** (create them via Ctrl/Cmd+P; edit/delete here)
+
+Long lists (statuses, scenarios, colors, recurrences, habits) open in their own dialog, so the settings page stays short.
 
 ---
 
 ## Building from source
 
-The source is split into small files under `src/` and concatenated into `main.js`. **No Node.js required** — the build is a PowerShell script:
+The source lives in `src/` as ES modules and is bundled into `main.js` with esbuild. Requires Node.js:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1
+```bash
+npm install
+npm run build   # bundle src/ -> main.js
+npm run dev     # same, in watch mode
+npm test        # run the test suite (also smoke-loads the bundle)
 ```
 
+`./build.sh` (macOS/Linux) or `powershell -File build.ps1` (Windows) run build + tests together.
 (`styles.css` and `manifest.json` are used directly — only `main.js` is generated.)
+
+Tests live in `tests/` and run against the real modules in `src/`, with a small stub standing in for the Obsidian API — no vault or running Obsidian needed.
 
 ---
 

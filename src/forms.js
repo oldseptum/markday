@@ -1,7 +1,10 @@
 // ─── Reusable creation forms (shared by settings tab & quick-create modal) ─────
 
+import * as obsidian from 'obsidian';
+import { CHECKBOX_ICON_CHOICES, MONTHS_UA, WD_UA, describeRule, genId, parseISO, t, todayISO } from './core.js';
+
 // Attach a native autocomplete <datalist> to an input (suggests existing tags / groups)
-function attachDatalist(inputEl, options) {
+export function attachDatalist(inputEl, options) {
     if (!options || !options.length) return;
     const dl = document.createElement('datalist');
     dl.id = 'tcdl-' + Math.random().toString(36).slice(2, 9);
@@ -10,12 +13,8 @@ function attachDatalist(inputEl, options) {
     inputEl.insertAdjacentElement('afterend', dl);
 }
 
-function parseTagsInput(str) {
-    return (str || '').split(/[\s,]+/).map(s => s.replace(/^#/, '').trim()).filter(Boolean);
-}
-
 // Chip editor: type + Enter adds a chip (with datalist autocomplete). Returns { get: () => string[] }.
-function buildChips(container, values, options, single, placeholder) {
+export function buildChips(container, values, options, single, placeholder) {
     const state = (values || []).filter(Boolean).slice();
     const wrap = container.createEl('div', { cls: 'tc-chips' });
     const input = document.createElement('input');
@@ -54,12 +53,10 @@ function buildChips(container, values, options, single, placeholder) {
     return { get: () => state.slice() };
 }
 
-function newTaskDraft() { return { text: '', date: todayISO(), tags: '', group: '' }; }
-function newRecurrenceDraft() { return { raw: '', freq: 'daily', interval: 1, weekdays: [], monthMode: 'day', monthday: '', nth: 1, weekday: 0, which: 'first', month: new Date().getMonth(), start: todayISO(), end: '' }; }
 
 // Map a recurrence draft → schedule fields of a rule (no id/raw/start/end). Shared by
 // the create flow, the settings edit modal and the live preview.
-function ruleFromRecDraft(d) {
+export function ruleFromRecDraft(d) {
     const rule = { freq: d.freq, interval: Math.max(1, Number(d.interval) || 1) };
     if (d.freq === 'weekly') rule.weekdays = (d.weekdays || []).slice();
     if (d.freq === 'monthly' || d.freq === 'yearly') {
@@ -71,12 +68,21 @@ function ruleFromRecDraft(d) {
     if (d.freq === 'yearly') rule.month = (d.month != null && d.month !== '') ? Number(d.month) : new Date().getMonth();
     return rule;
 }
-function newHabitDraft() { return { name: '', property: '', unit: '', type: 'number', emoji: '', color: '#9aa0a6', goal: '' }; }
+export function newHabitDraft() { return { name: '', property: '', unit: '', type: 'number', emoji: '', color: '#9aa0a6', goal: '' }; }
+
+// Assemble a persisted recurrence rule from raw task text + dates + a schedule draft.
+// Monthly/yearly rules in "by day of month" mode default their day to the start date's.
+export function buildRule(raw, start, end, d) {
+    const rule = Object.assign({ id: genId(), raw, start, end: end || null }, ruleFromRecDraft(d));
+    if ((rule.freq === 'monthly' || rule.freq === 'yearly') && rule.monthMode === 'day' && !rule.monthday)
+        rule.monthday = parseISO(start).getDate();
+    return rule;
+}
 
 // Render recurrence fields into `containerEl`. `rerender` is called when the set of
 // visible fields changes (frequency / weekday toggles) so the caller can rebuild.
 // opts.hideRaw → omit the task-text field; opts.hideDates → omit start/end (create flow).
-function buildRecurrenceFields(containerEl, d, rerender, opts) {
+export function buildRecurrenceFields(containerEl, d, rerender, opts) {
     opts = opts || {};
     if (!opts.hideRaw) {
         new obsidian.Setting(containerEl).setName(t('Назва'))
@@ -141,17 +147,13 @@ function buildRecurrenceFields(containerEl, d, rerender, opts) {
     containerEl.createEl('div', { cls: 'tc-rec-preview', text: '↻ ' + describeRule(ruleFromRecDraft(d)) });
 }
 
-function validateRecurrence(d) {
+export function validateRecurrence(d) {
     if (!d.raw.trim()) { new obsidian.Notice(t('Введіть текст задачі')); return null; }
     if (d.freq === 'weekly' && (d.weekdays || []).length === 0) { new obsidian.Notice(t('Оберіть хоча б один день тижня')); return null; }
-    const start = d.start || todayISO();
-    const rule = Object.assign({ id: genId(), raw: d.raw.trim(), start, end: d.end || null }, ruleFromRecDraft(d));
-    if ((rule.freq === 'monthly' || rule.freq === 'yearly') && rule.monthMode === 'day' && !rule.monthday)
-        rule.monthday = parseISO(start).getDate();
-    return rule;
+    return buildRule(d.raw.trim(), d.start || todayISO(), d.end, d);
 }
 
-function buildHabitFields(containerEl, d, rerender) {
+export function buildHabitFields(containerEl, d, rerender) {
     new obsidian.Setting(containerEl).setName(t('Назва'))
         .addText(c => c.setPlaceholder('Читання').setValue(d.name).onChange(v => d.name = v));
     new obsidian.Setting(containerEl).setName(t('Емодзі'))
@@ -177,10 +179,60 @@ function buildHabitFields(containerEl, d, rerender) {
     }
 }
 
-function validateHabit(d) {
+export function validateHabit(d) {
     const name = d.name.trim();
     const prop = d.property.trim();
     if (!name) { new obsidian.Notice(t('Введіть назву')); return null; }
     if (!prop) { new obsidian.Notice(t('Введіть назву property')); return null; }
     return { id: genId(), name, property: prop, type: d.type, unit: d.type === 'number' ? d.unit.trim() : '', emoji: (d.emoji || '').trim(), color: d.color || '', goal: d.type === 'number' ? (Number(d.goal) || null) : null };
+}
+
+export function newStatusDraft(status) {
+    return status
+        ? { id: status.id, char: status.char, label: status.label, behavior: status.behavior, icon: status.icon || '' }
+        : { id: null, char: '/', label: '', behavior: 'active', icon: '' };
+}
+
+// Checkbox-status fields: char + label + behavior + icon (curated dropdown, or free-text
+// via "Інша…" for any valid Lucide name) with a live preview of what Markday will draw.
+export function buildStatusFields(containerEl, d, rerender) {
+    new obsidian.Setting(containerEl).setName(t('Символ'))
+        .setDesc(t('Один символ, що записується як "- [X] текст задачі"'))
+        .addText(c => {
+            c.inputEl.maxLength = 1; c.inputEl.style.width = '3em';
+            c.setValue(d.char).onChange(v => { d.char = (v.trim() || v).slice(0, 1) || ' '; rerender(); });
+        });
+    new obsidian.Setting(containerEl).setName(t('Назва'))
+        .addText(c => c.setPlaceholder(t('Нова')).setValue(d.label).onChange(v => d.label = v));
+    new obsidian.Setting(containerEl).setName(t('Поведінка'))
+        .setDesc(t('Як статус враховується: як відкрита задача, виконана чи скасована'))
+        .addDropdown(dd => {
+            dd.addOption('active', t('Активна')).addOption('done', t('Виконано')).addOption('cancelled', t('Скасовано'));
+            dd.setValue(d.behavior).onChange(v => d.behavior = v);
+        });
+
+    const isCustomIcon = !!(d.icon && !CHECKBOX_ICON_CHOICES.includes(d.icon));
+    const iconSetting = new obsidian.Setting(containerEl).setName(t('Іконка'))
+        .setDesc(t('Показується у списках/календарі Markday замість символу (працює без сторонніх тем чи плагінів)'));
+    iconSetting.addDropdown(dd => {
+        dd.addOption('', t('Без іконки (лише символ)'));
+        CHECKBOX_ICON_CHOICES.forEach(name => dd.addOption(name, name));
+        dd.addOption('__custom', t('Інша…'));
+        dd.setValue(isCustomIcon ? '__custom' : (d.icon || ''));
+        dd.onChange(v => { d.icon = v === '__custom' ? (d.icon || 'circle') : v; rerender(); });
+    });
+    if (isCustomIcon) {
+        iconSetting.addText(c => c.setPlaceholder('lucide-name').setValue(d.icon || '').onChange(v => { d.icon = v.trim(); }));
+    }
+    const preview = iconSetting.controlEl.createSpan({ cls: 'tc-icon-preview' });
+    if (d.icon) obsidian.setIcon(preview, d.icon); else preview.setText(d.char.trim() ? d.char : '·');
+}
+
+export function validateStatus(d) {
+    // d.char is kept to exactly one character by buildStatusFields' onChange (defaults to
+    // a space if cleared), so it never needs the same "empty" guard as label/property below.
+    const char = (d.char || ' ').slice(0, 1);
+    const label = (d.label || '').trim();
+    if (!label) { new obsidian.Notice(t('Введіть назву')); return null; }
+    return { id: d.id || genId(), char, label, behavior: d.behavior || 'active', icon: (d.icon || '').trim() };
 }

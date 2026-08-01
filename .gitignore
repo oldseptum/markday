@@ -1,0 +1,11 @@
+# Internal assistant tooling — not for users/contributors
+CODEMAP.md
+tools/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+
+# Node / build artifacts
+node_modules/
+.testbuild/

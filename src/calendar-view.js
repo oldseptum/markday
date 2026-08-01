@@ -1,9 +1,18 @@
 // ─── Calendar View ───────────────────────────────────────────────────────────
 
-const CAL_MODES = [['month', 'Місяць'], ['agenda', 'Перелік'], ['week', 'Тиждень'], ['workweek', 'Робочий тиждень'], ['3day', '3 дні']];
-const COLOR_OPTS = [['priority', 'Колір: пріоритет'], ['tag', 'Колір: тег'], ['group', 'Колір: група'], ['none', 'Без кольору']];
+import * as obsidian from 'obsidian';
+import { CAL_VIEW, MONTHS_UA, addDays, addVirtuals, cardColor, compactMode, dayOrder, humanDate, monthGridDays, startOfWeek, startOfWorkWeek, t, toISO, todayISO, weekdayHeaders } from './core.js';
+import { attachSwipeNav } from './gestures.js';
+import { TaskCreateModal, renderTaskComposer } from './quick-create.js';
+import { applyCardColor, completeTask, makeStatusCheckbox, materializeAndEdit, openStatusMenu, quickAdd, renderTaskRow } from './render.js';
+import { loadAllTasks, openDay, setTaskStatus } from './store.js';
+import { TaskEditorModal } from './task-editor-modal.js';
+import { renderTimeline } from './timeline.js';
 
-class CalendarView extends obsidian.ItemView {
+export const CAL_MODES = [['month', 'Місяць'], ['week', 'Тиждень'], ['workweek', 'Робочий тиждень'], ['3day', '3 дні']];
+export const COLOR_OPTS = [['priority', 'Колір: пріоритет'], ['tag', 'Колір: тег'], ['group', 'Колір: група'], ['none', 'Без кольору']];
+
+export class CalendarView extends obsidian.ItemView {
     constructor(leaf, plugin) {
         super(leaf);
         this.plugin = plugin;
@@ -22,7 +31,8 @@ class CalendarView extends obsidian.ItemView {
 
     async onOpen() { await this.refresh(); }
 
-    isMonthish() { return this.mode === 'month' || this.mode === 'agenda'; }
+    isMonthish() { return this.mode === 'month'; }
+    isOverview() { return this.mode === 'month' && ((this.containerEl.children[1] && this.containerEl.children[1].clientWidth) || 9999) < 1250; }
     resetOffHours() { this.showEarly = false; this.showLate = false; }
     dayCount() { return this.mode === 'week' ? 7 : this.mode === 'workweek' ? 5 : 3; }
     rangeStartDate() { return this.mode === 'workweek' ? startOfWorkWeek(this.anchor) : this.mode === 'week' ? startOfWeek(this.anchor) : this.anchor; }
@@ -59,7 +69,8 @@ class CalendarView extends obsidian.ItemView {
 
     onResize() {
         const c = compactMode(this);
-        if (c !== this._lastCompact) { this.refresh(); return; }
+        const ov = this.isOverview();
+        if (c !== this._lastCompact || ov !== this._overview) { this.refresh(); return; }
         // height-only resize (e.g. window made shorter): re-render the month so the
         // "+N" overflow trimming is recomputed for the new (smaller) cell heights
         if (this.mode === 'month') {
@@ -86,11 +97,12 @@ class CalendarView extends obsidian.ItemView {
         const root = this.containerEl.children[1];
         root.empty();
         root.addClass('tc-pane', 'tc-cal-pane');
-        root.toggleClass('tc-cal-fill', this.mode === 'month' && !mobile);
+        const overview = this.isOverview();
+        this._overview = overview;
+        root.toggleClass('tc-cal-fill', this.mode === 'month' && !overview);
 
         this.renderHeader(root, mobile);
-        if (this.mode === 'month') this.renderMonth(root, map, mobile);
-        else if (this.mode === 'agenda') this.renderAgenda(root, map);
+        if (this.mode === 'month') { if (overview) this.renderOverview(root, map); else this.renderMonth(root, map, mobile); }
         else { this._map = map; renderTimeline(this, root, this.dayCount()); }
     }
 
@@ -101,7 +113,7 @@ class CalendarView extends obsidian.ItemView {
         if (mobile) {
             const modeBtn = bar.createEl('button', { cls: 'clickable-icon' });
             obsidian.setIcon(modeBtn, 'layout-grid');
-            modeBtn.setAttribute('aria-label', 'Режим');
+            modeBtn.setAttribute('aria-label', t('Режим'));
             modeBtn.onclick = e => this.modeMenu(e);
 
             const title = bar.createEl('div', { text: this.titleText(), cls: 'tc-cal-title' });
@@ -129,13 +141,13 @@ class CalendarView extends obsidian.ItemView {
 
         const filterBtn = right.createEl('button', { cls: 'clickable-icon' });
         obsidian.setIcon(filterBtn, 'filter');
-        filterBtn.setAttribute('aria-label', 'Фільтр');
+        filterBtn.setAttribute('aria-label', t('Фільтр'));
         if (this.filter) filterBtn.addClass('is-active');
         filterBtn.onclick = e => this.filterMenu(e);
 
         const dispBtn = right.createEl('button', { cls: 'clickable-icon' });
         obsidian.setIcon(dispBtn, 'more-horizontal');
-        dispBtn.setAttribute('aria-label', 'Відображення');
+        dispBtn.setAttribute('aria-label', t('Відображення'));
         dispBtn.onclick = e => this.displayMenu(e);
 
         const nav = right.createEl('div', { cls: 'tc-nav-group' });
@@ -204,15 +216,13 @@ class CalendarView extends obsidian.ItemView {
         return `${toISO(start)} → ${toISO(addDays(start, this.dayCount() - 1))}`;
     }
 
-    monthDays() {
-        const start = startOfWeek(new Date(this.anchor.getFullYear(), this.anchor.getMonth(), 1));
-        return Array.from({ length: 42 }, (_, i) => addDays(start, i));
-    }
+    monthDays() { return monthGridDays(this.anchor.getFullYear(), this.anchor.getMonth()); }
 
     renderMonth(root, map, mobile) {
         const s = this.plugin.settings;
         const refresh = () => this.refresh();
         const grid = root.createEl('div', { cls: 'tc-month-grid' });
+        attachSwipeNav(grid, () => this.shift(-1), () => this.shift(1));
         for (const wd of weekdayHeaders()) grid.createEl('div', { text: wd, cls: 'tc-wd' });
 
         const days = this.monthDays();
@@ -231,7 +241,20 @@ class CalendarView extends obsidian.ItemView {
 
                 const head = cell.createEl('div', { cls: 'tc-day-head' });
                 const num = head.createEl('span', { text: String(day.getDate()) });
-                if (!mobile) num.onclick = ev => { ev.stopPropagation(); openDay(this.app, iso); };
+                if (!mobile) {
+                    num.onclick = ev => { ev.stopPropagation(); openDay(this.app, iso); };
+                    cell.ondblclick = () => openDay(this.app, iso);
+                    cell.oncontextmenu = ev => {
+                        if (ev.defaultPrevented) return;   // клік по бару вже показав меню статусів
+                        ev.preventDefault();
+                        const menu = new obsidian.Menu();
+                        menu.addItem(i => i.setTitle(t('Створити задачу')).setIcon('plus')
+                            .onClick(() => new TaskCreateModal(this.app, this.plugin, iso).open()));
+                        menu.addItem(i => i.setTitle(t('Відкрити нотатку')).setIcon('file-text')
+                            .onClick(() => openDay(this.app, iso)));
+                        menu.showAtPosition({ x: ev.clientX, y: ev.clientY });
+                    };
+                }
 
                 const entry = map.get(iso);
                 if (entry && entry.tasks.length) {
@@ -242,20 +265,28 @@ class CalendarView extends obsidian.ItemView {
                         if (t.done) bar.addClass('tc-bar-done');
                         if (t.cancelled) bar.addClass('tc-bar-cancelled');
                         if (t.virtual) bar.addClass('tc-virtual');
+                        if (t.recId || t.virtual) bar.addClass('tc-bar-recurring');   // dashed, no emoji
                         applyCardColor(bar, t, s.colorBy, s.priorityDot);
                         if (!mobile) {
                             const cbx = makeStatusCheckbox(bar, t, async checked => {
-                                if (t.virtual) await materializeVirtual(this.app, t, checked, s);
-                                else if (t.subtasks && t.subtasks.length) await toggleTaskCascade(this.app, t.file, t, checked);
-                                else await toggleTask(this.app, t.file, t.line, checked);
+                                await completeTask(this.app, t, checked, s);
                                 refresh();
                             }, 'tc-bar-cbx');
                             cbx.onclick = ev => ev.stopPropagation();
                         }
                         bar.createEl('span', { text: t.text || '(без назви)', cls: 'tc-bar-text' });
                         if (t.start) bar.createEl('span', { text: t.start, cls: 'tc-bar-time' });
+                        if (!t.virtual && t.file) {
+                            bar.oncontextmenu = ev => {
+                                ev.preventDefault(); ev.stopPropagation();
+                                openStatusMenu(ev, t, async st => { await setTaskStatus(this.app, t.file, t.line, st.id); refresh(); });
+                            };
+                        }
                         if (!mobile && !t.virtual && t.file) {
-                            bar.onclick = ev => { ev.stopPropagation(); new TaskEditorModal(this.app, t, refresh).open(); };
+                            bar.onclick = ev => { ev.stopPropagation(); new TaskEditorModal(this.app, t, refresh, this.plugin).open(); };
+                        } else if (!mobile && t.virtual) {
+                            // virtual instance: materialize + open the editor in one click
+                            bar.onclick = ev => { ev.stopPropagation(); materializeAndEdit(this.app, t, s, refresh, this.plugin); };
                         }
                     });
                 }
@@ -284,14 +315,14 @@ class CalendarView extends obsidian.ItemView {
                 const bars = Array.from(items.children)
                     .filter(c => c.classList.contains('tc-bar') && !c.classList.contains('tc-bar-more'));
                 if (bars.length < 2) return;
+                const avail = items.clientHeight;
+                if (!avail) return;
                 const cs = getComputedStyle(items);
                 const gap = parseFloat(cs.rowGap || cs.gap) || 2;
-                const barH = bars[0].getBoundingClientRect().height + gap;
-                const avail = items.clientHeight;
-                if (!barH || !avail) return;
-                const fit = Math.floor((avail + gap) / barH);
-                if (bars.length <= fit) return;
-                const keep = Math.max(1, fit - 1);
+                const barH = (bars[0].getBoundingClientRect().height || 21) + gap;   // ≈ 23px per task
+                const full = Math.floor((avail + gap) / barH);        // how many fit fully
+                if (bars.length <= full) return;                      // all fit → no chip
+                const keep = Math.max(1, full - 1);                   // leave a row for the "+N" chip
                 for (let i = keep; i < bars.length; i++) bars[i].remove();
                 const more = items.createEl('div', { cls: 'tc-bar tc-bar-more', text: `+${bars.length - keep}` });
                 more.onclick = ev => {
@@ -314,7 +345,7 @@ class CalendarView extends obsidian.ItemView {
         const tasks = entry ? entry.tasks.slice().sort(dayOrder) : [];
         if (tasks.length) {
             const list = panel.createEl('div', { cls: 'tc-list' });
-            tasks.forEach(t => renderTaskRow(this.app, list, t, refresh, { settings }));
+            tasks.forEach(t => renderTaskRow(this.app, list, t, refresh, { settings, plugin: this.plugin }));
         } else {
             panel.createEl('div', { text: t('Задач немає'), cls: 'tc-col-empty' });
         }
@@ -322,9 +353,11 @@ class CalendarView extends obsidian.ItemView {
     }
 
     // "Перелік": compact month with done/undone dots + selected-day task list
-    renderAgenda(root, map) {
+    renderOverview(root, map) {
         const s = this.plugin.settings;
-        const grid = root.createEl('div', { cls: 'tc-month-grid tc-dots-grid' });
+        const wrap = root.createEl('div', { cls: 'tc-overview' });
+        attachSwipeNav(wrap, () => this.shift(-1), () => this.shift(1));
+        const grid = wrap.createEl('div', { cls: 'tc-month-grid tc-dots-grid' });
         for (const wd of weekdayHeaders()) grid.createEl('div', { text: wd, cls: 'tc-wd' });
         const todayStr = todayISO();
 
@@ -339,17 +372,18 @@ class CalendarView extends obsidian.ItemView {
             const entry = map.get(iso);
             if (entry && entry.tasks.length) {
                 const dots = cell.createEl('div', { cls: 'tc-dots' });
-                entry.tasks.slice(0, 10).forEach(t => {
+                entry.tasks.slice(0, 12).forEach(t => {
                     const d = dots.createEl('span', { cls: 'tc-dot' });
                     const c = cardColor(t, s.colorBy) || 'var(--interactive-accent)';
-                    if (t.done) { d.addClass('tc-dot-hollow'); d.style.borderColor = c; }
+                    if (t.cancelled) d.addClass('tc-dot-x');                       // cancelled → muted ✕ dot
+                    else if (t.done) { d.addClass('tc-dot-hollow'); d.style.borderColor = c; }
                     else d.style.background = c;
                 });
             }
             cell.onclick = () => { this.selectedDate = iso; this.refresh(); };
         }
 
-        this.renderDayDetail(root, map, this.selectedDate);
+        this.renderDayDetail(wrap, map, this.selectedDate);
     }
 
     renderDayDetail(root, map, iso) {
@@ -359,15 +393,15 @@ class CalendarView extends obsidian.ItemView {
         const head = panel.createEl('div', { cls: 'tc-day-detail-head' });
         head.createEl('span', { text: humanDate(iso), cls: 'tc-day-detail-date' });
         head.createEl('button', { text: t('Відкрити нотатку') }).onclick = () => openDay(this.app, iso);
+        renderTaskComposer(this.app, this.plugin, panel, iso, refresh);   // same composer as the list
 
         const entry = map.get(iso);
         const tasks = entry ? entry.tasks.slice().sort(dayOrder) : [];
         if (tasks.length) {
             const list = panel.createEl('div', { cls: 'tc-list' });
-            tasks.forEach(t => renderTaskRow(this.app, list, t, refresh, { settings }));
+            tasks.forEach(t => renderTaskRow(this.app, list, t, refresh, { settings, plugin: this.plugin }));
         } else {
             panel.createEl('div', { text: t('Задач немає'), cls: 'tc-col-empty' });
         }
-        quickAdd(this.app, panel, iso, refresh, t('+ задача'), settings);
     }
 }

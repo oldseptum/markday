@@ -1,6 +1,11 @@
 // ─── Mini Calendar View (sidebar) ────────────────────────────────────────────
 
-class MiniCalendarView extends obsidian.ItemView {
+import * as obsidian from 'obsidian';
+import { MINI_VIEW, MONTHS_UA, dateToPath, monthGridDays, parseISO, t, toISO, todayISO, weekdayHeaders } from './core.js';
+import { attachSwipeNav } from './gestures.js';
+import { getOrCreateDateFile, loadAllTasks, openDay } from './store.js';
+
+export class MiniCalendarView extends obsidian.ItemView {
     constructor(leaf, plugin) {
         super(leaf);
         this.plugin = plugin;
@@ -40,14 +45,12 @@ class MiniCalendarView extends obsidian.ItemView {
         bar.createEl('button', { text: '›', cls: 'tcm-nav' }).onclick = () => this.shift(1);
 
         const grid = root.createEl('div', { cls: 'tcm-grid' });
+        attachSwipeNav(grid, () => this.shift(-1), () => this.shift(1));
         for (const wd of weekdayHeaders()) grid.createEl('div', { text: wd, cls: 'tcm-wd' });
 
-        const first = new Date(this.anchor.getFullYear(), this.anchor.getMonth(), 1);
-        const start = startOfWeek(first);
         const todayStr = todayISO();
 
-        for (let i = 0; i < 42; i++) {
-            const day = addDays(start, i);
+        for (const day of monthGridDays(this.anchor.getFullYear(), this.anchor.getMonth())) {
             const iso = toISO(day);
             const cell = grid.createEl('div', { cls: 'tcm-cell' });
             if (day.getMonth() !== this.anchor.getMonth()) cell.addClass('tcm-outside');
@@ -81,7 +84,7 @@ class MiniCalendarView extends obsidian.ItemView {
             this.app.workspace.trigger('file-menu', menu, file, 'mini-calendar');
         } else {
             menu.addItem(item => item
-                .setTitle('Створити нотатку')
+                .setTitle(t('Створити нотатку'))
                 .setIcon('file-plus')
                 .onClick(async () => {
                     const f = await getOrCreateDateFile(this.app, iso);
@@ -92,6 +95,6 @@ class MiniCalendarView extends obsidian.ItemView {
     }
 }
 
-function miniDot(container, filled) {
+export function miniDot(container, filled) {
     container.createEl('span', { cls: filled ? 'tcm-dot tcm-dot-filled' : 'tcm-dot tcm-dot-hollow' });
 }

@@ -1,13 +1,20 @@
 // ─── Timeline grid (week / 3-day) with drag-move, resize & cross-day move ──────
 
-const HOUR_PX = 50;                                   // pixels per hour
-let _tlDragTask = null;                               // untimed task being dragged from the all-day row
+import { WD_UA, addDays, dayOrder, mondayIdx, pad, t, timeMin, toISO, todayISO } from './core.js';
+import { attachHoldDrag } from './gestures.js';
+import { parseTasks } from './parser.js';
+import { applyCardColor, completeTask, makeStatusCheckbox, materializeAndEdit, openStatusMenu, quickAdd } from './render.js';
+import { addTask, getOrCreateDateFile, moveTaskToDay, rewriteTaskLine, setTaskStatus } from './store.js';
+import { TaskEditorModal } from './task-editor-modal.js';
 
-function minToHHMM(min) { return `${pad(Math.floor(min / 60))}:${pad(min % 60)}`; }
-function snapStep(min, step) { return Math.round(min / step) * step; }
-function clampMin(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+export const HOUR_PX = 50;                                   // pixels per hour
+export let _tlDragTask = null;                               // untimed task being dragged from the all-day row
 
-function renderTimeline(view, root, n) {
+export function minToHHMM(min) { return `${pad(Math.floor(min / 60))}:${pad(min % 60)}`; }
+export function snapStep(min, step) { return Math.round(min / step) * step; }
+export function clampMin(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+export function renderTimeline(view, root, n) {
     const app = view.app;
     const settings = view.plugin.settings;
     const refresh = () => view.refresh();
@@ -35,6 +42,13 @@ function renderTimeline(view, root, n) {
         days.push({ day, iso, tasks });
     }
 
+    // keep the current-time line visible even outside working hours
+    if (days.some(d => d.iso === todayStr)) {
+        const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+        if (nowMin < minStart) minStart = nowMin;
+        if (nowMin > maxEnd) maxEnd = nowMin;
+    }
+
     // start from working hours, auto-FIT to tasks that fall outside, then honour manual expand
     let rangeStart = workStart;
     let rangeEnd = workEnd;
@@ -58,7 +72,7 @@ function renderTimeline(view, root, n) {
     for (const d of days) {
         const h = header.createEl('div', { cls: 'tc-tl-dayhead' });
         if (d.iso === todayStr) h.addClass('tc-col-today');
-        h.createEl('span', { text: WD_UA[(d.day.getDay() + 6) % 7], cls: 'tc-col-wd' });
+        h.createEl('span', { text: WD_UA[mondayIdx(d.day)], cls: 'tc-col-wd' });
         h.createEl('span', { text: `${pad(d.day.getDate())}.${pad(d.day.getMonth() + 1)}`, cls: 'tc-col-date' });
     }
 
@@ -69,7 +83,7 @@ function renderTimeline(view, root, n) {
         const cell = allday.createEl('div', { cls: 'tc-tl-alldaycell' });
         quickAdd(app, cell, d.iso, refresh, t('+ задача'), settings);
         d.tasks.filter(t => !t.start).sort(dayOrder).forEach(t => {
-            const w = renderTaskRow(app, cell, t, refresh, { settings });
+            const w = renderAllDayChip(view, cell, t, ctx);
             if (!t.virtual && t.file) {
                 w.setAttribute('draggable', 'true');
                 w.addEventListener('dragstart', e => { _tlDragTask = t; e.dataTransfer.effectAllowed = 'move'; });
@@ -127,7 +141,7 @@ function renderTimeline(view, root, n) {
         });
 
         const evs = d.tasks.filter(t => t.start).map(t => ({
-            t, sm: timeMin(t.start), em: t.end ? timeMin(t.end) : timeMin(t.start) + 60
+            t, sm: timeMin(t.start), em: t.end ? timeMin(t.end) : timeMin(t.start) + 15
         }));
         assignColumns(evs);
         for (const ev of evs) renderEventCard(view, col, ev.t, ctx, ev);
@@ -159,7 +173,7 @@ function renderTimeline(view, root, n) {
 }
 
 // Lay out time-overlapping events into side-by-side columns (mutates items: .col/.cols)
-function assignColumns(items) {
+export function assignColumns(items) {
     items.sort((a, b) => a.sm - b.sm || a.em - b.em);
     let i = 0;
     while (i < items.length) {
@@ -184,56 +198,117 @@ function assignColumns(items) {
     }
 }
 
-// Click empty grid → create at that time; click-drag → create with a time range. Opens editor after.
-function bindGridCreate(col, dIso, ctx, view) {
-    col.addEventListener('pointerdown', e => {
-        if (e.button !== 0) return;
-        if (e.target !== col && !e.target.classList.contains('tc-tl-hourline')) return;
-        e.preventDefault();
+// Create-on-empty-grid. Mouse: click → 60-min event, click-drag → time range (as before).
+// Touch: HOLD (~450ms) arms the gesture first, then dragging sets the range — a plain
+// pan over the grid just scrolls the week and never creates anything. Opens editor after.
+export function bindGridCreate(col, dIso, ctx, view) {
+    const isEmptyGrid = target => target === col || target.classList.contains('tc-tl-hourline');
+
+    // one create-session: preview element + y→minutes math + final task creation
+    const startSession = clientY0 => {
         const rect = col.getBoundingClientRect();
-        const startMin0 = ctx.rangeStartMin + (e.clientY - rect.top) / HOUR_PX * 60;
+        const toMin = y => ctx.rangeStartMin + (y - rect.top) / HOUR_PX * 60;
         const preview = col.createEl('div', { cls: 'tc-tl-event tc-tl-preview' });
-        let moved = false, a = startMin0, b = startMin0;
+        const a = toMin(clientY0);
+        let b = a, moved = false;
         const paint = () => {
             const lo = Math.min(a, b), hi = Math.max(a, b);
             preview.style.top = `${(lo - ctx.rangeStartMin) / 60 * HOUR_PX}px`;
             preview.style.height = `${Math.max((hi - lo) / 60 * HOUR_PX, 6)}px`;
         };
         paint();
-        const onMove = ev => {
-            b = ctx.rangeStartMin + (ev.clientY - rect.top) / HOUR_PX * 60;
-            if (Math.abs(b - startMin0) > 4) moved = true;
-            paint();
+        return {
+            move(clientY) {
+                b = toMin(clientY);
+                if (Math.abs(b - a) > 4) moved = true;
+                paint();
+            },
+            async finish() {
+                preview.remove();
+                let lo = clampMin(snapStep(Math.min(a, b), ctx.step), ctx.rangeStartMin, ctx.rangeEndMin - ctx.step);
+                let hi = moved ? clampMin(snapStep(Math.max(a, b), ctx.step), lo + ctx.step, ctx.rangeEndMin) : lo + 60;
+                hi = clampMin(hi, lo + ctx.step, ctx.rangeEndMin);
+                const file = await getOrCreateDateFile(view.app, dIso);
+                const lineNum = await addTask(view.app, file, `${minToHHMM(lo)}-${minToHHMM(hi)} ${t('Нова подія')}`, view.plugin.settings);
+                // re-read just this file (not the whole vault) and locate the new task by its line
+                const created = parseTasks(await view.app.vault.read(file)).find(x => x.line === lineNum);
+                if (created) new TaskEditorModal(view.app, { ...created, file, date: dIso }, () => view.refresh(), view.plugin).open();
+                else view.refresh();
+            },
         };
+    };
+
+    // mouse/pen path — unchanged behavior (only touch goes through attachHoldDrag below,
+    // so a stylus keeps the precise click-drag interaction rather than needing a hold)
+    col.addEventListener('pointerdown', e => {
+        if (e.pointerType === 'touch') return;
+        if (e.button !== 0) return;
+        if (!isEmptyGrid(e.target)) return;
+        e.preventDefault();
+        const session = startSession(e.clientY);
+        const onMove = ev => session.move(ev.clientY);
         const onUp = async () => {
             window.removeEventListener('pointermove', onMove);
             window.removeEventListener('pointerup', onUp);
-            preview.remove();
-            let lo = clampMin(snapStep(Math.min(a, b), ctx.step), ctx.rangeStartMin, ctx.rangeEndMin - ctx.step);
-            let hi = moved ? clampMin(snapStep(Math.max(a, b), ctx.step), lo + ctx.step, ctx.rangeEndMin) : lo + 60;
-            hi = clampMin(hi, lo + ctx.step, ctx.rangeEndMin);
-            const evName = t('Нова подія');
-            const file = await getOrCreateDateFile(view.app, dIso);
-            await addTask(view.app, file, `${minToHHMM(lo)}-${minToHHMM(hi)} ${evName}`, view.plugin.settings);
-            const entry = (await loadAllTasks(view.app)).get(dIso);
-            const created = entry && entry.tasks.find(x => x.start === minToHHMM(lo) && x.text === evName);
-            if (created) new TaskEditorModal(view.app, created, () => view.refresh()).open();
-            else view.refresh();
+            await session.finish();
         };
         window.addEventListener('pointermove', onMove);
         window.addEventListener('pointerup', onUp);
     });
+
+    // touch path — hold to arm, then drag the range; release commits
+    let session = null;
+    attachHoldDrag(col, {
+        accept: e => isEmptyGrid(e.target),
+        onStart: (x, y) => { session = startSession(y); },
+        onMove: (x, y) => { if (session) session.move(y); },
+        onEnd: async () => {
+            const s = session;
+            session = null;
+            if (s) await s.finish();
+        },
+    });
 }
 
-function renderEventCard(view, col, task, ctx, layout) {
+// All-day (untimed) task chip — same look as timed event cards (coloured, dashed for
+// recurrences, no emoji, single line), but flows in the all-day row.
+export function renderAllDayChip(view, cell, task, ctx) {
+    const app = view.app;
+    const card = cell.createEl('div', { cls: 'tc-tl-allday-card' });
+    applyCardColor(card, task, ctx.colorBy, ctx.priorityDot);
+    if (task.virtual) card.addClass('tc-virtual');
+    if (task.recId && !task.virtual) card.addClass('tc-tl-recurring');   // dashed for materialized recurrences
+    if (task.done) card.addClass('tc-tl-done');
+    if (task.cancelled) card.addClass('tc-cancelled');
+
+    const cb = makeStatusCheckbox(card, task, async checked => {
+        await completeTask(app, task, checked, view.plugin.settings);
+        ctx.refresh();
+    }, 'tc-tl-cb');
+    cb.addEventListener('click', e => e.stopPropagation());
+
+    card.createEl('span', { cls: 'tc-tl-event-title', text: task.text || '(без назви)' });
+    if (task.virtual || !task.file) card.onclick = () => materializeAndEdit(app, task, view.plugin.settings, ctx.refresh, view.plugin);
+    else {
+        card.onclick = () => new TaskEditorModal(app, task, () => view.refresh(), view.plugin).open();
+        card.addEventListener('contextmenu', e => {
+            e.preventDefault(); e.stopPropagation();
+            openStatusMenu(e, task, async st => { await setTaskStatus(app, task.file, task.line, st.id); ctx.refresh(); });
+        });
+    }
+    return card;
+}
+
+export function renderEventCard(view, col, task, ctx, layout) {
     const app = view.app;
     const sm = timeMin(task.start);
-    const em = task.end ? timeMin(task.end) : sm + 60;
+    const em = task.end ? timeMin(task.end) : sm + 15;     // no end → treat as a 15-min slot
     const pxPerMin = HOUR_PX / 60;
+    const compact = (em - sm) <= 30;
 
-    const card = col.createEl('div', { cls: 'tc-tl-event' });
+    const card = col.createEl('div', { cls: compact ? 'tc-tl-event tc-tl-event-compact' : 'tc-tl-event' });
     card.style.top = `${(sm - ctx.rangeStartMin) * pxPerMin}px`;
-    card.style.height = `${Math.max((em - sm) * pxPerMin, 30)}px`;
+    card.style.height = `${Math.max((em - sm) * pxPerMin, 20)}px`;
     if (layout && layout.cols > 1) {
         card.style.left = `calc(${(layout.col / layout.cols * 100).toFixed(4)}% + 1px)`;
         card.style.width = `calc(${(100 / layout.cols).toFixed(4)}% - 2px)`;
@@ -241,30 +316,36 @@ function renderEventCard(view, col, task, ctx, layout) {
     }
     applyCardColor(card, task, ctx.colorBy, ctx.priorityDot);
     if (task.virtual) card.addClass('tc-virtual');   // dashed only for not-yet-materialized recurrences
+    if (task.recId && !task.virtual) card.addClass('tc-tl-recurring');
     if (task.done) card.addClass('tc-tl-done');
     if (task.cancelled) card.addClass('tc-cancelled');
 
-    // checkbox (timed tasks)
+    // checkbox (timed tasks; no subtask cascade — a timed card completes only itself)
     const cb = makeStatusCheckbox(card, task, async checked => {
-        if (task.virtual) await materializeVirtual(app, task, checked, view.plugin.settings);
-        else await toggleTask(app, task.file, task.line, checked);
+        await completeTask(app, task, checked, view.plugin.settings, false);
         ctx.refresh();
     }, 'tc-tl-cb');
     cb.addEventListener('pointerdown', e => e.stopPropagation());
     cb.addEventListener('click', e => e.stopPropagation());
 
-    const body = card.createEl('div', { cls: 'tc-tl-event-body' });
-    body.createEl('div', { cls: 'tc-tl-event-title', text: task.text || '(без назви)' });
-    card._timeEl = body.createEl('div', {
+    const body = card.createEl('div', { cls: compact ? 'tc-tl-event-body tc-tl-event-body-row' : 'tc-tl-event-body' });
+    const tag = compact ? 'span' : 'div';
+    body.createEl(tag, { cls: 'tc-tl-event-title', text: task.text || '(без назви)' });
+    card._timeEl = body.createEl(tag, {
         cls: 'tc-tl-event-time',
         text: task.end ? `${task.start}–${task.end}` : task.start
     });
 
     if (task.virtual || !task.file) {
         card.addClass('tc-tl-event-virtual');
-        card.onclick = async () => { await materializeVirtual(app, task, false, view.plugin.settings); ctx.refresh(); };
+        card.onclick = () => materializeAndEdit(app, task, view.plugin.settings, ctx.refresh, view.plugin);
         return;
     }
+
+    card.addEventListener('contextmenu', e => {
+        e.preventDefault(); e.stopPropagation();
+        openStatusMenu(e, task, async st => { await setTaskStatus(app, task.file, task.line, st.id); ctx.refresh(); });
+    });
 
     const topH = card.createEl('div', { cls: 'tc-tl-handle tc-tl-handle-top' });
     const botH = card.createEl('div', { cls: 'tc-tl-handle tc-tl-handle-bottom' });
@@ -273,9 +354,10 @@ function renderEventCard(view, col, task, ctx, layout) {
     bindTimelineDrag(botH, card, task, view, ctx, 'resize-bottom');
 }
 
-function bindTimelineDrag(handleEl, card, task, view, ctx, mode) {
+export function bindTimelineDrag(handleEl, card, task, view, ctx, mode) {
     const pxPerMin = HOUR_PX / 60;
     handleEl.addEventListener('pointerdown', e => {
+        if (e.button !== 0) return;   // права/середня кнопка — не перетягування
         e.preventDefault();
         e.stopPropagation();
         const startY = e.clientY;
@@ -320,7 +402,7 @@ function bindTimelineDrag(handleEl, card, task, view, ctx, mode) {
             window.removeEventListener('pointermove', onMove);
             window.removeEventListener('pointerup', onUp);
             if (!moved) {
-                if (mode === 'move') new TaskEditorModal(view.app, task, () => view.refresh()).open();
+                if (mode === 'move') new TaskEditorModal(view.app, task, () => view.refresh(), view.plugin).open();
                 return;
             }
             const start = minToHHMM(ns);

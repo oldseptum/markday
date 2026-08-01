@@ -1,43 +1,60 @@
 // ─── Task Editor Modal (4-layer card; saves live, no Save/Cancel buttons) ──────
 
-class TaskEditorModal extends obsidian.Modal {
-    constructor(app, task, onClose) {
+import * as obsidian from 'obsidian';
+import { COLORS, DEFAULT_SETTINGS, STATUSES, autoColor, charForStatusId, humanDate, prioColor, priorityKeys, statusForChar, t, todayISO } from './core.js';
+import { RecurrenceEditModal } from './edit-modals.js';
+import { buildRule } from './forms.js';
+import { parseTasks } from './parser.js';
+import { DatePickerModal, RecurrenceCustomModal, attachInlineTagAutocomplete } from './quick-create.js';
+import { makeCheckbox, makeStatusCheckbox, openStatusMenu, tintBadge } from './render.js';
+import { addChild, collectGroups, collectTags, moveTaskToDay, openDay, removeSubtask, removeTaskBlock, rewriteTaskLine, serializeTaskBody, setDescription, toggleSubtask } from './store.js';
+
+export class TaskEditorModal extends obsidian.Modal {
+    constructor(app, task, onClose, plugin) {
         super(app);
         this.file = task.file;
         this.line = task.line;       // stays valid within a file for the modal's lifetime
         this.date = task.date;       // current day (for the date picker + cross-day move)
+        this.project = !!task.project;   // project-scenario task: date lives in an inline >token, not the file name
         this.task = task;
         this.onCloseCb = onClose;
+        this._plugin = plugin || null;
         this.deleted = false;
         this._lineSave = obsidian.debounce(() => this.applyLine(), 400, false);
         this._descSave = obsidian.debounce(() => this.saveDescription(), 500, false);
     }
 
     get plugin() {
-        return (this.app.plugins && this.app.plugins.plugins && this.app.plugins.plugins['markday'])
+        // prefer the explicitly threaded plugin; the app.plugins lookup is a legacy
+        // fallback for any call site that predates the 4th constructor argument
+        return this._plugin
+            || (this.app.plugins && this.app.plugins.plugins && this.app.plugins.plugins['markday'])
             || { settings: DEFAULT_SETTINGS };
     }
 
     async reload() {
         const content = await this.app.vault.read(this.file);
-        const found = parseTasks(content).find(t => t.line === this.line);
-        this.task = found ? { ...found, file: this.file, date: this.date } : null;
+        const found = parseTasks(content, { inlineDate: this.project }).find(t => t.line === this.line);
+        if (!found) { this.task = null; return; }
+        if (this.project) this.date = found.dateToken;
+        this.task = { ...found, file: this.file, date: this.date, project: this.project };
     }
 
     onOpen() {
-        // close only via Esc: hide the × button and ignore clicks on the dimmed backdrop
-        this.modalEl.addClass('tc-noclose');
-        const container = this.modalEl.closest('.modal-container');
-        if (container) for (const ev of ['mousedown', 'click']) container.addEventListener(ev, e => { if (!this.modalEl.contains(e.target)) e.stopImmediatePropagation(); }, true);
+        // closable like any modal (×, backdrop click, Esc) — safe because every edit
+        // is saved live and onClose() flushes the debounced title/description saves
         this.renderAll();
     }
 
     // ── live persistence ─────────────────────────────────────────────────────
     async applyLine() { if (!this.deleted && this.task) await rewriteTaskLine(this.app, this.file, this.line, this.task); }
     async saveDescription() { if (!this.deleted && this.task && this.descInput) await setDescription(this.app, this.file, this.task, this.descInput.value, this.plugin.settings); }
-    async setStatus(status) {
-        this.task.done = status === 'done';
-        this.task.cancelled = status === 'cancelled';
+    // statusId: any configured checkbox status id (not just the 3 built-ins) — see STATUSES
+    async setStatus(statusId) {
+        const st = STATUSES.find(s => s.id === statusId) || statusForChar(charForStatusId(statusId));
+        this.task.statusChar = st.char;
+        this.task.done = st.behavior === 'done';
+        this.task.cancelled = st.behavior === 'cancelled';
         await this.applyLine();
         this.renderAll();
     }
@@ -79,10 +96,7 @@ class TaskEditorModal extends obsidian.Modal {
         const cb = makeStatusCheckbox(l1, this.task, checked => this.setStatus(checked ? 'done' : 'todo'), 'tc-te-check');
         cb.addEventListener('contextmenu', e => {
             e.preventDefault();
-            const menu = new obsidian.Menu();
-            menu.addItem(it => it.setTitle(this.task.done ? t('Не виконано') : t('Виконано')).onClick(() => this.setStatus(this.task.done ? 'todo' : 'done')));
-            menu.addItem(it => it.setTitle(t('Не буде виконано')).setChecked(!!this.task.cancelled).onClick(() => this.setStatus(this.task.cancelled ? 'todo' : 'cancelled')));
-            menu.showAtMouseEvent(e);
+            openStatusMenu(e, this.task, st => this.setStatus(st.id));
         });
 
         const dateBtn = l1.createEl('button', { cls: 'tc-te-date' });
@@ -187,9 +201,7 @@ class TaskEditorModal extends obsidian.Modal {
     convertToRecurring() {
         const rec = { freq: 'daily', interval: 1, weekdays: [], monthMode: 'day', monthday: '', nth: 1, weekday: 0, which: 'first', month: new Date().getMonth() };
         new RecurrenceCustomModal(this.app, rec, async () => {
-            const start = this.date || todayISO();
-            const rule = Object.assign({ id: genId(), raw: serializeTaskBody(this.task), start, end: null }, ruleFromRecDraft(rec));
-            if ((rule.freq === 'monthly' || rule.freq === 'yearly') && rule.monthMode === 'day' && !rule.monthday) rule.monthday = parseISO(start).getDate();
+            const rule = buildRule(serializeTaskBody(this.task), this.date || todayISO(), null, rec);
             this.plugin.settings.recurrences.push(rule);
             await this.plugin.saveSettings();
             await removeTaskBlock(this.app, this.file, this.task);   // one-off line removed; now shows as a virtual recurrence

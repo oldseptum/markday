@@ -1,27 +1,34 @@
 // ─── Habits View (two-pane dashboard: list + selected-habit detail) ───────────
 
+import * as obsidian from 'obsidian';
+import { HABITS_VIEW, MONTHS_UA, WD_UA, addDays, countWords, fileToDate, getDailyNotesConfig, habitDone, habitList, habitProgress, lastDayOfMonth, mondayIdx, monthGridDays, pad, parseISO, readFrontmatter, setHabitValue, startOfWeek, t, toISO, todayISO, weekdayHeaders } from './core.js';
+import { HabitEditModal } from './edit-modals.js';
+import { attachLongPress, attachSwipeNav } from './gestures.js';
+import { HabitCreateModal } from './quick-create.js';
+import { getDateFiles } from './store.js';
+
 // Pane width (px) below which the two-pane dashboard collapses to a single column
 // (left list, tap a habit → detail screen). Raise it to hide the detail pane sooner.
-const HABITS_2PANE_MIN = 860;
+export const HABITS_2PANE_MIN = 860;
 
-function heatLevel(value, max) {
+export function heatLevel(value, max) {
     if (value <= 0 || max <= 0) return 0;
     return Math.min(4, Math.ceil(value / max * 4));
 }
-function heatColor(base, lvl) {
+export function heatColor(base, lvl) {
     if (lvl === 0) return 'var(--background-modifier-border)';
     return `color-mix(in srgb, ${base} ${6 + lvl * 22}%, var(--background-secondary))`;
 }
 
 // Read a habit's value out of a (cached) frontmatter object — fully synchronous.
-function fmHabitValue(fm, habit) {
+export function fmHabitValue(fm, habit) {
     const v = fm ? fm[habit.property] : undefined;
     if (habit.type === 'bool') return (v === true || v === 'true') ? 1 : 0;
     return Number(v) || 0;
 }
 
 // SVG progress ring with an optional centered label. Returns the wrapper element.
-function makeRing(parent, frac, color, opts) {
+export function makeRing(parent, frac, color, opts) {
     opts = opts || {};
     const size = opts.size || 28, sw = opts.stroke || 3;
     const r = (size - sw) / 2, circ = 2 * Math.PI * r, ns = 'http://www.w3.org/2000/svg';
@@ -50,7 +57,7 @@ function makeRing(parent, frac, color, opts) {
     return wrap;
 }
 
-class HabitsView extends obsidian.ItemView {
+export class HabitsView extends obsidian.ItemView {
     constructor(leaf, plugin) {
         super(leaf);
         this.plugin = plugin;
@@ -178,10 +185,21 @@ class HabitsView extends obsidian.ItemView {
             if (habit.type === 'bool') setHabitValue(this.app, iso, habit, v > 0 ? null : true);
             else new HabitCompleteModal(this.app, habit, iso, () => {}).open();
         };
+        // right-click / long-press → clear the day's value
+        const clearMenu = pos => {
+            const menu = new obsidian.Menu();
+            menu.addItem(i => i.setTitle(t('Очистити')).setIcon('eraser')
+                .onClick(() => setHabitValue(this.app, iso, habit, null)));
+            menu.showAtPosition({ x: pos.clientX, y: pos.clientY });
+        };
+        cell.oncontextmenu = ev => { ev.preventDefault(); clearMenu(ev); };
+        attachLongPress(cell, clearMenu);
     }
 
     // ── left: habit list with week ring-header ───────────────────────────────
     renderHabitList(root, habits, mobile) {
+        root = root.createEl('div', { cls: 'tc-hl' });   // own container for width-based name hiding
+        attachSwipeNav(root, () => this.weekStep(-1), () => this.weekStep(1));
         const bar = root.createEl('div', { cls: 'tc-cal-header' });
         bar.createEl('div', { text: t('Звички'), cls: 'tc-cal-title' });
         const ctr = bar.createEl('div', { cls: 'tc-cal-controls' });
@@ -199,9 +217,9 @@ class HabitsView extends obsidian.ItemView {
         for (const d of days) {
             const iso = toISO(d);
             const col = head.createEl('div', { cls: iso === todayStr ? 'tc-hl-dayhead tc-hl-today' : 'tc-hl-dayhead' });
-            col.createEl('div', { text: WD_UA[(d.getDay() + 6) % 7], cls: 'tc-col-wd' });
+            col.createEl('div', { text: WD_UA[mondayIdx(d)], cls: 'tc-col-wd' });
             let sum = 0; for (const h of habits) sum += habitProgress(this.val(iso, h), h);
-            makeRing(col, habits.length ? sum / habits.length : 0, 'var(--interactive-accent)', { size: 26, stroke: 3, center: String(d.getDate()) });
+            makeRing(col, habits.length ? sum / habits.length : 0, 'var(--interactive-accent)', { size: 22, stroke: 3, center: String(d.getDate()) });
         }
 
         for (const habit of habits) {
@@ -218,7 +236,7 @@ class HabitsView extends obsidian.ItemView {
                 const iso = toISO(d);
                 const cell = row.createEl('div', { cls: 'tc-hl-cell' });
                 const v = this.val(iso, habit);
-                const w = makeRing(cell, habitProgress(v, habit), habit.color || 'var(--interactive-accent)', { size: 24, stroke: 3 });
+                const w = makeRing(cell, habitProgress(v, habit), habit.color || 'var(--interactive-accent)', { size: 20, stroke: 3 });
                 if (habitDone(v, habit)) w.addClass('tc-ring-done');
                 this.cellInput(cell, habit, iso, v);
             }
@@ -295,11 +313,10 @@ class HabitsView extends obsidian.ItemView {
         this.navGroup(hd, `${MONTHS_UA[m]} ${y}`, dir => this.monthStep(dir));
 
         const grid = wrap.createEl('div', { cls: 'tc-ringcal-grid' });
+        attachSwipeNav(grid, () => this.monthStep(-1), () => this.monthStep(1));
         for (const wd of weekdayHeaders()) grid.createEl('div', { text: wd, cls: 'tc-wd' });
         const todayStr = todayISO();
-        const gs = startOfWeek(new Date(y, m, 1));
-        for (let i = 0; i < 42; i++) {
-            const d = addDays(gs, i);
+        for (const d of monthGridDays(y, m)) {
             const inMonth = d.getMonth() === m;
             const iso = toISO(d);
             const cell = grid.createEl('div', { cls: inMonth ? 'tc-ringcal-cell' : 'tc-ringcal-cell tc-outside' });
@@ -372,4 +389,50 @@ class HabitsView extends obsidian.ItemView {
             d = addDays(d, 7);
         }
     }
+}
+
+// ─── Habit completion modal (shared by this view & task-row habit strips) ─────
+
+export class HabitCompleteModal extends obsidian.Modal {
+    constructor(app, habit, iso, onDone) {
+        super(app);
+        this.habit = habit;
+        this.iso = iso;
+        this.onDone = onDone;
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.addClass('tc-editor');
+        contentEl.createEl('h3', { text: `${this.habit.emoji ? this.habit.emoji + ' ' : ''}${this.habit.name}` });
+
+        const done = () => { this.close(); if (this.onDone) this.onDone(); };
+
+        if (this.habit.type === 'bool') {
+            const btns = contentEl.createEl('div', { cls: 'tc-modal-btns' });
+            btns.createEl('button', { text: t('Скасувати') }).onclick = () => this.close();
+            btns.createEl('button', { text: t('Виконано'), cls: 'mod-cta' }).onclick = async () => {
+                await setHabitValue(this.app, this.iso, this.habit, true); done();
+            };
+            return;
+        }
+
+        let input;
+        const cur = readFrontmatter(this.app, this.iso)[this.habit.property];
+        const save = async () => {
+            const n = Number(input.getValue());
+            await setHabitValue(this.app, this.iso, this.habit, (isNaN(n) || n <= 0) ? null : n);
+            done();
+        };
+        new obsidian.Setting(contentEl).setName(`${t('Скільки')}${this.habit.unit ? ' (' + this.habit.unit + ')' : ''}`)
+            .addText(c => {
+                input = c; c.inputEl.type = 'number'; c.inputEl.style.width = '8em';
+                if (cur) c.setValue(String(cur));
+                c.inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') save(); });
+                setTimeout(() => c.inputEl.focus(), 0);
+            });
+        const btns = contentEl.createEl('div', { cls: 'tc-modal-btns' });
+        btns.createEl('button', { text: t('Скасувати') }).onclick = () => this.close();
+        btns.createEl('button', { text: t('Зберегти'), cls: 'mod-cta' }).onclick = save;
+    }
+    onClose() { this.contentEl.empty(); }
 }

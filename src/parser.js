@@ -1,11 +1,21 @@
 // ─── Task parsing ────────────────────────────────────────────────────────────
 
-function parseTaskLine(line, lineNum) {
-    const m = line.match(/^(\s*)- \[(x| |-)\] (.*)$/);
+import { escapeRe, normTime, priorityKeys, statusForChar, t } from './core.js';
+
+// Inline due-date token used by 'project' scenarios (see matchScenario): a bare
+// `>YYYY-MM-DD` anywhere in the task text, e.g. "Fix the deploy script >2026-07-05 #infra".
+// Daily-note tasks never look for this (their date comes from the file name), so plain
+// '>' text in a daily note is left untouched — only parseTaskLine(..., {inlineDate:true}) checks it.
+export const INLINE_DATE_RE = /(^|\s)>(\d{4}-\d{2}-\d{2})(?=\s|$)/;
+
+export function parseTaskLine(line, lineNum, opts) {
+    const m = line.match(/^(\s*)- \[(.)\] (.*)$/);
     if (!m) return null;
 
-    const done = m[2] === 'x';
-    const cancelled = m[2] === '-';
+    const statusChar = m[2];
+    const st = statusForChar(statusChar);
+    const done = st.behavior === 'done';
+    const cancelled = st.behavior === 'cancelled';
     let body = m[3];
 
     // trailing block ids: ^rc-<id> (recurrence rule) and ^tcd-<id> (description heading)
@@ -41,18 +51,26 @@ function parseTaskLine(line, lineNum) {
     const tagRe = /#([^\s#]+)/g;
     while ((tm = tagRe.exec(rest)) !== null) tags.push(tm[1]);
 
-    const text = rest
+    // project scenario only: pull the >YYYY-MM-DD token out before building the display text
+    let dateToken = null;
+    let rest2 = rest;
+    if (opts && opts.inlineDate) {
+        const dm = rest.match(INLINE_DATE_RE);
+        if (dm) { dateToken = dm[2]; rest2 = rest.slice(0, dm.index) + rest.slice(dm.index + dm[0].length); }
+    }
+
+    const text = rest2
         .replace(new RegExp(`!(${pAlt})\\b`, 'ig'), '')
         .replace(/@[^\s]+/g, '')
         .replace(/#[^\s#]+/g, '')
         .replace(/\s{2,}/g, ' ')
         .trim();
 
-    return { done, cancelled, text, tags, group, priority, start, end, recId, descId, line: lineNum };
+    return { done, cancelled, statusChar, text, tags, group, priority, start, end, recId, descId, dateToken, line: lineNum };
 }
 
 // Find a task's description (content under the `^tcd-<id>` heading); returns {text, headingLine, endLine}
-function findDescription(lines, descId) {
+export function findDescription(lines, descId) {
     const re = new RegExp(`^(#{1,6})\\s+.*\\^tcd-${descId}\\s*$`);
     for (let i = 0; i < lines.length; i++) {
         const m = lines[i].match(re);
@@ -69,24 +87,25 @@ function findDescription(lines, descId) {
     return null;
 }
 
-const CHILD_INDENT = '    ';   // indentation used for subtasks / comments
+export const CHILD_INDENT = '    ';   // indentation used for subtasks / comments
 
 // Top-level tasks (indent 0). Indented checkbox lines → subtasks; indented bullets → comments.
-function parseTasks(content) {
+// opts.inlineDate → also extract each task's >YYYY-MM-DD token (project scenario; see matchScenario).
+export function parseTasks(content, opts) {
     const lines = content.split('\n');
     const tasks = [];
     let current = null;
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-        const cb = line.match(/^(\s*)- \[(x| )\] (.*)$/);
+        const cb = line.match(/^(\s*)- \[(.)\] (.*)$/);
         if (cb) {
             if (cb[1].length === 0) {
-                current = parseTaskLine(line, i);
+                current = parseTaskLine(line, i, opts);
                 current.subtasks = [];
                 current.comments = [];
                 tasks.push(current);
             } else if (current) {
-                current.subtasks.push(parseTaskLine(line, i));
+                current.subtasks.push(parseTaskLine(line, i, opts));
             }
             continue;
         }
